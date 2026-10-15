@@ -16,7 +16,56 @@ class AssetController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
         $query = Asset::with(['model.category', 'model.pricingTiers']);
+
+        $branchId = $request->get('branch_id') 
+            ?? $request->get('affiliate_id') 
+            ?? $request->header('X-Branch-Id') 
+            ?? $tenantContext->getBranchId();
+
+        if (!$branchId && $businessId && !$request->boolean('all_branches')) {
+            $defaultBranch = \App\Models\Affiliate::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->orderBy('is_central', 'desc')
+                ->first();
+            $branchId = $defaultBranch?->id;
+        }
+
+        if ($branchId) {
+            if ($businessId) {
+                $validBranch = \App\Models\Affiliate::where('id', $branchId)
+                    ->where('business_id', $businessId)
+                    ->exists();
+
+                if (!$validBranch) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Cabang tidak valid untuk bisnis rental ini.',
+                        'code' => 'INVALID_BRANCH',
+                    ], 422);
+                }
+            }
+
+            $user = $request->user();
+            if ($user && $tenantContext->isStaff()) {
+                $member = $tenantContext->getMember();
+                if ($member) {
+                    $allowedBranches = $member->branchMembers()->pluck('affiliate_id')->toArray();
+                    if (!empty($allowedBranches) && !in_array((int)$branchId, $allowedBranches)) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Akses cabang ditolak. Anda tidak ditugaskan di cabang ini.',
+                            'code' => 'BRANCH_ACCESS_DENIED',
+                        ], 403);
+                    }
+                }
+            }
+
+            $query->where('affiliate_id', $branchId);
+        }
 
         if ($request->has('status')) {
             $query->where('status', $request->status);
@@ -87,14 +136,62 @@ class AssetController extends Controller
     public function store(Request $request): JsonResponse
     {
         $user = $request->user();
-        $affiliateId = $user->isSuperAdmin() 
-            ? ($request->get('affiliate_id') ?? $user->affiliate_id)
-            : $user->affiliate_id;
+        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+
+        $affiliateId = $request->get('affiliate_id') 
+            ?? $request->header('X-Branch-Id') 
+            ?? app(\App\Tenancy\TenantContext::class)->getBranchId();
+
+        if (empty($affiliateId)) {
+            $defaultBranch = \App\Models\Affiliate::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->orderBy('is_central', 'desc')
+                ->first();
+            $affiliateId = $defaultBranch?->id ?? $user->affiliate_id;
+        }
+
+        if ($affiliateId && !$user->isSuperAdmin()) {
+            $validBranch = \App\Models\Affiliate::where('id', $affiliateId)
+                ->where('business_id', $businessId)
+                ->exists();
+            if (!$validBranch) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cabang tidak valid untuk bisnis rental ini.',
+                    'code' => 'INVALID_BRANCH',
+                ], 422);
+            }
+        }
 
         $validated = $request->validate([
-            'model_id' => 'required|exists:asset_models,id',
-            'asset_code' => 'required|string|max:50|unique:assets,asset_code',
-            'serial_number' => 'required|string|max:100|unique:assets,serial_number',
+            'model_id' => [
+                'required',
+                \Illuminate\Validation\Rule::exists('asset_models', 'id')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'asset_code' => [
+                'required',
+                'string',
+                'max:50',
+                \Illuminate\Validation\Rule::unique('assets', 'asset_code')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'serial_number' => [
+                'required',
+                'string',
+                'max:100',
+                \Illuminate\Validation\Rule::unique('assets', 'serial_number')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'imei_1' => 'nullable|string|max:50',
             'imei_2' => 'nullable|string|max:50',
             'condition_grade' => 'nullable|in:A,B,C',
@@ -103,6 +200,7 @@ class AssetController extends Controller
         ]);
 
         $asset = Asset::create([
+            'business_id' => $businessId,
             'affiliate_id' => $affiliateId,
             'model_id' => $validated['model_id'],
             'asset_code' => strtoupper(trim($validated['asset_code'])),
@@ -195,9 +293,28 @@ class AssetController extends Controller
         $results = [];
         $allAvailable = true;
 
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $branchId = $request->get('branch_id') 
+            ?? $request->get('affiliate_id') 
+            ?? $request->header('X-Branch-Id') 
+            ?? $tenantContext->getBranchId();
+
+        if (!$branchId && $businessId) {
+            $defaultBranch = \App\Models\Affiliate::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->orderBy('is_central', 'desc')
+                ->first();
+            $branchId = $defaultBranch?->id;
+        }
+
         $assets = Asset::with('model')->whereIn('id', $request->asset_ids)->get();
         foreach ($assets as $asset) {
             $isAvailable = $pricingService->isAssetAvailable($asset, $startAt, $endAt);
+            if ($branchId && (int)$asset->affiliate_id !== (int)$branchId) {
+                $isAvailable = false;
+            }
             if (!$isAvailable) {
                 $allAvailable = false;
             }
@@ -206,6 +323,7 @@ class AssetController extends Controller
                 'asset_code' => $asset->asset_code,
                 'model_name' => $asset->model->name,
                 'status' => $asset->status,
+                'affiliate_id' => $asset->affiliate_id,
                 'is_available' => $isAvailable,
             ];
         }

@@ -6,6 +6,7 @@ use App\Models\Affiliate;
 use App\Models\Asset;
 use App\Models\Booking;
 use App\Models\BookingItem;
+use App\Models\BusinessMember;
 use App\Models\Customer;
 use App\Models\CustomerIdentity;
 use App\Models\PaymentMethod;
@@ -14,6 +15,7 @@ use App\Models\PricingTier;
 use App\Models\User;
 use App\Models\Voucher;
 use App\Models\VoucherUsage;
+use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Exception;
 use Illuminate\Support\Facades\DB;
@@ -35,12 +37,105 @@ class BookingService
     public function createCounterRental(array $data, User $cashier): Booking
     {
         return DB::transaction(function () use ($data, $cashier) {
-            $affiliateId = $cashier->affiliate_id ?? $data['affiliate_id'];
-            $affiliate = Affiliate::findOrFail($affiliateId);
+            $tenantContext = app(TenantContext::class);
+            $businessId = $tenantContext->getBusinessId();
 
-            // 1. Ensure or find Customer
+            // 1. Resolve affiliate_id safely without undefined array key
+            $affiliateId = !empty($data['affiliate_id']) ? (int)$data['affiliate_id'] : null;
+
+            // Fallback to TenantContext active branch (e.g. from X-Branch-Id header)
+            if (empty($affiliateId)) {
+                $affiliateId = $tenantContext->getBranchId();
+            }
+
+            // Fallback to cashier's explicit affiliate assignment (legacy role)
+            if (empty($affiliateId) && !empty($cashier->affiliate_id)) {
+                $affiliateId = $cashier->affiliate_id;
+            }
+
+            $assetIds = (array)($data['asset_ids'] ?? []);
+
+            // Fallback to the business's central/default active branch
+            if (empty($affiliateId) && $businessId) {
+                $defaultBranch = Affiliate::where('business_id', $businessId)
+                    ->where('is_active', true)
+                    ->orderBy('is_central', 'desc')
+                    ->first();
+                $affiliateId = $defaultBranch?->id;
+            }
+
+            // Fail closed if affiliate still cannot be determined
+            if (empty($affiliateId)) {
+                throw ValidationException::withMessages([
+                    'affiliate_id' => ['Cabang/outlet tidak dapat ditentukan. Harap tentukan cabang aktif.'],
+                ]);
+            }
+
+            // Validate affiliate existence
+            $affiliate = Affiliate::find($affiliateId);
+            if (!$affiliate) {
+                throw ValidationException::withMessages([
+                    'affiliate_id' => ['Cabang yang dipilih tidak ditemukan.'],
+                ]);
+            }
+
+            // Derive businessId from affiliate if not set in TenantContext
+            if (!$businessId && $affiliate->business_id) {
+                $businessId = $affiliate->business_id;
+            }
+
+            // Multi-tenant isolation: Verify branch belongs to active business
+            if ($businessId && $affiliate->business_id && (int)$affiliate->business_id !== (int)$businessId) {
+                throw ValidationException::withMessages([
+                    'affiliate_id' => ['Cabang tidak valid untuk bisnis rental ini.'],
+                ]);
+            }
+
+            // Authorize user access to this business
+            if ($affiliate->business_id && !$cashier->isSuperAdmin()) {
+                $isMember = BusinessMember::where('business_id', $affiliate->business_id)
+                    ->where('user_id', $cashier->id)
+                    ->where('is_active', true)
+                    ->exists();
+
+                if (!$isMember && (int)$cashier->affiliate_id !== (int)$affiliate->id) {
+                    throw ValidationException::withMessages([
+                        'affiliate_id' => ['Anda tidak memiliki akses ke cabang bisnis ini.'],
+                    ]);
+                }
+            }
+
+            // Authorize user access to this specific branch (if branch-restricted)
+            if (!$cashier->isSuperAdmin()) {
+                if (!empty($cashier->affiliate_id) && (int)$cashier->affiliate_id !== (int)$affiliate->id) {
+                    throw ValidationException::withMessages([
+                        'affiliate_id' => ['Akses cabang ditolak. Anda tidak berwenang untuk cabang ini.'],
+                    ]);
+                }
+
+                $member = $tenantContext->getMember() ?? BusinessMember::where('business_id', $businessId)
+                    ->where('user_id', $cashier->id)
+                    ->where('is_active', true)
+                    ->first();
+
+                if ($member && $member->isStaff()) {
+                    $allowedBranches = $member->branchMembers()->pluck('affiliate_id')->toArray();
+                    if (!empty($allowedBranches) && !in_array((int)$affiliate->id, $allowedBranches)) {
+                        throw ValidationException::withMessages([
+                            'affiliate_id' => ['Akses cabang ditolak. Anda tidak ditugaskan di cabang ini.'],
+                        ]);
+                    }
+                }
+            }
+
+            // 1. Ensure or find Customer scoped to business
+            $customerAttrs = ['phone' => $data['customer_phone']];
+            if ($businessId) {
+                $customerAttrs['business_id'] = $businessId;
+            }
+
             $customer = Customer::firstOrCreate(
-                ['phone' => $data['customer_phone']],
+                $customerAttrs,
                 [
                     'name' => $data['customer_name'],
                     'email' => $data['customer_email'] ?? null,
@@ -93,23 +188,30 @@ class BookingService
             }
 
             // 2. Lock and verify Assets with Pessimistic Concurrency (SELECT ... FOR UPDATE)
-            $assetIds = (array)$data['asset_ids'];
-            $assets = Asset::withoutGlobalScopes()
+            $assetQuery = Asset::withoutGlobalScopes()
                 ->whereIn('id', $assetIds)
-                ->where('affiliate_id', $affiliateId)
-                ->lockForUpdate()
-                ->get();
+                ->where('affiliate_id', $affiliateId);
+
+            if ($businessId) {
+                $assetQuery->where(function ($q) use ($businessId) {
+                    $q->where('business_id', $businessId)
+                      ->orWhereNull('business_id');
+                });
+            }
+
+            $assets = $assetQuery->lockForUpdate()->get();
 
             if ($assets->count() !== count($assetIds)) {
                 throw ValidationException::withMessages([
-                    'asset_ids' => ['Sebagian perangkat yang dipilih tidak ditemukan di cabang ini.'],
+                    'asset_ids' => ['Sebagian perangkat yang dipilih tidak ditemukan di cabang ini atau telah dipindahkan ke cabang lain.'],
                 ]);
             }
 
             foreach ($assets as $asset) {
                 if ($asset->status !== 'ready') {
+                    $modelName = $asset->model ? $asset->model->name : 'Unit Gadget';
                     throw ValidationException::withMessages([
-                        'asset_ids' => ["Perangkat {$asset->asset_code} ({$asset->model->name}) sedang tidak siap (status: {$asset->status})."],
+                        'asset_ids' => ["Perangkat {$asset->asset_code} ({$modelName}) sedang tidak siap (status: {$asset->status})."],
                     ]);
                 }
             }
@@ -193,8 +295,14 @@ class BookingService
                         ]);
                     }
                     // Validate Manager PIN
-                    $manager = User::where('affiliate_id', $affiliateId)
-                        ->where('role', 'affiliate_admin')
+                    $manager = User::where(function ($q) use ($affiliateId, $businessId) {
+                            $q->where('affiliate_id', $affiliateId);
+                            if ($businessId) {
+                                $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
+                                    $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
+                                });
+                            }
+                        })
                         ->whereNotNull('manager_override_pin')
                         ->first();
 
@@ -221,6 +329,7 @@ class BookingService
 
             // 7. Create Booking (Direct activation: status = 'rented')
             $booking = Booking::withoutGlobalScopes()->create([
+                'business_id' => $businessId,
                 'booking_code' => $bookingCode,
                 'affiliate_id' => $affiliateId,
                 'customer_id' => $customer->id,
@@ -293,9 +402,10 @@ class BookingService
             $cashChange = $isCash ? max(0, $cashReceived - $totalBill) : 0.00;
 
             $txCode = sprintf('TX-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
-            $receiptNumber = sprintf('REC-%s-%s-%04d', $affiliate->code, $datePrefix, $booking->id);
+            $receiptNumber = sprintf('REC-%s-%s-%04d', $affiliate->code ?? 'CTR', $datePrefix, $booking->id);
 
             PaymentTransaction::create([
+                'business_id' => $businessId,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'booking_id' => $booking->id,

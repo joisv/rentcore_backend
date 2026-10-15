@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Affiliate extends Model
@@ -11,6 +12,7 @@ class Affiliate extends Model
     use HasFactory;
 
     protected $fillable = [
+        'business_id',
         'code',
         'name',
         'slug',
@@ -31,6 +33,16 @@ class Affiliate extends Model
         'cashier_discount_limit_percent' => 'decimal:2',
         'cashier_discount_limit_nominal' => 'decimal:2',
     ];
+
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new \App\Scopes\TenantScope);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
+    }
 
     public function users(): HasMany
     {

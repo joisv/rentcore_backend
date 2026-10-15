@@ -23,12 +23,33 @@ class ProductController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
+        // Catalog entries (models) are business-level and are never hidden from a branch just
+        // because another branch created them. Unit counts, however, are branch-specific and are
+        // based on the authoritative current branch (assets.affiliate_id), so transferred units
+        // count only at their destination. Pass all_branches=1 for a business-wide view
+        // (only honored for members who are not branch-restricted).
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $countBranchId = $tenantContext->getBranchId();
+        if ($request->boolean('all_branches') && !$tenantContext->isBranchRestricted()) {
+            $countBranchId = null;
+        }
+
         $query = AssetModel::with(['category', 'pricingTiers' => function ($q) {
             $q->where('is_active', true)->orderBy('duration_hours');
         }])
-        ->withCount(['assets', 'assets as ready_units_count' => function ($q) {
-            $q->where('status', 'ready');
-        }]);
+        ->withCount([
+            'assets' => function ($q) use ($countBranchId) {
+                if ($countBranchId) {
+                    $q->where('assets.affiliate_id', $countBranchId);
+                }
+            },
+            'assets as ready_units_count' => function ($q) use ($countBranchId) {
+                $q->where('status', 'ready');
+                if ($countBranchId) {
+                    $q->where('assets.affiliate_id', $countBranchId);
+                }
+            },
+        ]);
 
         if ($request->has('category_id')) {
             $query->where('category_id', $request->category_id);
@@ -68,15 +89,28 @@ class ProductController extends Controller
      */
     public function show(Request $request, int $id): JsonResponse
     {
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $branchId = $tenantContext->getBranchId();
+        if ($request->boolean('all_branches') && !$tenantContext->isBranchRestricted()) {
+            $branchId = null;
+        }
+        $branchFilter = function ($q) use ($branchId) {
+            if ($branchId) {
+                $q->where('assets.affiliate_id', $branchId);
+            }
+        };
+
         $product = AssetModel::with([
             'category',
             'pricingTiers',
-            'assets' => function ($q) {
+            'assets' => function ($q) use ($branchFilter) {
+                $branchFilter($q);
                 $q->with('affiliate');
             }
         ])
-        ->withCount(['assets', 'assets as ready_units_count' => function ($q) {
+        ->withCount(['assets' => $branchFilter, 'assets as ready_units_count' => function ($q) use ($branchFilter) {
             $q->where('status', 'ready');
+            $branchFilter($q);
         }])
         ->findOrFail($id);
 
@@ -91,11 +125,32 @@ class ProductController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+
         $validated = $request->validate([
-            'category_id' => 'required|exists:asset_categories,id',
+            'category_id' => [
+                'required',
+                \Illuminate\Validation\Rule::exists('asset_categories', 'id')->where(function ($q) use ($businessId) {
+                    $q->where(function ($sub) use ($businessId) {
+                        $sub->whereNull('business_id');
+                        if ($businessId) {
+                            $sub->orWhere('business_id', $businessId);
+                        }
+                    });
+                }),
+            ],
             'brand' => 'required|string|max:100',
             'name' => 'required|string|max:150',
-            'slug' => 'nullable|string|max:150|unique:asset_models,slug',
+            'slug' => [
+                'nullable',
+                'string',
+                'max:150',
+                \Illuminate\Validation\Rule::unique('asset_models', 'slug')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'description' => 'nullable|string',
             'storage_capacity' => 'nullable|string|max:50',
             'color' => 'nullable|string|max:50',
@@ -115,12 +170,13 @@ class ProductController extends Controller
             ? Str::slug($validated['slug']) 
             : Str::slug($validated['brand'] . ' ' . $validated['name'] . ' ' . ($validated['storage_capacity'] ?? ''));
 
-        // Ensure unique slug fallback
-        if (AssetModel::where('slug', $slug)->exists()) {
+        // Ensure unique slug fallback per business
+        if (AssetModel::where('business_id', $businessId)->where('slug', $slug)->exists()) {
             $slug .= '-' . Str::random(5);
         }
 
         $product = AssetModel::create([
+            'business_id' => $businessId,
             'category_id' => $validated['category_id'],
             'brand' => $validated['brand'],
             'name' => $validated['name'],
@@ -149,6 +205,7 @@ class ProductController extends Controller
                         'duration_value' => $val,
                     ],
                     [
+                        'business_id' => $businessId,
                         'duration_hours' => $hours,
                         'price' => $rate['price'],
                         'extension_hourly_rate' => $rate['extension_hourly_rate'] ?? 15000.00,
@@ -183,11 +240,32 @@ class ProductController extends Controller
         $product = AssetModel::findOrFail($id);
         $old = $product->toArray();
 
+        $businessId = $product->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId();
+
         $validated = $request->validate([
-            'category_id' => 'nullable|exists:asset_categories,id',
+            'category_id' => [
+                'nullable',
+                \Illuminate\Validation\Rule::exists('asset_categories', 'id')->where(function ($q) use ($businessId) {
+                    $q->where(function ($sub) use ($businessId) {
+                        $sub->whereNull('business_id');
+                        if ($businessId) {
+                            $sub->orWhere('business_id', $businessId);
+                        }
+                    });
+                }),
+            ],
             'brand' => 'nullable|string|max:100',
             'name' => 'nullable|string|max:150',
-            'slug' => 'nullable|string|max:150|unique:asset_models,slug,' . $product->id,
+            'slug' => [
+                'nullable',
+                'string',
+                'max:150',
+                \Illuminate\Validation\Rule::unique('asset_models', 'slug')->ignore($product->id)->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'description' => 'nullable|string',
             'storage_capacity' => 'nullable|string|max:50',
             'color' => 'nullable|string|max:50',

@@ -5,8 +5,11 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Models\Affiliate;
 use App\Models\Asset;
+use App\Models\BusinessMember;
 use App\Models\InventoryTransfer;
+use App\Models\User;
 use App\Services\AuditLogService;
+use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -16,35 +19,57 @@ use Illuminate\Validation\ValidationException;
 class TransferController extends Controller
 {
     /**
-     * List inventory transfers involving the authenticated user's branch.
+     * List inventory transfers involving the authenticated user's branch / business.
      */
     public function index(Request $request): JsonResponse
     {
         $user = $request->user();
-        $affiliateId = $user->affiliate_id;
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $membership = $user->getBusinessMembership($businessId);
+        if (!$membership && !$user->isPlatformAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Anda tidak memiliki akses ke bisnis rental ini.',
+            ], 403);
+        }
+
+        $isOwner = $membership ? $membership->isOwner() : false;
+        $userBranchIds = $user->getBranchIdsForBusiness($businessId);
 
         $query = InventoryTransfer::with([
             'asset.model.category',
             'fromAffiliate',
             'toAffiliate',
             'sender',
-            'receiver'
+            'receiver',
+            'recipient',
+            'approver',
+            'rejecter',
         ]);
 
-        if ($affiliateId && !$user->isSuperAdmin()) {
-            $query->where(function ($q) use ($affiliateId) {
-                $q->where('from_affiliate_id', $affiliateId)
-                  ->orWhere('to_affiliate_id', $affiliateId);
+        // Non-owners can only see transfers for their assigned branches or transfers they created/received
+        if (!$isOwner) {
+            $query->where(function ($q) use ($user, $userBranchIds) {
+                if (!empty($userBranchIds)) {
+                    $q->whereIn('from_affiliate_id', $userBranchIds)
+                      ->orWhereIn('to_affiliate_id', $userBranchIds);
+                }
+                $q->orWhere('sent_by', $user->id)
+                  ->orWhere('recipient_id', $user->id);
             });
+        }
 
-            if ($request->get('direction') === 'outbound') {
-                $query->where('from_affiliate_id', $affiliateId);
-            } elseif ($request->get('direction') === 'inbound') {
-                $query->where('to_affiliate_id', $affiliateId);
+        if ($request->has('direction')) {
+            if ($request->get('direction') === 'outbound' && !empty($userBranchIds)) {
+                $query->whereIn('from_affiliate_id', $userBranchIds);
+            } elseif ($request->get('direction') === 'inbound' && !empty($userBranchIds)) {
+                $query->whereIn('to_affiliate_id', $userBranchIds);
             }
         }
 
-        if ($request->has('status')) {
+        if ($request->filled('status')) {
             $query->where('status', $request->status);
         }
 
@@ -57,15 +82,21 @@ class TransferController extends Controller
     }
 
     /**
-     * List available destination branches.
+     * List available destination branches within the active business.
      */
     public function destinationAffiliates(Request $request): JsonResponse
     {
-        $currentAffiliateId = $request->user()->affiliate_id;
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
 
-        $affiliates = Affiliate::where('is_active', true)
-            ->when($currentAffiliateId, fn($q) => $q->where('id', '!=', $currentAffiliateId))
-            ->get();
+        $excludeBranchId = $request->get('from_affiliate_id')
+            ?? $request->header('X-Branch-Id')
+            ?? $tenantContext->getBranchId();
+
+        $affiliates = Affiliate::where('business_id', $businessId)
+            ->where('is_active', true)
+            ->when($excludeBranchId, fn($q) => $q->where('id', '!=', (int)$excludeBranchId))
+            ->get(['id', 'code', 'name', 'city', 'address', 'is_central']);
 
         return response()->json([
             'success' => true,
@@ -74,35 +105,121 @@ class TransferController extends Controller
     }
 
     /**
-     * Initiate an inter-affiliate stock transfer.
+     * List eligible recipients for a specific destination branch.
+     */
+    public function recipients(Request $request): JsonResponse
+    {
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $branchId = (int) $request->get('branch_id');
+        if (!$branchId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Parameter branch_id wajib disertakan.',
+            ], 422);
+        }
+
+        // Validate branch belongs to current business
+        $branch = Affiliate::where('business_id', $businessId)->findOrFail($branchId);
+
+        // Fetch business members assigned to this branch or owners
+        $members = BusinessMember::with('user')
+            ->where('business_id', $businessId)
+            ->where('is_active', true)
+            ->where(function ($q) use ($branchId) {
+                $q->whereHas('branchMembers', fn($bm) => $bm->where('affiliate_id', $branchId))
+                  ->orWhere('role', 'owner');
+            })
+            ->get();
+
+        $recipients = $members->map(function ($m) {
+            return [
+                'id' => $m->user->id,
+                'name' => $m->user->name,
+                'email' => $m->user->email,
+                'role' => $m->role,
+            ];
+        })->values();
+
+        // Also include any active legacy user tied to this affiliate
+        $existingIds = $recipients->pluck('id')->toArray();
+        $legacyUsers = User::where('affiliate_id', $branchId)
+            ->where('is_active', true)
+            ->whereNotIn('id', $existingIds)
+            ->get(['id', 'name', 'email', 'role']);
+
+        $allRecipients = $recipients->concat($legacyUsers);
+
+        return response()->json([
+            'success' => true,
+            'data' => $allRecipients,
+        ]);
+    }
+
+    /**
+     * Initiate or request an inter-branch stock transfer.
      */
     public function store(Request $request): JsonResponse
     {
         $user = $request->user();
-        $fromAffiliateId = $user->affiliate_id;
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $membership = $user->getBusinessMembership($businessId);
+        if (!$membership && !$user->isPlatformAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Anda tidak memiliki wewenang dalam bisnis rental ini.',
+            ], 403);
+        }
+
+        $isOwner = $membership ? $membership->isOwner() : false;
+        $userBranchIds = $user->getBranchIdsForBusiness($businessId);
 
         $validated = $request->validate([
-            'asset_id' => 'required|integer|exists:assets,id',
-            'to_affiliate_id' => 'required|integer|exists:affiliates,id',
-            'notes' => 'nullable|string',
+            'asset_id' => 'required|integer',
+            'to_affiliate_id' => 'required|integer',
+            'recipient_id' => 'required|string',
+            'notes' => 'nullable|string|max:500',
         ]);
 
-        if ($fromAffiliateId && $fromAffiliateId === (int)$validated['to_affiliate_id']) {
+        $toAffiliate = Affiliate::where('business_id', $businessId)
+            ->where('id', $validated['to_affiliate_id'])
+            ->firstOrFail();
+
+        $recipient = User::where('id', $validated['recipient_id'])->where('is_active', true)->firstOrFail();
+        $recipientBranchIds = $recipient->getBranchIdsForBusiness($businessId);
+        if (!in_array($toAffiliate->id, $recipientBranchIds)) {
             throw ValidationException::withMessages([
-                'to_affiliate_id' => ['Cabang tujuan mutasi tidak boleh sama dengan cabang asal.'],
+                'recipient_id' => ['Penerima mutasi yang dipilih tidak terdaftar di cabang tujuan.'],
             ]);
         }
 
-        $transfer = DB::transaction(function () use ($validated, $user, $fromAffiliateId, $request) {
-            // Lock asset with SELECT ... FOR UPDATE
-            $asset = Asset::withoutGlobalScopes()
+        $transfer = DB::transaction(function () use ($validated, $user, $isOwner, $userBranchIds, $toAffiliate, $recipient, $businessId, $request) {
+            // Lock asset strictly within the current business context
+            $asset = Asset::where('business_id', $businessId)
                 ->where('id', $validated['asset_id'])
                 ->lockForUpdate()
-                ->firstOrFail();
+                ->first();
 
-            if ($fromAffiliateId && $asset->affiliate_id !== $fromAffiliateId) {
+            if (!$asset) {
                 throw ValidationException::withMessages([
-                    'asset_id' => ['Perangkat ini tidak berada di inventaris cabang Anda.'],
+                    'asset_id' => ['Perangkat tidak ditemukan di inventaris bisnis rental Anda.'],
+                ]);
+            }
+
+            $fromAffiliateId = $asset->affiliate_id;
+
+            if (!$isOwner && !in_array($fromAffiliateId, $userBranchIds)) {
+                throw ValidationException::withMessages([
+                    'asset_id' => ['Anda tidak memiliki akses untuk memutasi aset dari cabang asal ini.'],
+                ]);
+            }
+
+            if ($fromAffiliateId === (int)$toAffiliate->id) {
+                throw ValidationException::withMessages([
+                    'to_affiliate_id' => ['Cabang tujuan mutasi tidak boleh sama dengan cabang asal.'],
                 ]);
             }
 
@@ -112,90 +229,306 @@ class TransferController extends Controller
                 ]);
             }
 
-            $originAffiliateId = $fromAffiliateId ?? $asset->affiliate_id;
+            $hasActiveTransfer = InventoryTransfer::where('business_id', $businessId)
+                ->where('asset_id', $asset->id)
+                ->whereIn('status', ['pending', 'in_transit'])
+                ->exists();
 
-            // Generate Transfer Code: TRF-YYMMDD-XXXX
+            if ($hasActiveTransfer) {
+                throw ValidationException::withMessages([
+                    'asset_id' => ['Perangkat ini sedang dalam proses mutasi aktif lain.'],
+                ]);
+            }
+
             $datePrefix = Carbon::now()->format('ymd');
-            $countToday = InventoryTransfer::whereDate('created_at', Carbon::today())->count() + 1;
+            $countToday = InventoryTransfer::withoutGlobalScopes()
+                ->where('business_id', $businessId)
+                ->whereDate('created_at', Carbon::today())
+                ->count() + 1;
             $transferCode = sprintf('TRF-%s-%04d', $datePrefix, $countToday);
 
-            // 1. Create transfer record in_transit
+            // Owner-initiated transfers auto-approve to 'in_transit'
+            // Staff / Admin requests enter 'pending' requiring Owner approval
+            $initialStatus = $isOwner ? 'in_transit' : 'pending';
+            $newAssetStatus = $isOwner ? 'in_transit' : 'reserved';
+
             $transferRecord = InventoryTransfer::create([
+                'business_id' => $businessId,
                 'transfer_code' => $transferCode,
                 'asset_id' => $asset->id,
-                'from_affiliate_id' => $originAffiliateId,
-                'to_affiliate_id' => $validated['to_affiliate_id'],
+                'from_affiliate_id' => $fromAffiliateId,
+                'to_affiliate_id' => $toAffiliate->id,
                 'sent_by' => $user->id,
-                'status' => 'in_transit',
+                'recipient_id' => $recipient->id,
+                'approved_by' => $isOwner ? $user->id : null,
+                'approved_at' => $isOwner ? Carbon::now() : null,
+                'status' => $initialStatus,
                 'notes' => $validated['notes'] ?? null,
                 'sent_at' => Carbon::now(),
             ]);
 
-            // 2. Atomically transition asset status to in_transit
-            $asset->update(['status' => 'in_transit']);
+            $asset->update(['status' => $newAssetStatus]);
 
-            // 3. Immutable audit log
             AuditLogService::log(
                 $user,
-                'transfer.initiated',
+                $isOwner ? 'transfer.initiated_by_owner' : 'transfer.requested',
                 'InventoryTransfer',
                 $transferRecord->id,
                 [
                     'transfer_code' => $transferCode,
                     'asset_code' => $asset->asset_code,
-                    'from_affiliate_id' => $originAffiliateId,
-                    'to_affiliate_id' => $validated['to_affiliate_id'],
+                    'from_affiliate_id' => $fromAffiliateId,
+                    'to_affiliate_id' => $toAffiliate->id,
+                    'recipient_id' => $recipient->id,
+                    'status' => $initialStatus,
                 ],
                 [
                     'previous_asset_status' => 'ready',
+                    'new_asset_status' => $newAssetStatus,
                 ],
                 $request->ip(),
-                $originAffiliateId
+                $fromAffiliateId
             );
 
-            return $transferRecord->load(['asset.model.category', 'fromAffiliate', 'toAffiliate', 'sender']);
+            return $transferRecord->load([
+                'asset.model.category',
+                'fromAffiliate',
+                'toAffiliate',
+                'sender',
+                'recipient',
+                'approver',
+            ]);
         });
+
+        $message = $isOwner
+            ? 'Mutasi unit antar cabang berhasil diinisiasi dan langsung dalam pengiriman.'
+            : 'Pengajuan mutasi berhasil dikirim dan menunggu persetujuan Owner.';
 
         return response()->json([
             'success' => true,
-            'message' => 'Mutasi unit antar cabang berhasil diinisiasi dan status perangkat diubah menjadi Dalam Pengiriman.',
+            'message' => $message,
             'data' => $transfer,
         ], 201);
     }
 
     /**
-     * Destination branch accepts and receives transferred unit.
+     * Business Owner approves a pending transfer.
+     */
+    public function approve(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        if (!$user->isBusinessOwner($businessId) && !$user->isPlatformAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Business Owner yang berwenang menyetujui mutasi unit.',
+            ], 403);
+        }
+
+        return DB::transaction(function () use ($id, $businessId, $user, $request) {
+            $transfer = InventoryTransfer::where('business_id', $businessId)
+                ->where('id', $id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ($transfer->status !== 'pending') {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Mutasi tidak dapat disetujui karena berstatus: {$transfer->status}.",
+                ], 422);
+            }
+
+            $asset = Asset::where('business_id', $businessId)
+                ->where('id', $transfer->asset_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $transfer->update([
+                'status' => 'in_transit',
+                'approved_by' => $user->id,
+                'approved_at' => Carbon::now(),
+            ]);
+
+            $asset->update(['status' => 'in_transit']);
+
+            AuditLogService::log(
+                $user,
+                'transfer.approved',
+                'InventoryTransfer',
+                $transfer->id,
+                [
+                    'transfer_code' => $transfer->transfer_code,
+                    'approved_by' => $user->id,
+                ],
+                [
+                    'previous_status' => 'pending',
+                    'new_status' => 'in_transit',
+                ],
+                $request->ip(),
+                $transfer->from_affiliate_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Mutasi unit telah disetujui dan kini berstatus Dalam Pengiriman.',
+                'data' => $transfer->fresh([
+                    'asset.model.category',
+                    'fromAffiliate',
+                    'toAffiliate',
+                    'sender',
+                    'recipient',
+                    'approver',
+                ]),
+            ]);
+        });
+    }
+
+    /**
+     * Business Owner rejects a pending transfer.
+     */
+    public function reject(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        if (!$user->isBusinessOwner($businessId) && !$user->isPlatformAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Business Owner yang berwenang menolak mutasi unit.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'rejection_reason' => 'required|string|max:500',
+        ]);
+
+        return DB::transaction(function () use ($id, $businessId, $user, $validated, $request) {
+            $transfer = InventoryTransfer::where('business_id', $businessId)
+                ->where('id', $id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ($transfer->status !== 'pending') {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Mutasi tidak dapat ditolak karena berstatus: {$transfer->status}.",
+                ], 422);
+            }
+
+            $asset = Asset::where('business_id', $businessId)
+                ->where('id', $transfer->asset_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $transfer->update([
+                'status' => 'rejected',
+                'rejected_by' => $user->id,
+                'rejected_at' => Carbon::now(),
+                'rejection_reason' => $validated['rejection_reason'],
+            ]);
+
+            // Revert asset status from reserved back to ready
+            $asset->update(['status' => 'ready']);
+
+            AuditLogService::log(
+                $user,
+                'transfer.rejected',
+                'InventoryTransfer',
+                $transfer->id,
+                [
+                    'transfer_code' => $transfer->transfer_code,
+                    'rejected_by' => $user->id,
+                    'rejection_reason' => $validated['rejection_reason'],
+                ],
+                [
+                    'previous_status' => 'pending',
+                    'new_status' => 'rejected',
+                ],
+                $request->ip(),
+                $transfer->from_affiliate_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Mutasi unit telah ditolak dan unit telah dikembalikan ke status Siap Sewa.',
+                'data' => $transfer->fresh([
+                    'asset.model.category',
+                    'fromAffiliate',
+                    'toAffiliate',
+                    'sender',
+                    'recipient',
+                    'rejecter',
+                ]),
+            ]);
+        });
+    }
+
+    /**
+     * Assigned recipient accepts and receives transferred unit.
      */
     public function receive(Request $request, int $id): JsonResponse
     {
         $user = $request->user();
-        $affiliateId = $user->affiliate_id;
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
 
-        $transfer = InventoryTransfer::with('asset')->findOrFail($id);
+        return DB::transaction(function () use ($id, $businessId, $user, $request) {
+            $transfer = InventoryTransfer::where('business_id', $businessId)
+                ->where('id', $id)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        if ($affiliateId && !$user->isSuperAdmin() && $transfer->to_affiliate_id !== $affiliateId) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Hanya staf cabang tujuan yang berwenang menerima unit mutasi ini.',
-            ], 403);
-        }
+            // Strict authorization: Only the explicitly assigned recipient may confirm receipt!
+            if ($transfer->recipient_id && $transfer->recipient_id !== $user->id) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Hanya staf penerima yang ditugaskan secara khusus yang berwenang mengonfirmasi penerimaan unit ini.',
+                ], 403);
+            }
 
-        if ($transfer->status !== 'in_transit') {
-            return response()->json([
-                'success' => false,
-                'message' => "Unit tidak dapat diterima karena status saat ini: {$transfer->status}.",
-            ], 422);
-        }
+            if ($transfer->status !== 'in_transit') {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Unit tidak dapat diterima karena status saat ini: {$transfer->status}.",
+                ], 422);
+            }
 
-        DB::transaction(function () use ($transfer, $user, $request) {
+            $membership = $user->getBusinessMembership($businessId);
+            if (!$membership && !$user->isPlatformAdmin()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akun penerima sudah tidak aktif dalam bisnis rental ini.',
+                ], 403);
+            }
+
+            // Verify that the confirming recipient remains actively assigned to the destination branch
+            if (!$user->isPlatformAdmin() && !$user->isBusinessOwner($businessId)) {
+                $recipientBranchIds = $user->getBranchIdsForBusiness($businessId);
+                if (!in_array($transfer->to_affiliate_id, $recipientBranchIds)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Penerima tidak lagi terdaftar atau berwenang di cabang tujuan mutasi ini.',
+                    ], 403);
+                }
+            }
+
+            $asset = Asset::withoutGlobalScopes()
+                ->where('business_id', $businessId)
+                ->where('id', $transfer->asset_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
             $transfer->update([
                 'status' => 'received',
                 'received_by' => $user->id,
                 'received_at' => Carbon::now(),
             ]);
 
-            // Atomically transfer ownership & return asset to ready status
-            Asset::withoutGlobalScopes()->where('id', $transfer->asset_id)->update([
+            // Update physical location and set status to ready
+            $asset->update([
                 'affiliate_id' => $transfer->to_affiliate_id,
                 'status' => 'ready',
             ]);
@@ -209,6 +542,7 @@ class TransferController extends Controller
                     'transfer_code' => $transfer->transfer_code,
                     'new_affiliate_id' => $transfer->to_affiliate_id,
                     'new_asset_status' => 'ready',
+                    'received_by' => $user->id,
                 ],
                 [
                     'previous_transfer_status' => 'in_transit',
@@ -216,48 +550,68 @@ class TransferController extends Controller
                 $request->ip(),
                 $transfer->to_affiliate_id
             );
-        });
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Unit mutasi berhasil diterima dan kini siap disewakan di cabang Anda.',
-            'data' => $transfer->fresh(['asset.model.category', 'fromAffiliate', 'toAffiliate', 'receiver']),
-        ]);
+            return response()->json([
+                'success' => true,
+                'message' => 'Unit mutasi berhasil diterima dan kini siap disewakan di cabang Anda.',
+                'data' => $transfer->fresh([
+                    'asset.model.category',
+                    'fromAffiliate',
+                    'toAffiliate',
+                    'receiver',
+                    'recipient',
+                    'approver',
+                ]),
+            ]);
+        });
     }
 
     /**
-     * Source branch cancels an in-transit transfer before arrival.
+     * Sender or Owner cancels a pending or in-transit transfer.
      */
     public function cancel(Request $request, int $id): JsonResponse
     {
         $user = $request->user();
-        $affiliateId = $user->affiliate_id;
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
 
-        $transfer = InventoryTransfer::findOrFail($id);
+        return DB::transaction(function () use ($id, $businessId, $user, $request) {
+            $transfer = InventoryTransfer::where('business_id', $businessId)
+                ->where('id', $id)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        if ($affiliateId && !$user->isSuperAdmin() && $transfer->from_affiliate_id !== $affiliateId) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Hanya staf cabang pengirim yang dapat membatalkan mutasi ini.',
-            ], 403);
-        }
+            $isOwner = $user->isBusinessOwner($businessId);
+            $isSender = $transfer->sent_by === $user->id;
 
-        if ($transfer->status !== 'in_transit') {
-            return response()->json([
-                'success' => false,
-                'message' => "Mutasi tidak dapat dibatalkan karena berstatus: {$transfer->status}.",
-            ], 422);
-        }
+            if (!$isOwner && !$isSender && !$user->isPlatformAdmin()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Hanya pengirim atau Business Owner yang berwenang membatalkan mutasi ini.',
+                ], 403);
+            }
 
-        DB::transaction(function () use ($transfer, $user, $request) {
+            if (!in_array($transfer->status, ['pending', 'in_transit'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Mutasi tidak dapat dibatalkan karena berstatus: {$transfer->status}.",
+                ], 422);
+            }
+
+            $asset = Asset::withoutGlobalScopes()
+                ->where('business_id', $businessId)
+                ->where('id', $transfer->asset_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $previousStatus = $transfer->status;
+
             $transfer->update([
                 'status' => 'cancelled',
             ]);
 
-            // Restore asset to ready in origin branch
-            Asset::withoutGlobalScopes()->where('id', $transfer->asset_id)->update([
-                'status' => 'ready',
-            ]);
+            // Revert asset back to ready
+            $asset->update(['status' => 'ready']);
 
             AuditLogService::log(
                 $user,
@@ -266,19 +620,25 @@ class TransferController extends Controller
                 $transfer->id,
                 [
                     'transfer_code' => $transfer->transfer_code,
+                    'cancelled_by' => $user->id,
                 ],
                 [
-                    'previous_transfer_status' => 'in_transit',
+                    'previous_transfer_status' => $previousStatus,
                 ],
                 $request->ip(),
                 $transfer->from_affiliate_id
             );
-        });
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Mutasi berhasil dibatalkan dan status unit dikembalikan ke Siap Sewa di cabang asal.',
-            'data' => $transfer->fresh(),
-        ]);
+            return response()->json([
+                'success' => true,
+                'message' => 'Mutasi berhasil dibatalkan dan status unit dikembalikan ke Siap Sewa di cabang asal.',
+                'data' => $transfer->fresh([
+                    'asset.model.category',
+                    'fromAffiliate',
+                    'toAffiliate',
+                    'sender',
+                ]),
+            ]);
+        });
     }
 }

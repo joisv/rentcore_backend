@@ -20,7 +20,16 @@ class AuditLogService
         ?string $ipAddress = null,
         ?int $affiliateId = null
     ): AuditLog {
+        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+        if (!$businessId && $user) {
+            $businessId = $user->businesses()->first()?->id;
+        }
+        if (!$businessId && $affiliateId) {
+            $businessId = \App\Models\Affiliate::withoutGlobalScopes()->find($affiliateId)?->business_id;
+        }
+
         return AuditLog::create([
+            'business_id' => $businessId,
             'user_id' => $user?->id,
             'affiliate_id' => $affiliateId ?? $user?->affiliate_id,
             'action' => $action,

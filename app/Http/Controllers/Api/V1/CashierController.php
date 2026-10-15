@@ -127,6 +127,7 @@ class CashierController extends Controller
             $receiptNumber = sprintf('REC-%s-%s-%04d', $booking->affiliate->code ?? 'PST', $datePrefix, $booking->id);
 
             $paymentTx = PaymentTransaction::create([
+                'business_id' => $booking->business_id ?? $user->business_id,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'booking_id' => $booking->id,
@@ -189,6 +190,10 @@ class CashierController extends Controller
     public function receipt(string $id): JsonResponse
     {
         $user = request()->user();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+        $isSuperAdmin = $user && $user->isSuperAdmin();
+
         $tx = PaymentTransaction::with([
             'paymentMethod',
             'booking.customer',
@@ -198,12 +203,35 @@ class CashierController extends Controller
             'processedBy',
         ])->where('id', $id)->orWhere('receipt_number', $id)->firstOrFail();
 
-        // Franchise multi-tenant isolation
-        if ($user && $user->affiliate_id && !$user->isSuperAdmin() && $tx->booking->affiliate_id !== $user->affiliate_id) {
+        // Enforce business isolation
+        if ($businessId && $tx->business_id && (int)$tx->business_id !== (int)$businessId && !$isSuperAdmin && !$user->isPlatformAdmin()) {
             return response()->json([
                 'success' => false,
-                'message' => 'Anda tidak memiliki hak akses struk cabang lain.',
+                'message' => 'Akses ditolak. Transaksi bukan milik bisnis rental ini.',
             ], 403);
+        }
+
+        // Enforce branch isolation for branch staff
+        if ($user && !$isSuperAdmin && !$user->isPlatformAdmin()) {
+            $member = $tenantContext->getMember() ?? ($businessId ? $user->getBusinessMembership($businessId) : null);
+            $isOwner = $member ? $member->isOwner() : false;
+
+            if (!$isOwner) {
+                $allowedBranches = $user->getBranchIdsForBusiness($businessId);
+                if (empty($allowedBranches) && $user->affiliate_id) {
+                    $allowedBranches = [(int)$user->affiliate_id];
+                }
+                // If the booking is not visible (filtered by the branch-restricted TenantScope),
+                // it belongs to another branch: deny instead of dereferencing null.
+                $txBranchId = $tx->booking ? (int)$tx->booking->affiliate_id : null;
+                if ((!empty($allowedBranches) || $tenantContext->isBranchRestricted())
+                    && ($txBranchId === null || !in_array($txBranchId, array_map('intval', $allowedBranches), true))) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Anda tidak memiliki hak akses struk cabang lain.',
+                    ], 403);
+                }
+            }
         }
 
         $affiliate = $tx->booking->affiliate;
@@ -243,34 +271,161 @@ class CashierController extends Controller
     }
 
     /**
-     * Get closing shift summary for today or given date.
+     * Get closing shift summary for today or given date range.
      */
     public function closingSummary(Request $request): JsonResponse
     {
-        $date = $request->get('date', Carbon::today()->toDateString());
-        $start = Carbon::parse($date)->startOfDay();
-        $end = Carbon::parse($date)->endOfDay();
+        $startDate = $request->get('start_date');
+        $endDate = $request->get('end_date');
+        $dateParam = $request->get('date');
+
+        if ($startDate && $endDate) {
+            $start = Carbon::parse($startDate)->startOfDay();
+            $end = Carbon::parse($endDate)->endOfDay();
+            $dateLabel = $startDate . ' - ' . $endDate;
+        } elseif ($dateParam) {
+            $start = Carbon::parse($dateParam)->startOfDay();
+            $end = Carbon::parse($dateParam)->endOfDay();
+            $dateLabel = $dateParam;
+        } else {
+            $today = Carbon::today()->toDateString();
+            $start = Carbon::today()->startOfDay();
+            $end = Carbon::today()->endOfDay();
+            $dateLabel = $today;
+        }
 
         $user = $request->user();
-        $affiliateId = $user ? $user->affiliate_id : null;
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+        $isSuperAdmin = $user && $user->isSuperAdmin();
 
-        $query = PaymentTransaction::with(['paymentMethod', 'booking'])
-            ->whereBetween('transacted_at', [$start, $end]);
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwner = $member ? $member->isOwner() : ($isSuperAdmin || ($user && $user->isPlatformAdmin()));
+        $isCentralBranchStaff = false;
+        if ($user && $user->affiliate_id) {
+            $userAffiliate = \App\Models\Affiliate::find($user->affiliate_id);
+            $isCentralBranchStaff = (bool)($userAffiliate?->is_central ?? false);
+        }
+        $canAccessConsolidated = $isOwner || $isSuperAdmin || $isCentralBranchStaff;
 
-        // Enforce franchise multi-tenant isolation
-        if ($affiliateId && (!$user || !$user->isSuperAdmin())) {
-            $query->whereHas('booking', function ($bq) use ($affiliateId) {
-                $bq->where('affiliate_id', $affiliateId);
+        // Resolve requested branch from query parameter or header
+        $isAllBranches = $request->boolean('all_branches')
+            || $request->get('branch_id') === 'all'
+            || $request->get('branch_id') === '-1';
+
+        $rawBranchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id') ?? $request->header('X-Branch-Id'));
+        $requestedBranchId = ($rawBranchId !== null && $rawBranchId !== '' && $rawBranchId !== 'all') ? (int)$rawBranchId : null;
+        $targetBranchId = null;
+
+        // Authorize branch scope
+        if (!$canAccessConsolidated) {
+            $allowedBranches = $user ? $user->getBranchIdsForBusiness($businessId) : [];
+            if (empty($allowedBranches) && $user && $user->affiliate_id) {
+                $allowedBranches = [(int)$user->affiliate_id];
+            }
+
+            if ($isAllBranches) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses cabang ditolak. Anda tidak berwenang melihat laporan konsolidasi seluruh cabang.',
+                    'code' => 'BRANCH_ACCESS_DENIED',
+                ], 403);
+            }
+
+            if ($requestedBranchId !== null) {
+                if (!in_array($requestedBranchId, $allowedBranches, true)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Akses cabang ditolak. Anda tidak berwenang melihat laporan closing cabang lain.',
+                        'code' => 'BRANCH_ACCESS_DENIED',
+                    ], 403);
+                }
+                $targetBranchId = $requestedBranchId;
+            } else {
+                $targetBranchId = !empty($allowedBranches) ? $allowedBranches[0] : ($user && $user->affiliate_id ? (int)$user->affiliate_id : null);
+            }
+        } else {
+            // Business Owner / Platform Admin / Central Staff: specific branch or consolidated (null)
+            if (!$isAllBranches && $requestedBranchId !== null) {
+                if ($businessId) {
+                    $branchValid = \App\Models\Affiliate::where('id', $requestedBranchId)
+                        ->where('business_id', $businessId)
+                        ->where('is_active', true)
+                        ->exists();
+
+                    if (!$branchValid) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Cabang tidak valid untuk bisnis rental ini.',
+                            'code' => 'INVALID_BRANCH',
+                        ], 422);
+                    }
+                }
+                $targetBranchId = $requestedBranchId;
+            } else {
+                // Explicit all_branches or no branch specified by authorized central/owner
+                if (!$isAllBranches && !$businessId && $user && $user->affiliate_id && !$isSuperAdmin) {
+                    $targetBranchId = (int)$user->affiliate_id;
+                } else {
+                    $targetBranchId = null; // Consolidated
+                }
+            }
+        }
+
+        $query = PaymentTransaction::with([
+            'paymentMethod',
+            'booking' => fn($q) => $q->withoutGlobalScope(\App\Scopes\TenantScope::class),
+            'booking.affiliate',
+            'booking.customer',
+            'booking.items.asset.model',
+            'processedBy'
+        ])
+        ->whereBetween('transacted_at', [$start, $end]);
+
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('payment_transactions.business_id', $businessId)
+                  ->orWhereHas('booking', function ($bq) use ($businessId) {
+                      $bq->where('business_id', $businessId);
+                  });
             });
         }
 
-        $transactions = $query->get();
+        if ($targetBranchId !== null) {
+            $query->whereHas('booking', function ($bq) use ($targetBranchId) {
+                $bq->where('affiliate_id', $targetBranchId);
+            });
+        }
+
+        $transactions = $query->latest('transacted_at')->get();
 
         $breakdown = [];
         $totalRevenue = 0.00;
         $totalTransactions = $transactions->count();
 
+        $branchStats = [];
+        if ($businessId) {
+            $affiliates = \App\Models\Affiliate::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->get();
+            foreach ($affiliates as $aff) {
+                $branchStats[$aff->id] = [
+                    'branch_id' => $aff->id,
+                    'branch_name' => $aff->name,
+                    'branch_code' => $aff->code,
+                    'is_central' => (bool)$aff->is_central,
+                    'transaction_count' => 0,
+                    'total_revenue' => 0.00,
+                    'cash_revenue' => 0.00,
+                    'non_cash_revenue' => 0.00,
+                ];
+            }
+        }
+
         foreach ($transactions as $tx) {
+            $amount = (float)$tx->amount;
+            $totalRevenue += $amount;
+
             $methodName = $tx->paymentMethod->name ?? 'Lainnya';
             if (!isset($breakdown[$methodName])) {
                 $breakdown[$methodName] = [
@@ -279,18 +434,89 @@ class CashierController extends Controller
                 ];
             }
             $breakdown[$methodName]['count']++;
-            $breakdown[$methodName]['total'] += (float)$tx->amount;
-            $totalRevenue += (float)$tx->amount;
+            $breakdown[$methodName]['total'] += $amount;
+
+            $methodCode = strtolower($tx->paymentMethod->code ?? '');
+            $isCash = $methodCode === 'cash' || str_contains(strtolower($methodName), 'tunai');
+
+            $bId = $tx->booking?->affiliate_id;
+            if ($bId !== null) {
+                if (!isset($branchStats[$bId])) {
+                    $bName = $tx->booking?->affiliate?->name ?? ('Cabang #' . $bId);
+                    $bCode = $tx->booking?->affiliate?->code ?? 'CBG';
+                    $isCentral = (bool)($tx->booking?->affiliate?->is_central ?? false);
+                    $branchStats[$bId] = [
+                        'branch_id' => $bId,
+                        'branch_name' => $bName,
+                        'branch_code' => $bCode,
+                        'is_central' => $isCentral,
+                        'transaction_count' => 0,
+                        'total_revenue' => 0.00,
+                        'cash_revenue' => 0.00,
+                        'non_cash_revenue' => 0.00,
+                    ];
+                }
+                $branchStats[$bId]['transaction_count']++;
+                $branchStats[$bId]['total_revenue'] += $amount;
+                if ($isCash) {
+                    $branchStats[$bId]['cash_revenue'] += $amount;
+                } else {
+                    $branchStats[$bId]['non_cash_revenue'] += $amount;
+                }
+            }
         }
+
+        $branchBreakdownList = array_values($branchStats);
+        if ($targetBranchId !== null) {
+            $branchBreakdownList = array_values(array_filter($branchBreakdownList, fn($b) => $b['branch_id'] === $targetBranchId));
+        }
+
+        $limit = max(10, (int)$request->get('limit', $request->get('per_page', 50)));
+        $recentTransactions = $transactions->take($limit)->map(function ($tx) {
+            return [
+                'id' => $tx->id,
+                'transaction_code' => $tx->transaction_code,
+                'receipt_number' => $tx->receipt_number,
+                'booking_id' => $tx->booking_id,
+                'booking_code' => $tx->booking?->booking_code,
+                'customer_name' => $tx->booking?->customer?->name ?? 'Pelanggan',
+                'customer_phone' => $tx->booking?->customer?->phone ?? '',
+                'branch_id' => $tx->booking?->affiliate_id,
+                'branch_name' => $tx->booking?->affiliate?->name ?? ($tx->booking?->affiliate_id ? 'Cabang #' . $tx->booking->affiliate_id : 'Tidak Teridentifikasi'),
+                'is_central' => (bool)($tx->booking?->affiliate?->is_central ?? false),
+                'cashier_name' => $tx->processedBy?->name ?? 'Kasir',
+                'amount' => (float)$tx->amount,
+                'payment_method' => $tx->paymentMethod?->name ?? 'Tunai',
+                'type' => $tx->type,
+                'cash_received' => (float)$tx->cash_received,
+                'cash_change' => (float)$tx->cash_change,
+                'notes' => $tx->notes,
+                'transacted_at' => $tx->transacted_at?->toISOString() ?? (string)$tx->transacted_at,
+                'items_summary' => $tx->booking?->items?->map(function ($item) {
+                    $mName = $item->asset?->model?->name ?? 'Perangkat Apple';
+                    $sn = $item->asset?->serial_number;
+                    $imei = $item->asset?->imei_1;
+                    $desc = $mName;
+                    if ($sn) $desc .= ' (SN: ' . $sn . ')';
+                    elseif ($imei) $desc .= ' (IMEI: ' . $imei . ')';
+                    return $desc;
+                })->join(', '),
+            ];
+        });
 
         return response()->json([
             'success' => true,
             'data' => [
-                'date' => $date,
+                'branch_id' => $targetBranchId,
+                'is_consolidated' => $targetBranchId === null,
+                'date' => $dateLabel,
+                'start_date' => $start->toDateString(),
+                'end_date' => $end->toDateString(),
                 'total_revenue' => (float)$totalRevenue,
                 'total_transactions' => (int)$totalTransactions,
                 'breakdown_by_method' => (object)$breakdown,
-                'recent_transactions' => $transactions->take(10),
+                'breakdown_by_branch' => $branchBreakdownList,
+                'recent_transactions' => $recentTransactions,
             ],
         ]);
     }

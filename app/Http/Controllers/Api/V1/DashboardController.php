@@ -19,32 +19,103 @@ class DashboardController extends Controller
     public function kpi(Request $request): JsonResponse
     {
         $user = $request->user();
-        $affiliateId = $user ? $user->affiliate_id : null;
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
         $isSuperAdmin = $user && $user->isSuperAdmin();
+
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwner = $member ? $member->isOwner() : ($isSuperAdmin || ($user && $user->isPlatformAdmin()));
+        $isStaff = $member ? $member->isStaff() : ($user && $user->isStaff());
+
+        // Resolve requested branch from query parameter or header
+        $rawBranchId = $request->get('branch_id') ?? $request->get('affiliate_id') ?? $request->header('X-Branch-Id');
+        $requestedBranchId = $rawBranchId !== null ? (int)$rawBranchId : null;
+        $targetBranchId = null;
+
+        // Authorize branch scope
+        if ($user && ($isStaff || !$isOwner)) {
+            $allowedBranches = $user->getBranchIdsForBusiness($businessId);
+            if (empty($allowedBranches) && $user->affiliate_id) {
+                $allowedBranches = [(int)$user->affiliate_id];
+            }
+
+            if ($requestedBranchId !== null) {
+                if (!in_array($requestedBranchId, $allowedBranches, true)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Akses cabang ditolak. Anda tidak berwenang melihat data cabang ini.',
+                        'code' => 'BRANCH_ACCESS_DENIED',
+                    ], 403);
+                }
+                $targetBranchId = $requestedBranchId;
+            } else {
+                $targetBranchId = !empty($allowedBranches) ? $allowedBranches[0] : ($user->affiliate_id ? (int)$user->affiliate_id : null);
+            }
+        } else {
+            // Business Owner / Platform Admin: specific branch or consolidated (null)
+            if ($requestedBranchId !== null) {
+                if ($businessId) {
+                    $branchValid = \App\Models\Affiliate::where('id', $requestedBranchId)
+                        ->where('business_id', $businessId)
+                        ->where('is_active', true)
+                        ->exists();
+
+                    if (!$branchValid) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Cabang tidak valid untuk bisnis rental ini.',
+                            'code' => 'INVALID_BRANCH',
+                        ], 422);
+                    }
+                }
+                $targetBranchId = $requestedBranchId;
+            } else {
+                // If legacy user without business context
+                if (!$businessId && $user && $user->affiliate_id && !$isSuperAdmin) {
+                    $targetBranchId = (int)$user->affiliate_id;
+                } else {
+                    $targetBranchId = null; // Consolidated
+                }
+            }
+        }
 
         $now = Carbon::now();
         $todayStart = Carbon::today()->startOfDay();
         $todayEnd = Carbon::today()->endOfDay();
 
-        // 1. Asset Inventory Breakdown (Mutually Exclusive Statuses)
-        // Assets are automatically scoped by FranchiseTenantScope
-        $unitsTotal = Asset::count();
-        $unitsReady = Asset::where('status', 'ready')->count();
-        $unitsRented = Asset::where('status', 'rented')->count();
-        $unitsMaintenance = Asset::where('status', 'maintenance')->count();
-        $unitsInTransit = Asset::where('status', 'in_transit')->count();
+        // 1. Asset Inventory Breakdown (Scoped to target branch or consolidated)
+        $assetQuery = Asset::query();
+        if ($businessId) {
+            $assetQuery->where('business_id', $businessId);
+        }
+        if ($targetBranchId !== null) {
+            $assetQuery->where('affiliate_id', $targetBranchId);
+        }
+
+        $unitsTotal = (clone $assetQuery)->whereNotIn('status', ['retired', 'lost'])->count();
+        $unitsReady = (clone $assetQuery)->where('status', 'ready')->count();
+        $unitsRented = (clone $assetQuery)->where('status', 'rented')->count();
+        $unitsMaintenance = (clone $assetQuery)->where('status', 'maintenance')->count();
+        $unitsInTransit = (clone $assetQuery)->where('status', 'in_transit')->count();
         $utilizationRate = $unitsTotal > 0 ? round(($unitsRented / $unitsTotal) * 100, 1) : 0.0;
 
-        // 2. Operational Bookings Metrics
-        // Bookings are automatically scoped by FranchiseTenantScope
-        $dueToday = Booking::where('status', 'rented')
+        // 2. Operational Bookings Metrics (Scoped to target branch or consolidated)
+        $bookingQuery = Booking::query();
+        if ($businessId) {
+            $bookingQuery->where('business_id', $businessId);
+        }
+        if ($targetBranchId !== null) {
+            $bookingQuery->where('affiliate_id', $targetBranchId);
+        }
+
+        $dueToday = (clone $bookingQuery)->where('status', 'rented')
             ->whereBetween('end_at', [$todayStart, $todayEnd])
             ->count();
 
-        $todayRentalsCreated = Booking::whereBetween('created_at', [$todayStart, $todayEnd])->count();
+        $todayRentalsCreated = (clone $bookingQuery)->whereBetween('created_at', [$todayStart, $todayEnd])->count();
         $activeRentals = $unitsRented;
 
-        $overdueBookings = Booking::with(['customer', 'items.asset.model'])
+        $overdueBookings = (clone $bookingQuery)->with(['customer', 'items.asset.model'])
             ->where('status', 'rented')
             ->where('end_at', '<', $now)
             ->orderBy('end_at', 'asc')
@@ -81,7 +152,7 @@ class DashboardController extends Controller
         });
 
         // 3. Imminent Returns (within next 4 hours)
-        $imminentReturns = Booking::with(['customer', 'items.asset.model'])
+        $imminentReturns = (clone $bookingQuery)->with(['customer', 'items.asset.model'])
             ->where('status', 'rented')
             ->whereBetween('end_at', [$now, (clone $now)->addHours(4)])
             ->orderBy('end_at', 'asc')
@@ -102,19 +173,24 @@ class DashboardController extends Controller
                 ];
             });
 
-        // 4. Financial Summary Today (Multi-tenant scoped)
+        // 4. Financial Summary Today (Scoped by original transaction branch)
         $paymentQuery = PaymentTransaction::whereBetween('transacted_at', [$todayStart, $todayEnd]);
-        if ($affiliateId && !$isSuperAdmin) {
-            $paymentQuery->whereHas('booking', function ($bq) use ($affiliateId) {
-                $bq->where('affiliate_id', $affiliateId);
+        if ($businessId) {
+            $paymentQuery->where('business_id', $businessId);
+        }
+        if ($targetBranchId !== null) {
+            $paymentQuery->whereHas('booking', function ($bq) use ($targetBranchId) {
+                $bq->where('affiliate_id', $targetBranchId);
             });
         }
         $todayRevenue = (float)$paymentQuery->sum('amount');
-        $todayTransactionsCount = $paymentQuery->count();
+        $todayTransactionsCount = (int)$paymentQuery->count();
 
         return response()->json([
             'success' => true,
             'data' => [
+                'branch_id' => $targetBranchId,
+                'is_consolidated' => $targetBranchId === null,
                 'kpi' => [
                     // Inventory overview
                     'units_total' => $unitsTotal,

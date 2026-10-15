@@ -126,6 +126,7 @@ class ReturnService
                 $receiptNumber = sprintf('REC-PEN-%s-%04d', $datePrefix, $booking->id);
 
                 PaymentTransaction::create([
+                    'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
                     'transaction_code' => $txCode,
                     'receipt_number' => $receiptNumber,
                     'booking_id' => $booking->id,

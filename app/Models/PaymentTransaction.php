@@ -11,6 +11,7 @@ class PaymentTransaction extends Model
     use HasFactory;
 
     protected $fillable = [
+        'business_id',
         'transaction_code',
         'receipt_number',
         'booking_id',
@@ -31,6 +32,16 @@ class PaymentTransaction extends Model
         'transacted_at' => 'datetime',
     ];
 
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new \App\Scopes\TenantScope);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
+    }
+
     public function booking(): BelongsTo
     {
         return $this->belongsTo(Booking::class);
@@ -42,6 +53,11 @@ class PaymentTransaction extends Model
     }
 
     public function processor(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'processed_by');
+    }
+
+    public function processedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'processed_by');
     }

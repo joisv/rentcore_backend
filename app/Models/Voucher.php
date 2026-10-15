@@ -13,6 +13,7 @@ class Voucher extends Model
     use HasFactory;
 
     protected $fillable = [
+        'business_id',
         'affiliate_id',
         'code',
         'name',
@@ -41,6 +42,16 @@ class Voucher extends Model
         'usage_count' => 'integer',
         'is_active' => 'boolean',
     ];
+
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new \App\Scopes\TenantScope);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
+    }
 
     public function affiliate(): BelongsTo
     {

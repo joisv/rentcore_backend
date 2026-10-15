@@ -13,6 +13,7 @@ class AuditLog extends Model
     public $timestamps = false;
 
     protected $fillable = [
+        'business_id',
         'user_id',
         'affiliate_id',
         'action',
@@ -29,6 +30,11 @@ class AuditLog extends Model
         'new_values' => 'array',
         'created_at' => 'datetime',
     ];
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
+    }
 
     public function user(): BelongsTo
     {

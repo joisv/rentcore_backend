@@ -14,6 +14,7 @@ class Booking extends Model
     use HasFactory;
 
     protected $fillable = [
+        'business_id',
         'booking_code',
         'affiliate_id',
         'customer_id',
@@ -53,7 +54,12 @@ class Booking extends Model
 
     protected static function booted(): void
     {
-        static::addGlobalScope(new FranchiseTenantScope);
+        static::addGlobalScope(new \App\Scopes\TenantScope);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
     }
 
     public function affiliate(): BelongsTo

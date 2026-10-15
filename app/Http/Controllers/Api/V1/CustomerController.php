@@ -96,8 +96,15 @@ class CustomerController extends Controller
             'identity_photo' => 'nullable',
         ]);
 
+        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+
+        $searchAttrs = ['phone' => $request->phone];
+        if ($businessId) {
+            $searchAttrs['business_id'] = $businessId;
+        }
+
         $customer = Customer::firstOrCreate(
-            ['phone' => $request->phone],
+            $searchAttrs,
             [
                 'name' => $request->name,
                 'email' => $request->email,

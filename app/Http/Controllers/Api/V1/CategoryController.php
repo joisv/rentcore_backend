@@ -64,9 +64,29 @@ class CategoryController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+
         $validated = $request->validate([
-            'name' => 'required|string|max:100|unique:asset_categories,name',
-            'slug' => 'nullable|string|max:100|unique:asset_categories,slug',
+            'name' => [
+                'required',
+                'string',
+                'max:100',
+                \Illuminate\Validation\Rule::unique('asset_categories', 'name')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'slug' => [
+                'nullable',
+                'string',
+                'max:100',
+                \Illuminate\Validation\Rule::unique('asset_categories', 'slug')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'description' => 'nullable|string',
             'is_active' => 'nullable|boolean',
         ]);
@@ -74,6 +94,7 @@ class CategoryController extends Controller
         $slug = !empty($validated['slug']) ? Str::slug($validated['slug']) : Str::slug($validated['name']);
 
         $category = AssetCategory::create([
+            'business_id' => $businessId,
             'name' => $validated['name'],
             'slug' => $slug,
             'description' => $validated['description'] ?? null,
@@ -103,11 +124,39 @@ class CategoryController extends Controller
     public function update(Request $request, int $id): JsonResponse
     {
         $category = AssetCategory::findOrFail($id);
+
+        if ($category->business_id === null && !$request->user()->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Kategori sistem global tidak dapat diubah.',
+                'code' => 'GLOBAL_CATEGORY_IMMUTABLE',
+            ], 403);
+        }
+
         $old = $category->toArray();
+        $businessId = $category->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId();
 
         $validated = $request->validate([
-            'name' => 'nullable|string|max:100|unique:asset_categories,name,' . $category->id,
-            'slug' => 'nullable|string|max:100|unique:asset_categories,slug,' . $category->id,
+            'name' => [
+                'nullable',
+                'string',
+                'max:100',
+                \Illuminate\Validation\Rule::unique('asset_categories', 'name')->ignore($category->id)->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'slug' => [
+                'nullable',
+                'string',
+                'max:100',
+                \Illuminate\Validation\Rule::unique('asset_categories', 'slug')->ignore($category->id)->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'description' => 'nullable|string',
             'is_active' => 'nullable|boolean',
         ]);
@@ -132,6 +181,48 @@ class CategoryController extends Controller
             'success' => true,
             'message' => 'Kategori rental berhasil diperbarui.',
             'data' => $category,
+        ]);
+    }
+
+    /**
+     * Delete an existing category.
+     */
+    public function destroy(Request $request, int $id): JsonResponse
+    {
+        $category = AssetCategory::findOrFail($id);
+
+        if ($category->business_id === null && !$request->user()->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Kategori sistem global tidak dapat dihapus.',
+                'code' => 'GLOBAL_CATEGORY_IMMUTABLE',
+            ], 403);
+        }
+
+        if ($category->models()->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Kategori tidak dapat dihapus karena masih memiliki model produk terdaftar.',
+                'code' => 'CATEGORY_HAS_MODELS',
+            ], 422);
+        }
+
+        $old = $category->toArray();
+        $category->delete();
+
+        AuditLogService::log(
+            $request->user(),
+            'category.deleted',
+            'AssetCategory',
+            $id,
+            null,
+            $old,
+            $request->ip()
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kategori rental berhasil dihapus.',
         ]);
     }
 }

@@ -28,6 +28,18 @@ class PricingTier extends Model
         'is_active' => 'boolean',
     ];
 
+    protected static function booted(): void
+    {
+        static::creating(function ($tier) {
+            if (empty($tier->duration_unit)) {
+                $tier->duration_unit = 'hour';
+            }
+            if (empty($tier->duration_value) && !empty($tier->duration_hours)) {
+                $tier->duration_value = $tier->duration_hours;
+            }
+        });
+    }
+
     public function model(): BelongsTo
     {
         return $this->belongsTo(AssetModel::class, 'model_id');

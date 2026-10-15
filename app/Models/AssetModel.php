@@ -12,6 +12,7 @@ class AssetModel extends Model
     use HasFactory;
 
     protected $fillable = [
+        'business_id',
         'category_id',
         'brand',
         'name',
@@ -33,6 +34,16 @@ class AssetModel extends Model
         'requires_frp_check' => 'boolean',
         'is_active' => 'boolean',
     ];
+
+    protected static function booted(): void
+    {
+        static::addGlobalScope(new \App\Scopes\TenantScope);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(Business::class);
+    }
 
     public function category(): BelongsTo
     {

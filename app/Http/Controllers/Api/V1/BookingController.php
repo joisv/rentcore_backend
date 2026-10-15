@@ -25,7 +25,70 @@ class BookingController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $query = Booking::with(['customer', 'items.asset.model', 'payments.paymentMethod']);
+        $user = $request->user();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+        $isSuperAdmin = $user && $user->isSuperAdmin();
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwner = $member ? $member->isOwner() : ($isSuperAdmin || ($user && $user->isPlatformAdmin()));
+        $isCentralBranchStaff = false;
+        if ($user && $user->affiliate_id) {
+            $userAffiliate = \App\Models\Affiliate::find($user->affiliate_id);
+            $isCentralBranchStaff = (bool)($userAffiliate?->is_central ?? false);
+        }
+
+        $query = Booking::with([
+            'customer',
+            'items.asset.model',
+            'payments.paymentMethod',
+            'payments.processedBy',
+            'affiliate',
+            'creator',
+        ]);
+
+        $isAllBranches = $request->boolean('all_branches')
+            || $request->get('branch_id') === 'all'
+            || $request->get('branch_id') === '-1';
+
+        $branchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id'));
+        $canAccessConsolidated = $isOwner || $isSuperAdmin || $isCentralBranchStaff;
+
+        if (!$canAccessConsolidated) {
+            if ($isAllBranches) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses ditolak. Anda tidak berwenang melihat transaksi sewa seluruh cabang.',
+                ], 403);
+            }
+            $allowedBranches = $user ? $user->getBranchIdsForBusiness($businessId) : [];
+            if (empty($allowedBranches) && $user && $user->affiliate_id) {
+                $allowedBranches = [(int)$user->affiliate_id];
+            }
+            if ($branchId !== null && !in_array((int)$branchId, $allowedBranches, true)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses ditolak. Anda tidak berwenang melihat transaksi sewa cabang lain.',
+                ], 403);
+            }
+            if ($branchId === null && !empty($allowedBranches)) {
+                $query->whereIn('affiliate_id', $allowedBranches);
+            } elseif ($branchId !== null) {
+                $query->where('affiliate_id', (int)$branchId);
+            }
+        } else {
+            if ($isAllBranches) {
+                $query->withoutGlobalScope(\App\Scopes\TenantScope::class);
+                if ($businessId) {
+                    $query->where('bookings.business_id', $businessId);
+                }
+            } elseif ($branchId !== null) {
+                $query->withoutGlobalScope(\App\Scopes\TenantScope::class);
+                if ($businessId) {
+                    $query->where('bookings.business_id', $businessId);
+                }
+                $query->where('affiliate_id', (int)$branchId);
+            }
+        }
 
         if ($request->has('status')) {
             if ($request->status === 'overdue') {
@@ -64,6 +127,7 @@ class BookingController extends Controller
     public function store(Request $request): JsonResponse
     {
         $request->validate([
+            'affiliate_id' => 'nullable|integer|exists:affiliates,id',
             'customer_name' => 'required|string|max:150',
             'customer_phone' => 'required|string|max:30',
             'customer_email' => 'nullable|email',
@@ -88,9 +152,22 @@ class BookingController extends Controller
             'collateral_type' => 'nullable|string|max:50',
             'collateral_storage_slot' => 'nullable|string|max:100',
             'notes' => 'nullable|string',
+            'unit_prices' => 'nullable|array',
+            'unit_prices.*' => 'numeric|min:0',
         ]);
 
-        $booking = $this->bookingService->createCounterRental($request->all(), $request->user());
+        $payload = $request->all();
+        $headerBranchId = $request->header('X-Branch-Id') ? (int)$request->header('X-Branch-Id') : null;
+        if (!empty($payload['affiliate_id']) && $headerBranchId && (int)$payload['affiliate_id'] !== $headerBranchId) {
+            throw \Illuminate\Validation\ValidationException::withMessages([
+                'affiliate_id' => ['Cabang transaksi tidak sesuai dengan cabang aktif yang dipilih.'],
+            ]);
+        }
+        if (empty($payload['affiliate_id']) && $headerBranchId) {
+            $payload['affiliate_id'] = $headerBranchId;
+        }
+
+        $booking = $this->bookingService->createCounterRental($payload, $request->user());
 
         return response()->json([
             'success' => true,
@@ -108,8 +185,9 @@ class BookingController extends Controller
             'customer.identities',
             'items.asset.model',
             'payments.paymentMethod',
+            'payments.processedBy',
             'voucher',
-            'extensions',
+            'extensions.extender',
             'returnInspection.inspector',
             'creator',
             'affiliate'
