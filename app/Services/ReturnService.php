@@ -102,8 +102,14 @@ class ReturnService
             ]);
 
             // 4. Update Booking Status
+            $newPaymentStatus = $booking->payment_status;
+            if ($totalPenalty > 0 && empty($data['penalty_payment_method_id'])) {
+                $newPaymentStatus = 'partial';
+            }
+
             $booking->update([
                 'status' => 'returned',
+                'payment_status' => $newPaymentStatus,
             ]);
 
             // 5. Update Asset Status (ready if grade A/B without damage, maintenance if damaged)
@@ -120,25 +126,54 @@ class ReturnService
 
             // 6. Record Penalty Payment if applicable
             if ($totalPenalty > 0 && !empty($data['penalty_payment_method_id'])) {
-                $paymentMethod = PaymentMethod::findOrFail($data['penalty_payment_method_id']);
-                $datePrefix = Carbon::now()->format('ymd');
-                $txCode = sprintf('TX-PEN-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
-                $receiptNumber = sprintf('REC-PEN-%s-%04d', $datePrefix, $booking->id);
+                $existingPenaltyTx = PaymentTransaction::where('booking_id', $booking->id)
+                    ->where('type', 'penalty')
+                    ->first();
 
-                PaymentTransaction::create([
-                    'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
-                    'transaction_code' => $txCode,
-                    'receipt_number' => $receiptNumber,
-                    'booking_id' => $booking->id,
-                    'payment_method_id' => $paymentMethod->id,
-                    'processed_by' => $inspector->id,
-                    'type' => 'penalty',
-                    'amount' => $totalPenalty,
-                    'cash_received' => $data['cash_received'] ?? $totalPenalty,
-                    'cash_change' => 0.00,
-                    'notes' => 'Pembayaran denda keterlambatan/kerusakan unit',
-                    'transacted_at' => Carbon::now(),
-                ]);
+                if (!$existingPenaltyTx) {
+                    $paymentMethod = PaymentMethod::findOrFail($data['penalty_payment_method_id']);
+                    $isCash = strtoupper($paymentMethod->code) === 'CASH';
+                    $amountToPay = $totalPenalty;
+
+                    if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $amountToPay) {
+                        throw ValidationException::withMessages([
+                            'cash_received' => [
+                                'Jumlah uang tunai yang diterima (Rp ' . number_format((float)$data['cash_received'], 0, ',', '.') . 
+                                ') kurang dari total tagihan denda (Rp ' . number_format($amountToPay, 0, ',', '.') . ').'
+                            ],
+                        ]);
+                    }
+
+                    $cashReceived = $isCash ? (float)($data['cash_received'] ?? $amountToPay) : $amountToPay;
+                    $cashChange = $isCash ? max(0, $cashReceived - $amountToPay) : 0.00;
+
+                    $datePrefix = Carbon::now()->format('ymd');
+                    $countToday = PaymentTransaction::withoutGlobalScopes()
+                        ->whereDate('created_at', Carbon::today())
+                        ->count() + 1;
+                    $randomSuffix = strtoupper(substr(uniqid(), -4));
+                    $txCode = sprintf('TX-PEN-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                    $receiptNumber = sprintf('REC-PEN-%s-%s-%04d', $booking->affiliate->code ?? 'CTR', $datePrefix, $booking->id);
+
+                    PaymentTransaction::create([
+                        'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
+                        'transaction_code' => $txCode,
+                        'receipt_number' => $receiptNumber,
+                        'booking_id' => $booking->id,
+                        'payment_method_id' => $paymentMethod->id,
+                        'processed_by' => $inspector->id,
+                        'type' => 'penalty',
+                        'amount' => $amountToPay,
+                        'cash_received' => $cashReceived,
+                        'cash_change' => $cashChange,
+                        'notes' => 'Pembayaran denda keterlambatan/kerusakan unit',
+                        'transacted_at' => Carbon::now(),
+                    ]);
+
+                    $booking->update([
+                        'payment_status' => 'paid',
+                    ]);
+                }
             }
 
             // 7. Immutable Security Audit Logging

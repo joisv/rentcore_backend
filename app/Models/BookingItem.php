@@ -32,6 +32,6 @@ class BookingItem extends Model
 
     public function asset(): BelongsTo
     {
-        return $this->belongsTo(Asset::class);
+        return $this->belongsTo(Asset::class)->withoutGlobalScope(\App\Scopes\TenantScope::class);
     }
 }

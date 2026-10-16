@@ -148,6 +148,13 @@ class CashierController extends Controller
                     ->sum('amount');
                 $newPaymentStatus = ($newTotalPaid >= (float)$lockedBooking->total_bill) ? 'paid' : 'partial';
                 $lockedBooking->update(['payment_status' => $newPaymentStatus]);
+            } elseif ($type === 'penalty') {
+                $totalPenaltyPaid = (float)$lockedBooking->payments()->where('type', 'penalty')->sum('amount');
+                $totalPenaltyDue = (float)($lockedBooking->returnInspection?->total_penalty ?? 0.0);
+                $isRentalSettled = ((float)$lockedBooking->payments()->whereIn('type', ['dp', 'settlement', 'extension'])->sum('amount')) >= (float)$lockedBooking->total_bill;
+                if ($isRentalSettled && $totalPenaltyPaid >= $totalPenaltyDue) {
+                    $lockedBooking->update(['payment_status' => 'paid']);
+                }
             }
 
             // Security Audit Log
@@ -264,6 +271,10 @@ class CashierController extends Controller
                 'voucher_code' => $tx->booking->voucher->code ?? null,
                 'total_amount' => (float)$tx->amount,
                 'payment_method' => $tx->paymentMethod->name ?? 'Tunai',
+                'type' => $tx->type,
+                'type_label' => $tx->type === 'penalty'
+                    ? 'Denda Keterlambatan (Late Return Penalty)'
+                    : ($tx->type === 'extension' ? 'Perpanjangan Sewa' : 'Sewa Kontrak Pokok'),
                 'cash_received' => (float)$tx->cash_received,
                 'cash_change' => (float)$tx->cash_change,
             ],
@@ -422,9 +433,27 @@ class CashierController extends Controller
             }
         }
 
+        $typeBreakdown = [
+            'rental' => ['label' => 'Sewa Kontrak Pokok', 'count' => 0, 'total' => 0.00],
+            'extension' => ['label' => 'Perpanjangan Sewa', 'count' => 0, 'total' => 0.00],
+            'penalty' => ['label' => 'Denda Keterlambatan (Late Return Penalty)', 'count' => 0, 'total' => 0.00],
+        ];
+
         foreach ($transactions as $tx) {
             $amount = (float)$tx->amount;
             $totalRevenue += $amount;
+
+            $txType = $tx->type ?? 'settlement';
+            if ($txType === 'penalty') {
+                $typeBreakdown['penalty']['count']++;
+                $typeBreakdown['penalty']['total'] += $amount;
+            } elseif ($txType === 'extension') {
+                $typeBreakdown['extension']['count']++;
+                $typeBreakdown['extension']['total'] += $amount;
+            } else {
+                $typeBreakdown['rental']['count']++;
+                $typeBreakdown['rental']['total'] += $amount;
+            }
 
             $methodName = $tx->paymentMethod->name ?? 'Lainnya';
             if (!isset($breakdown[$methodName])) {
@@ -488,6 +517,9 @@ class CashierController extends Controller
                 'amount' => (float)$tx->amount,
                 'payment_method' => $tx->paymentMethod?->name ?? 'Tunai',
                 'type' => $tx->type,
+                'type_label' => $tx->type === 'penalty'
+                    ? 'Denda Keterlambatan (Late Return Penalty)'
+                    : ($tx->type === 'extension' ? 'Perpanjangan Sewa' : ($tx->type === 'dp' ? 'Uang Muka (DP)' : 'Sewa Kontrak Pokok')),
                 'cash_received' => (float)$tx->cash_received,
                 'cash_change' => (float)$tx->cash_change,
                 'notes' => $tx->notes,
@@ -514,6 +546,7 @@ class CashierController extends Controller
                 'end_date' => $end->toDateString(),
                 'total_revenue' => (float)$totalRevenue,
                 'total_transactions' => (int)$totalTransactions,
+                'breakdown_by_type' => (object)$typeBreakdown,
                 'breakdown_by_method' => (object)$breakdown,
                 'breakdown_by_branch' => $branchBreakdownList,
                 'recent_transactions' => $recentTransactions,

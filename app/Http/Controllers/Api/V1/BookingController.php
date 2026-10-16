@@ -50,7 +50,17 @@ class BookingController extends Controller
             || $request->get('branch_id') === 'all'
             || $request->get('branch_id') === '-1';
 
-        $branchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id'));
+        $rawBranchId = $isAllBranches ? null : (
+            $request->get('branch_id')
+            ?? $request->get('affiliate_id')
+            ?? $request->header('X-Branch-Id')
+            ?? ($tenantContext->hasActiveBranch() ? $tenantContext->getBranchId() : null)
+        );
+
+        $branchId = ($rawBranchId !== null && $rawBranchId !== '' && $rawBranchId !== 'null')
+            ? (int)$rawBranchId
+            : null;
+
         $canAccessConsolidated = $isOwner || $isSuperAdmin || $isCentralBranchStaff;
 
         if (!$canAccessConsolidated) {
@@ -71,9 +81,10 @@ class BookingController extends Controller
                 ], 403);
             }
             if ($branchId === null && !empty($allowedBranches)) {
-                $query->whereIn('affiliate_id', $allowedBranches);
-            } elseif ($branchId !== null) {
-                $query->where('affiliate_id', (int)$branchId);
+                $branchId = $allowedBranches[0];
+            }
+            if ($branchId !== null) {
+                $query->where('bookings.affiliate_id', (int)$branchId);
             }
         } else {
             if ($isAllBranches) {
@@ -82,30 +93,65 @@ class BookingController extends Controller
                     $query->where('bookings.business_id', $businessId);
                 }
             } elseif ($branchId !== null) {
+                // Verify the requested branch belongs to this business
+                if ($businessId) {
+                    $branchValid = \App\Models\Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+                        ->where('id', $branchId)
+                        ->where('business_id', $businessId)
+                        ->exists();
+
+                    if (!$branchValid) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Cabang tidak ditemukan atau tidak berada dalam bisnis Anda.',
+                        ], 404);
+                    }
+                }
+
                 $query->withoutGlobalScope(\App\Scopes\TenantScope::class);
                 if ($businessId) {
                     $query->where('bookings.business_id', $businessId);
                 }
-                $query->where('affiliate_id', (int)$branchId);
+                $query->where('bookings.affiliate_id', (int)$branchId);
+            } else {
+                // Owner / Consolidated user did not specify all_branches and did not specify a branch
+                // Scope to user's assigned branch if available, or first active branch of business
+                $fallbackBranch = $user && $user->affiliate_id ? (int)$user->affiliate_id : null;
+                if (!$fallbackBranch && $businessId) {
+                    $firstBranch = \App\Models\Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+                        ->where('business_id', $businessId)
+                        ->where('is_active', true)
+                        ->first();
+                    $fallbackBranch = $firstBranch?->id;
+                }
+
+                if ($fallbackBranch) {
+                    $query->withoutGlobalScope(\App\Scopes\TenantScope::class);
+                    if ($businessId) {
+                        $query->where('bookings.business_id', $businessId);
+                    }
+                    $query->where('bookings.affiliate_id', $fallbackBranch);
+                }
             }
         }
 
         if ($request->has('status')) {
             if ($request->status === 'overdue') {
-                $query->where('status', 'rented')->where('end_at', '<', Carbon::now());
+                $query->where('bookings.status', 'rented')
+                      ->where('bookings.end_at', '<=', Carbon::now());
             } else {
-                $query->where('status', $request->status);
+                $query->where('bookings.status', $request->status);
             }
         }
 
         if ($request->has('payment_status')) {
-            $query->where('payment_status', $request->payment_status);
+            $query->where('bookings.payment_status', $request->payment_status);
         }
 
         if ($request->has('search')) {
             $search = $request->search;
             $query->where(function ($q) use ($search) {
-                $q->where('booking_code', 'like', "%{$search}%")
+                $q->where('bookings.booking_code', 'like', "%{$search}%")
                   ->orWhereHas('customer', function ($cq) use ($search) {
                       $cq->where('name', 'like', "%{$search}%")
                          ->orWhere('phone', 'like', "%{$search}%");
