@@ -66,7 +66,7 @@ class CashierController extends Controller
             // Re-fetch booking with row-level pessimistic lock
             $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->first();
 
-            if ($type === 'settlement') {
+            if ($type === 'settlement' || $type === 'extension') {
                 $alreadyPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension'])
                     ->sum('amount');
@@ -137,12 +137,12 @@ class CashierController extends Controller
                 'amount' => $amountToPay,
                 'cash_received' => $cashReceived,
                 'cash_change' => $cashChange,
-                'notes' => $request->notes ?? ($type === 'penalty' ? 'Pelunasan denda via Kasir POS' : 'Pembayaran sewa via Kasir POS'),
+                'notes' => $request->notes ?? ($type === 'penalty' ? 'Pelunasan denda via Kasir POS' : ($type === 'extension' ? 'Pembayaran perpanjangan sewa via Kasir POS' : 'Pembayaran sewa via Kasir POS')),
                 'transacted_at' => Carbon::now(),
             ]);
 
             // Update booking payment status
-            if ($type === 'settlement') {
+            if ($type === 'settlement' || $type === 'extension') {
                 $newTotalPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension'])
                     ->sum('amount');

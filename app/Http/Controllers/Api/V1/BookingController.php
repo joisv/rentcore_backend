@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Models\Booking;
+use App\Models\PaymentMethod;
+use App\Models\PaymentTransaction;
 use App\Models\PricingTier;
 use App\Models\RentalExtension;
 use App\Services\AuditLogService;
@@ -12,6 +14,8 @@ use App\Services\ReturnService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 
 class BookingController extends Controller
 {
@@ -257,88 +261,154 @@ class BookingController extends Controller
         $request->validate([
             'additional_hours' => 'required|integer|min:1|max:72',
             'additional_fee' => 'nullable|numeric|min:0',
+            'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'cash_received' => 'nullable|numeric|min:0',
+            'notes' => 'nullable|string|max:255',
         ]);
 
-        $booking = Booking::findOrFail($id);
+        return DB::transaction(function () use ($request, $id) {
+            $booking = Booking::with(['items.asset.model', 'affiliate'])
+                ->lockForUpdate()
+                ->findOrFail($id);
 
-        if ($booking->status !== 'rented') {
-            return response()->json([
-                'success' => false,
-                'message' => 'Hanya rental berstatus aktif (rented) yang dapat diperpanjang.',
-            ], 422);
-        }
+            if ($booking->status !== 'rented') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Hanya rental berstatus aktif (rented) yang dapat diperpanjang.',
+                ], 422);
+            }
 
-        $additionalHours = (int)$request->additional_hours;
-        $previousEndAt = Carbon::parse($booking->end_at);
-        $newEndAt = (clone $previousEndAt)->addHours($additionalHours);
+            $additionalHours = (int)$request->additional_hours;
+            $previousEndAt = Carbon::parse($booking->end_at);
+            $newEndAt = (clone $previousEndAt)->addHours($additionalHours);
 
-        // Collision check: verify asset is not booked for subsequent confirmed reservation
-        $assetIds = $booking->items->pluck('asset_id')->toArray();
-        $collision = Booking::where('id', '!=', $booking->id)
-            ->whereIn('status', ['confirmed', 'rented'])
-            ->whereHas('items', function ($iq) use ($assetIds) {
-                $iq->whereIn('asset_id', $assetIds);
-            })
-            ->where(function ($tq) use ($previousEndAt, $newEndAt) {
-                $tq->where('start_at', '<', $newEndAt)
-                   ->where('end_at', '>', $previousEndAt);
-            })
-            ->first();
+            // Collision check: verify asset is not booked for subsequent confirmed reservation
+            $assetIds = $booking->items->pluck('asset_id')->toArray();
+            $collision = Booking::where('id', '!=', $booking->id)
+                ->whereIn('status', ['confirmed', 'rented'])
+                ->whereHas('items', function ($iq) use ($assetIds) {
+                    $iq->whereIn('asset_id', $assetIds);
+                })
+                ->where(function ($tq) use ($previousEndAt, $newEndAt) {
+                    $tq->where('start_at', '<', $newEndAt)
+                       ->where('end_at', '>', $previousEndAt);
+                })
+                ->first();
 
-        if ($collision) {
-            return response()->json([
-                'success' => false,
-                'message' => "Tidak dapat memperpanjang sewa. Perangkat telah dipesan untuk jadwal berikutnya (Booking: {$collision->booking_code}).",
-            ], 422);
-        }
+            if ($collision) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Tidak dapat memperpanjang sewa. Perangkat telah dipesan untuk jadwal berikutnya (Booking: {$collision->booking_code}).",
+                ], 422);
+            }
 
-        // Calculate extension fee (default: 15,000/hr)
-        $additionalFee = $request->additional_fee !== null 
-            ? (float)$request->additional_fee 
-            : ($additionalHours * 15000);
+            // Authoritative calculation from PricingTier
+            $hourlyRate = 15000.00;
+            $firstItem = $booking->items()->first();
+            if ($firstItem && $firstItem->asset) {
+                $tier = PricingTier::where('model_id', $firstItem->asset->model_id)->first();
+                if ($tier && (float)$tier->extension_hourly_rate > 0) {
+                    $hourlyRate = (float)$tier->extension_hourly_rate;
+                }
+            }
+            $additionalFee = $request->filled('additional_fee')
+                ? (float)$request->additional_fee
+                : ($additionalHours * $hourlyRate);
 
-        $extension = RentalExtension::create([
-            'booking_id' => $booking->id,
-            'extended_by' => $request->user()->id,
-            'previous_end_at' => $previousEndAt,
-            'new_end_at' => $newEndAt,
-            'additional_hours' => $additionalHours,
-            'additional_fee' => $additionalFee,
-        ]);
-
-        $booking->update([
-            'end_at' => $newEndAt,
-            'duration_hours' => $booking->duration_hours + $additionalHours,
-            'total_bill' => $booking->total_bill + $additionalFee,
-        ]);
-
-        // Immutable Audit Log
-        AuditLogService::log(
-            $request->user(),
-            'booking.extended',
-            'RentalExtension',
-            $extension->id,
-            [
-                'booking_code' => $booking->booking_code,
+            $extension = RentalExtension::create([
+                'booking_id' => $booking->id,
+                'extended_by' => $request->user()->id,
+                'previous_end_at' => $previousEndAt,
+                'new_end_at' => $newEndAt,
                 'additional_hours' => $additionalHours,
                 'additional_fee' => $additionalFee,
-                'new_end_at' => $newEndAt->toDateTimeString(),
-            ],
-            [
-                'previous_end_at' => $previousEndAt->toDateTimeString(),
-            ],
-            $request->ip(),
-            $booking->affiliate_id
-        );
+            ]);
 
-        return response()->json([
-            'success' => true,
-            'message' => "Sewa berhasil diperpanjang {$additionalHours} jam hingga {$newEndAt->format('d M Y, H:i')}.",
-            'data' => [
-                'booking' => $booking->fresh(['items.asset.model', 'extensions']),
-                'extension' => $extension,
-            ],
-        ]);
+            $newTotalBill = (float)$booking->total_bill + $additionalFee;
+            $paymentTx = null;
+
+            if ($request->filled('payment_method_id')) {
+                $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+                $isCash = strtoupper($paymentMethod->code) === 'CASH';
+
+                if ($isCash) {
+                    $cashReceived = (float)($request->cash_received ?? $additionalFee);
+                    if ($cashReceived < $additionalFee) {
+                        throw ValidationException::withMessages([
+                            'cash_received' => [
+                                'Jumlah uang tunai yang diterima (Rp ' . number_format($cashReceived, 0, ',', '.') . 
+                                ') kurang dari biaya perpanjangan (Rp ' . number_format($additionalFee, 0, ',', '.') . ').'
+                            ],
+                        ]);
+                    }
+                    $cashChange = max(0, $cashReceived - $additionalFee);
+                } else {
+                    $cashReceived = $additionalFee;
+                    $cashChange = 0.00;
+                }
+
+                $datePrefix = Carbon::now()->format('ymd');
+                $txCode = sprintf('TX-EXT-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
+                $receiptNumber = sprintf('REC-EXT-%s-%s-%04d', $booking->affiliate->code ?? 'PST', $datePrefix, $booking->id);
+
+                $paymentTx = PaymentTransaction::create([
+                    'business_id' => $booking->business_id ?? $request->user()->business_id,
+                    'transaction_code' => $txCode,
+                    'receipt_number' => $receiptNumber,
+                    'booking_id' => $booking->id,
+                    'payment_method_id' => $paymentMethod->id,
+                    'processed_by' => $request->user()->id,
+                    'type' => 'extension',
+                    'amount' => $additionalFee,
+                    'cash_received' => $cashReceived,
+                    'cash_change' => $cashChange,
+                    'notes' => $request->notes ?? "Pembayaran perpanjangan sewa {$additionalHours} jam",
+                    'transacted_at' => Carbon::now(),
+                ]);
+            }
+
+            $alreadyPaid = (float)$booking->payments()->whereIn('type', ['dp', 'settlement', 'extension'])->sum('amount')
+                + ($paymentTx ? (float)$paymentTx->amount : 0.0);
+            $newPaymentStatus = ($alreadyPaid >= $newTotalBill) ? 'paid' : 'partial';
+
+            $booking->update([
+                'end_at' => $newEndAt,
+                'duration_hours' => $booking->duration_hours + $additionalHours,
+                'total_bill' => $newTotalBill,
+                'payment_status' => $newPaymentStatus,
+            ]);
+
+            // Immutable Audit Log
+            AuditLogService::log(
+                $request->user(),
+                'booking.extended',
+                'RentalExtension',
+                $extension->id,
+                [
+                    'booking_code' => $booking->booking_code,
+                    'additional_hours' => $additionalHours,
+                    'additional_fee' => $additionalFee,
+                    'new_end_at' => $newEndAt->toDateTimeString(),
+                    'payment_recorded' => $paymentTx !== null,
+                ],
+                [
+                    'previous_end_at' => $previousEndAt->toDateTimeString(),
+                ],
+                $request->ip(),
+                $booking->affiliate_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => "Sewa berhasil diperpanjang {$additionalHours} jam hingga {$newEndAt->format('d M Y, H:i')}.",
+                'data' => [
+                    'booking' => $booking->fresh(['items.asset.model', 'extensions', 'payments.paymentMethod']),
+                    'extension' => $extension,
+                    'payment' => $paymentTx,
+                    'receipt_number' => $paymentTx?->receipt_number,
+                ],
+            ]);
+        });
     }
 
     /**
