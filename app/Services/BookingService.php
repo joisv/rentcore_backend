@@ -406,12 +406,15 @@ class BookingService
 
             PaymentTransaction::create([
                 'business_id' => $businessId,
+                'branch_id' => $affiliateId,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'booking_id' => $booking->id,
                 'payment_method_id' => $paymentMethod->id,
                 'processed_by' => $cashier->id,
                 'type' => 'settlement',
+                'status' => 'completed',
+                'direction' => 'inflow',
                 'amount' => $totalBill,
                 'cash_received' => $cashReceived,
                 'cash_change' => $cashChange,

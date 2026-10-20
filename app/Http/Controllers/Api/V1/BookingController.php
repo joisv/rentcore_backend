@@ -10,6 +10,7 @@ use App\Models\PricingTier;
 use App\Models\RentalExtension;
 use App\Services\AuditLogService;
 use App\Services\BookingService;
+use App\Services\ExchangeService;
 use App\Services\ReturnService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
@@ -21,7 +22,8 @@ class BookingController extends Controller
 {
     public function __construct(
         protected BookingService $bookingService,
-        protected ReturnService $returnService
+        protected ReturnService $returnService,
+        protected ExchangeService $exchangeService
     ) {}
 
     /**
@@ -46,6 +48,11 @@ class BookingController extends Controller
             'items.asset.model',
             'payments.paymentMethod',
             'payments.processedBy',
+            'exchanges.oldAsset.model',
+            'exchanges.newAsset.model',
+            'exchanges.handler',
+            'exchanges.manager',
+            'exchanges.payment.paymentMethod',
             'affiliate',
             'creator',
         ]);
@@ -239,6 +246,11 @@ class BookingController extends Controller
             'voucher',
             'extensions.extender',
             'returnInspection.inspector',
+            'exchanges.oldAsset.model',
+            'exchanges.newAsset.model',
+            'exchanges.handler',
+            'exchanges.manager',
+            'exchanges.payment.paymentMethod',
             'creator',
             'affiliate'
         ])
@@ -282,12 +294,16 @@ class BookingController extends Controller
             $previousEndAt = Carbon::parse($booking->end_at);
             $newEndAt = (clone $previousEndAt)->addHours($additionalHours);
 
-            // Collision check: verify asset is not booked for subsequent confirmed reservation
-            $assetIds = $booking->items->pluck('asset_id')->toArray();
+            // Collision check: verify active asset is not booked for subsequent confirmed reservation
+            $activeItems = $booking->activeItems->isNotEmpty() ? $booking->activeItems : $booking->items;
+            $assetIds = $activeItems->pluck('asset_id')->toArray();
             $collision = Booking::where('id', '!=', $booking->id)
                 ->whereIn('status', ['confirmed', 'rented'])
                 ->whereHas('items', function ($iq) use ($assetIds) {
-                    $iq->whereIn('asset_id', $assetIds);
+                    $iq->whereIn('asset_id', $assetIds)
+                       ->where(function ($sq) {
+                           $sq->whereNull('status')->orWhere('status', 'active');
+                       });
                 })
                 ->where(function ($tq) use ($previousEndAt, $newEndAt) {
                     $tq->where('start_at', '<', $newEndAt)
@@ -304,7 +320,7 @@ class BookingController extends Controller
 
             // Authoritative calculation from PricingTier
             $hourlyRate = 15000.00;
-            $firstItem = $booking->items()->first();
+            $firstItem = $booking->active_item ?? $booking->items()->first();
             if ($firstItem && $firstItem->asset) {
                 $tier = PricingTier::where('model_id', $firstItem->asset->model_id)->first();
                 if ($tier && (float)$tier->extension_hourly_rate > 0) {
@@ -438,5 +454,50 @@ class BookingController extends Controller
             'message' => 'Pengembalian unit berhasil diproses dan unit dikembalikan ke status siap/perbaikan.',
             'data' => $inspection,
         ]);
+    }
+
+    /**
+     * Get available candidate replacement assets for a booking.
+     */
+    public function availableReplacements(Request $request, int $id): JsonResponse
+    {
+        $booking = Booking::with(['items.asset.model', 'affiliate'])->findOrFail($id);
+
+        $currentAssetId = $request->query('asset_id') ? (int)$request->query('asset_id') : null;
+        $data = $this->exchangeService->getAvailableReplacements($booking, $currentAssetId);
+
+        return response()->json([
+            'success' => true,
+            'data' => $data,
+        ]);
+    }
+
+    /**
+     * Process rental unit exchange.
+     */
+    public function exchange(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'old_asset_id' => 'required|integer|exists:assets,id',
+            'new_asset_id' => 'required|integer|exists:assets,id',
+            'reported_issue_category' => 'required|in:camera,screen,battery,network,audio,system,other',
+            'customer_complaint' => 'required|string',
+            'staff_diagnosis' => 'nullable|string',
+            'old_unit_condition_grade' => 'nullable|in:A,B,C',
+            'icloud_signout_verified' => 'nullable|boolean',
+            'old_asset_disposition' => 'nullable|in:maintenance,quarantine,ready',
+            'fee_waived' => 'nullable|boolean',
+            'waiver_reason' => 'nullable|string|max:255',
+            'manager_pin' => 'nullable|string',
+            'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'cash_received' => 'nullable|numeric|min:0',
+            'idempotency_key' => 'nullable|string|max:64',
+        ]);
+
+        $booking = Booking::with(['items.asset.model', 'affiliate'])->findOrFail($id);
+
+        $result = $this->exchangeService->executeExchange($booking, $request->all(), $request->user());
+
+        return response()->json($result);
     }
 }

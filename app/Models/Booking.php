@@ -52,6 +52,27 @@ class Booking extends Model
         'collateral_secured' => 'boolean',
     ];
 
+    protected $appends = [
+        'active_item',
+        'active_asset',
+    ];
+
+    public function getActiveItemAttribute(): ?BookingItem
+    {
+        if ($this->relationLoaded('items')) {
+            return $this->items->first(fn ($item) => $item->status === 'active' || $item->status === null)
+                ?? $this->items->first();
+        }
+
+        return $this->activeItems()->with('asset.model')->first()
+            ?? $this->items()->with('asset.model')->latest('id')->first();
+    }
+
+    public function getActiveAssetAttribute(): ?Asset
+    {
+        return $this->active_item?->asset;
+    }
+
     protected static function booted(): void
     {
         static::addGlobalScope(new \App\Scopes\TenantScope);
@@ -89,7 +110,7 @@ class Booking extends Model
 
     public function items(): HasMany
     {
-        return $this->hasMany(BookingItem::class);
+        return $this->hasMany(BookingItem::class)->orderByRaw("CASE WHEN status = 'active' OR status IS NULL THEN 0 ELSE 1 END, id DESC");
     }
 
     public function extensions(): HasMany
@@ -105,5 +126,15 @@ class Booking extends Model
     public function payments(): HasMany
     {
         return $this->hasMany(PaymentTransaction::class);
+    }
+
+    public function exchanges(): HasMany
+    {
+        return $this->hasMany(RentalUnitExchange::class)->orderBy('exchanged_at', 'desc');
+    }
+
+    public function activeItems(): HasMany
+    {
+        return $this->hasMany(BookingItem::class)->where('status', 'active');
     }
 }

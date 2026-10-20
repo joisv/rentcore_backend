@@ -112,9 +112,15 @@ class ReturnService
                 'payment_status' => $newPaymentStatus,
             ]);
 
-            // 5. Update Asset Status (ready if grade A/B without damage, maintenance if damaged)
+            // 5. Update Asset Status for active items only (ready if grade A/B without damage, maintenance if damaged)
+            // Exchanged units in maintenance must remain in maintenance!
             $newAssetStatus = ($damageFee > 0 || $conditionGrade === 'C') ? 'maintenance' : 'ready';
-            foreach ($booking->items as $item) {
+            $itemsToReturn = $booking->items->filter(fn ($it) => $it->status === 'active' || $it->status === null);
+            if ($itemsToReturn->isEmpty()) {
+                $itemsToReturn = $booking->items;
+            }
+
+            foreach ($itemsToReturn as $item) {
                 if ($item->asset) {
                     $item->asset->update([
                         'status' => $newAssetStatus,
@@ -122,6 +128,7 @@ class ReturnService
                         'battery_health' => $data['battery_health_final'] ?? $item->asset->battery_health,
                     ]);
                 }
+                $item->update(['status' => 'returned']);
             }
 
             // 6. Record Penalty Payment if applicable
@@ -157,12 +164,15 @@ class ReturnService
 
                     PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
+                        'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
                         'booking_id' => $booking->id,
                         'payment_method_id' => $paymentMethod->id,
                         'processed_by' => $inspector->id,
                         'type' => 'penalty',
+                        'status' => 'completed',
+                        'direction' => 'inflow',
                         'amount' => $amountToPay,
                         'cash_received' => $cashReceived,
                         'cash_change' => $cashChange,
@@ -172,6 +182,44 @@ class ReturnService
 
                     $booking->update([
                         'payment_status' => 'paid',
+                    ]);
+                }
+            }
+
+            // 6b. Record Deposit Refund if deposit exceeds penalties
+            if ($depositRefunded > 0) {
+                $existingRefundTx = PaymentTransaction::where('booking_id', $booking->id)
+                    ->where('type', 'refund')
+                    ->first();
+
+                if (!$existingRefundTx) {
+                    $cashMethod = PaymentMethod::where('code', 'CASH')->orWhere('code', 'cash')->first()
+                        ?? PaymentMethod::first();
+
+                    $datePrefix = Carbon::now()->format('ymd');
+                    $countToday = PaymentTransaction::withoutGlobalScopes()
+                        ->whereDate('created_at', Carbon::today())
+                        ->count() + 1;
+                    $randomSuffix = strtoupper(substr(uniqid(), -4));
+                    $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                    $receiptNumber = sprintf('REC-REF-%s-%s-%04d', $booking->affiliate->code ?? 'CTR', $datePrefix, $booking->id);
+
+                    PaymentTransaction::create([
+                        'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
+                        'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
+                        'transaction_code' => $txCode,
+                        'receipt_number' => $receiptNumber,
+                        'booking_id' => $booking->id,
+                        'payment_method_id' => $cashMethod ? $cashMethod->id : 1,
+                        'processed_by' => $inspector->id,
+                        'type' => 'refund',
+                        'status' => 'completed',
+                        'direction' => 'outflow',
+                        'amount' => $depositRefunded,
+                        'cash_received' => $depositRefunded,
+                        'cash_change' => 0.00,
+                        'notes' => 'Pengembalian uang titipan jaminan sewa (deposit refund) saat pengembalian unit',
+                        'transacted_at' => Carbon::now(),
                     ]);
                 }
             }

@@ -176,7 +176,10 @@ class PricingService
         $collisionQuery = Booking::withoutGlobalScopes()
             ->whereIn('status', ['reserved', 'rented'])
             ->whereHas('items', function ($iq) use ($asset) {
-                $iq->where('asset_id', $asset->id);
+                $iq->where('asset_id', $asset->id)
+                   ->where(function ($sq) {
+                       $sq->whereNull('status')->orWhere('status', 'active');
+                   });
             })
             ->where(function ($tq) use ($startAt, $endAt) {
                 $tq->where('start_at', '<', $endAt)

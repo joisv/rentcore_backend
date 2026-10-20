@@ -12,16 +12,24 @@ class PaymentTransaction extends Model
 
     protected $fillable = [
         'business_id',
+        'branch_id',
         'transaction_code',
         'receipt_number',
+        'external_reference',
+        'idempotency_key',
         'booking_id',
         'payment_method_id',
         'processed_by',
+        'reversal_of_id',
         'type',
+        'status',
+        'direction',
         'amount',
         'cash_received',
         'cash_change',
         'notes',
+        'void_reason',
+        'void_by',
         'transacted_at',
     ];
 
@@ -60,5 +68,30 @@ class PaymentTransaction extends Model
     public function processedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'processed_by');
+    }
+
+    public function branch(): BelongsTo
+    {
+        return $this->belongsTo(Affiliate::class, 'branch_id');
+    }
+
+    public function reversalOf(): BelongsTo
+    {
+        return $this->belongsTo(PaymentTransaction::class, 'reversal_of_id');
+    }
+
+    public function voidBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'void_by');
+    }
+
+    public function isRefund(): bool
+    {
+        return $this->type === 'refund' || $this->direction === 'outflow';
+    }
+
+    public function isVoid(): bool
+    {
+        return $this->status === 'void';
     }
 }

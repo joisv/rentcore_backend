@@ -48,12 +48,22 @@ class Asset extends Model
 
     public function model(): BelongsTo
     {
-        return $this->belongsTo(AssetModel::class, 'model_id');
+        return $this->belongsTo(AssetModel::class, 'model_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
     }
 
     public function bookingItems(): HasMany
     {
         return $this->hasMany(BookingItem::class);
+    }
+
+    public function exchangesAsOld(): HasMany
+    {
+        return $this->hasMany(RentalUnitExchange::class, 'old_asset_id');
+    }
+
+    public function exchangesAsNew(): HasMany
+    {
+        return $this->hasMany(RentalUnitExchange::class, 'new_asset_id');
     }
 
     public function scopeReady(Builder $query): Builder

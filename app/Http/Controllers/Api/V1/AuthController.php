@@ -43,6 +43,21 @@ class AuthController extends Controller
         $deviceName = $request->device_name ?? 'RentCore Mobile Terminal';
         $token = $user->createToken($deviceName)->plainTextToken;
 
+        $memberships = \App\Models\BusinessMember::with('business.branches')
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->get();
+
+        $businesses = $memberships->map(function ($m) {
+            return [
+                'id' => $m->business->id,
+                'uuid' => $m->business->uuid,
+                'name' => $m->business->name,
+                'role' => $m->role,
+                'branches' => $m->serializeAccessibleBranches(),
+            ];
+        });
+
         return response()->json([
             'success' => true,
             'message' => 'Login berhasil.',
@@ -62,6 +77,7 @@ class AuthController extends Controller
                         'is_central' => $user->affiliate->is_central,
                     ] : null,
                 ],
+                'businesses' => $businesses,
             ],
         ]);
     }

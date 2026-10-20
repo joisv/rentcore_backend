@@ -17,13 +17,21 @@ class BookingItem extends Model
         'duration_unit',
         'duration_value',
         'rate_snapshot',
+        'status',
+        'exchanged_at',
     ];
 
     protected $casts = [
         'unit_price' => 'decimal:2',
         'duration_value' => 'integer',
         'rate_snapshot' => 'array',
+        'exchanged_at' => 'datetime',
     ];
+
+    public function scopeActive($query)
+    {
+        return $query->where('status', 'active');
+    }
 
     public function booking(): BelongsTo
     {

@@ -88,4 +88,46 @@ class AuthApiTest extends TestCase
         $logoutResponse->assertStatus(200)
             ->assertJson(['success' => true]);
     }
+
+    public function test_login_returns_associated_businesses_and_accessible_branches(): void
+    {
+        $user = User::create([
+            'name' => 'Owner Rental',
+            'email' => 'owner@rentcore.id',
+            'password' => Hash::make('password123'),
+            'role' => 'affiliate_admin',
+            'is_active' => true,
+        ]);
+
+        $business = \App\Models\Business::create([
+            'name' => 'RentCore Express',
+            'slug' => 'rentcore-express',
+            'owner_id' => $user->id,
+            'is_active' => true,
+        ]);
+
+        $branch = Affiliate::create([
+            'business_id' => $business->id,
+            'code' => 'EXP',
+            'name' => 'Express Branch',
+            'slug' => 'express-branch',
+            'is_central' => true,
+        ]);
+
+        \App\Models\BusinessMember::create([
+            'business_id' => $business->id,
+            'user_id' => $user->id,
+            'role' => 'owner',
+            'is_active' => true,
+        ]);
+
+        $response = $this->postJson('/api/v1/auth/login', [
+            'email' => 'owner@rentcore.id',
+            'password' => 'password123',
+        ]);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('data.businesses.0.name', 'RentCore Express')
+            ->assertJsonPath('data.businesses.0.branches.0.code', 'EXP');
+    }
 }

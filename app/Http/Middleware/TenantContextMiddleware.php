@@ -86,7 +86,9 @@ class TenantContextMiddleware
 
         // Resolve branch context (affiliate)
         $isAllBranches = $request->boolean('all_branches') || $request->get('branch_id') === 'all' || $request->get('branch_id') === '-1';
-        $branchId = $isAllBranches ? null : ($request->header('X-Branch-Id') ?? $request->get('branch_id'));
+        $rawHeaderBranch = $request->header('X-Branch-Id');
+        $effectiveHeaderBranch = ($rawHeaderBranch !== null && $rawHeaderBranch !== '') ? $rawHeaderBranch : null;
+        $branchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id') ?? $effectiveHeaderBranch);
         $branch = null;
         $isBranchRestricted = false;
 

@@ -6,7 +6,9 @@ use App\Http\Controllers\Controller;
 use App\Models\Booking;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
+use App\Models\User;
 use App\Services\AuditLogService;
+use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -62,13 +64,40 @@ class CashierController extends Controller
         $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
         $isCash = strtoupper($paymentMethod->code) === 'CASH';
 
-        return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user) {
+        $idempotencyKey = $request->header('X-Idempotency-Key') ?? $request->input('idempotency_key');
+        if ($idempotencyKey) {
+            $existingTx = PaymentTransaction::where('business_id', $booking->business_id ?? $user->business_id)
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+            if ($existingTx) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Pembayaran telah diproses sebelumnya (Idempotent).',
+                    'data' => [
+                        'transaction_id' => $existingTx->id,
+                        'transaction_code' => $existingTx->transaction_code,
+                        'receipt_number' => $existingTx->receipt_number,
+                        'amount' => (float)$existingTx->amount,
+                        'cash_received' => (float)$existingTx->cash_received,
+                        'cash_change' => (float)$existingTx->cash_change,
+                        'status' => $existingTx->status,
+                        'payment' => $existingTx->load('paymentMethod'),
+                        'is_idempotent' => true,
+                    ],
+                ]);
+            }
+        }
+
+        return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey) {
             // Re-fetch booking with row-level pessimistic lock
             $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->first();
 
             if ($type === 'settlement' || $type === 'extension') {
                 $alreadyPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 'void');
+                    })
                     ->sum('amount');
                 $remainingDue = max(0, (float)$lockedBooking->total_bill - $alreadyPaid);
 
@@ -86,7 +115,12 @@ class CashierController extends Controller
                         'booking' => ['Tidak ada tagihan denda untuk transaksi ini.'],
                     ]);
                 }
-                $penaltyPaid = (float)$lockedBooking->payments()->where('type', 'penalty')->sum('amount');
+                $penaltyPaid = (float)$lockedBooking->payments()
+                    ->where('type', 'penalty')
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 'void');
+                    })
+                    ->sum('amount');
                 $remainingPenalty = max(0, (float)$inspection->total_penalty - $penaltyPaid);
 
                 if ($remainingPenalty <= 0) {
@@ -126,14 +160,20 @@ class CashierController extends Controller
             $txCode = sprintf('TX-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
             $receiptNumber = sprintf('REC-%s-%s-%04d', $booking->affiliate->code ?? 'PST', $datePrefix, $booking->id);
 
+            $cashierBranchId = $request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id;
+
             $paymentTx = PaymentTransaction::create([
                 'business_id' => $booking->business_id ?? $user->business_id,
+                'branch_id' => $cashierBranchId ? (int)$cashierBranchId : null,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
+                'idempotency_key' => $idempotencyKey,
                 'booking_id' => $booking->id,
                 'payment_method_id' => $paymentMethod->id,
                 'processed_by' => $user->id,
                 'type' => $type,
+                'status' => 'completed',
+                'direction' => $type === 'refund' ? 'outflow' : 'inflow',
                 'amount' => $amountToPay,
                 'cash_received' => $cashReceived,
                 'cash_change' => $cashChange,
@@ -145,13 +185,26 @@ class CashierController extends Controller
             if ($type === 'settlement' || $type === 'extension') {
                 $newTotalPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 'void');
+                    })
                     ->sum('amount');
-                $newPaymentStatus = ($newTotalPaid >= (float)$lockedBooking->total_bill) ? 'paid' : 'partial';
+                $newPaymentStatus = ($newTotalPaid >= (float)$lockedBooking->total_bill) ? 'paid' : ($newTotalPaid > 0 ? 'partial' : 'unpaid');
                 $lockedBooking->update(['payment_status' => $newPaymentStatus]);
             } elseif ($type === 'penalty') {
-                $totalPenaltyPaid = (float)$lockedBooking->payments()->where('type', 'penalty')->sum('amount');
+                $totalPenaltyPaid = (float)$lockedBooking->payments()
+                    ->where('type', 'penalty')
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 'void');
+                    })
+                    ->sum('amount');
                 $totalPenaltyDue = (float)($lockedBooking->returnInspection?->total_penalty ?? 0.0);
-                $isRentalSettled = ((float)$lockedBooking->payments()->whereIn('type', ['dp', 'settlement', 'extension'])->sum('amount')) >= (float)$lockedBooking->total_bill;
+                $isRentalSettled = ((float)$lockedBooking->payments()
+                    ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 'void');
+                    })
+                    ->sum('amount')) >= (float)$lockedBooking->total_bill;
                 if ($isRentalSettled && $totalPenaltyPaid >= $totalPenaltyDue) {
                     $lockedBooking->update(['payment_status' => 'paid']);
                 }
@@ -385,6 +438,7 @@ class CashierController extends Controller
 
         $query = PaymentTransaction::with([
             'paymentMethod',
+            'branch',
             'booking' => fn($q) => $q->withoutGlobalScope(\App\Scopes\TenantScope::class),
             'booking.affiliate',
             'booking.customer',
@@ -403,8 +457,12 @@ class CashierController extends Controller
         }
 
         if ($targetBranchId !== null) {
-            $query->whereHas('booking', function ($bq) use ($targetBranchId) {
-                $bq->where('affiliate_id', $targetBranchId);
+            $query->where(function ($q) use ($targetBranchId) {
+                $q->where('payment_transactions.branch_id', $targetBranchId)
+                  ->orWhere(function ($fallbackQ) use ($targetBranchId) {
+                      $fallbackQ->whereNull('payment_transactions.branch_id')
+                                ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $targetBranchId));
+                  });
             });
         }
 
@@ -437,11 +495,23 @@ class CashierController extends Controller
             'rental' => ['label' => 'Sewa Kontrak Pokok', 'count' => 0, 'total' => 0.00],
             'extension' => ['label' => 'Perpanjangan Sewa', 'count' => 0, 'total' => 0.00],
             'penalty' => ['label' => 'Denda Keterlambatan (Late Return Penalty)', 'count' => 0, 'total' => 0.00],
+            'refund' => ['label' => 'Pengembalian Dana / Titipan Jaminan (Refund)', 'count' => 0, 'total' => 0.00],
         ];
 
         foreach ($transactions as $tx) {
+            // Exclude void transactions from revenue calculations
+            if (($tx->status ?? 'completed') === 'void') {
+                continue;
+            }
+
             $amount = (float)$tx->amount;
-            $totalRevenue += $amount;
+            $isRefund = ($tx->type === 'refund' || ($tx->direction ?? 'inflow') === 'outflow');
+
+            if ($isRefund) {
+                $totalRevenue -= $amount;
+            } else {
+                $totalRevenue += $amount;
+            }
 
             $txType = $tx->type ?? 'settlement';
             if ($txType === 'penalty') {
@@ -450,6 +520,9 @@ class CashierController extends Controller
             } elseif ($txType === 'extension') {
                 $typeBreakdown['extension']['count']++;
                 $typeBreakdown['extension']['total'] += $amount;
+            } elseif ($txType === 'refund') {
+                $typeBreakdown['refund']['count']++;
+                $typeBreakdown['refund']['total'] += $amount;
             } else {
                 $typeBreakdown['rental']['count']++;
                 $typeBreakdown['rental']['total'] += $amount;
@@ -463,17 +536,22 @@ class CashierController extends Controller
                 ];
             }
             $breakdown[$methodName]['count']++;
-            $breakdown[$methodName]['total'] += $amount;
+            if ($isRefund) {
+                $breakdown[$methodName]['total'] -= $amount;
+            } else {
+                $breakdown[$methodName]['total'] += $amount;
+            }
 
             $methodCode = strtolower($tx->paymentMethod->code ?? '');
             $isCash = $methodCode === 'cash' || str_contains(strtolower($methodName), 'tunai');
 
-            $bId = $tx->booking?->affiliate_id;
+            $bId = $tx->branch_id ?? $tx->booking?->affiliate_id;
             if ($bId !== null) {
                 if (!isset($branchStats[$bId])) {
-                    $bName = $tx->booking?->affiliate?->name ?? ('Cabang #' . $bId);
-                    $bCode = $tx->booking?->affiliate?->code ?? 'CBG';
-                    $isCentral = (bool)($tx->booking?->affiliate?->is_central ?? false);
+                    $branchModel = \App\Models\Affiliate::find($bId);
+                    $bName = $branchModel?->name ?? ($tx->booking?->affiliate?->name ?? ('Cabang #' . $bId));
+                    $bCode = $branchModel?->code ?? ($tx->booking?->affiliate?->code ?? 'CBG');
+                    $isCentral = (bool)($branchModel?->is_central ?? ($tx->booking?->affiliate?->is_central ?? false));
                     $branchStats[$bId] = [
                         'branch_id' => $bId,
                         'branch_name' => $bName,
@@ -486,11 +564,20 @@ class CashierController extends Controller
                     ];
                 }
                 $branchStats[$bId]['transaction_count']++;
-                $branchStats[$bId]['total_revenue'] += $amount;
-                if ($isCash) {
-                    $branchStats[$bId]['cash_revenue'] += $amount;
+                if ($isRefund) {
+                    $branchStats[$bId]['total_revenue'] -= $amount;
+                    if ($isCash) {
+                        $branchStats[$bId]['cash_revenue'] -= $amount;
+                    } else {
+                        $branchStats[$bId]['non_cash_revenue'] -= $amount;
+                    }
                 } else {
-                    $branchStats[$bId]['non_cash_revenue'] += $amount;
+                    $branchStats[$bId]['total_revenue'] += $amount;
+                    if ($isCash) {
+                        $branchStats[$bId]['cash_revenue'] += $amount;
+                    } else {
+                        $branchStats[$bId]['non_cash_revenue'] += $amount;
+                    }
                 }
             }
         }
@@ -499,6 +586,66 @@ class CashierController extends Controller
         if ($targetBranchId !== null) {
             $branchBreakdownList = array_values(array_filter($branchBreakdownList, fn($b) => $b['branch_id'] === $targetBranchId));
         }
+
+        // Fetch Branch Operating Expenses in this period
+        $expenseQuery = \App\Models\BranchExpense::whereBetween('created_at', [$start, $end])
+            ->whereIn('status', ['approved', 'disbursed']);
+
+        if ($businessId) {
+            $expenseQuery->where('business_id', $businessId);
+        }
+        if ($targetBranchId !== null) {
+            $expenseQuery->where('branch_id', $targetBranchId);
+        }
+
+        $expenses = $expenseQuery->latest('created_at')->get();
+        $totalExpenses = 0.00;
+        $cashDrawerExpenses = 0.00;
+        $expenseCategoryBreakdown = [];
+
+        foreach ($expenses as $exp) {
+            $expAmt = (float)$exp->amount;
+            $totalExpenses += $expAmt;
+            if ($exp->payment_source === 'cash_drawer') {
+                $cashDrawerExpenses += $expAmt;
+            }
+            $cat = $exp->category ?? 'other';
+            if (!isset($expenseCategoryBreakdown[$cat])) {
+                $expenseCategoryBreakdown[$cat] = ['count' => 0, 'total' => 0.00];
+            }
+            $expenseCategoryBreakdown[$cat]['count']++;
+            $expenseCategoryBreakdown[$cat]['total'] += $expAmt;
+        }
+
+        // Active shift & opening float if single branch
+        $activeShiftData = null;
+        $openingFloat = 0.00;
+        if ($targetBranchId !== null) {
+            $activeShift = \App\Models\CashDrawerShift::where('branch_id', $targetBranchId)
+                ->where('status', 'open')
+                ->latest('opened_at')
+                ->first();
+
+            if ($activeShift) {
+                $openingFloat = (float)$activeShift->opening_cash_float;
+                $activeShiftData = [
+                    'id' => $activeShift->id,
+                    'shift_number' => $activeShift->shift_number,
+                    'opened_at' => $activeShift->opened_at->toIso8601String(),
+                    'opening_cash_float' => $openingFloat,
+                    'status' => $activeShift->status,
+                ];
+            }
+        }
+
+        $totalCashRevenue = 0.00;
+        foreach ($breakdown as $mName => $mStat) {
+            if (str_contains(strtolower($mName), 'cash') || str_contains(strtolower($mName), 'tunai')) {
+                $totalCashRevenue += (float)($mStat['total'] ?? 0);
+            }
+        }
+
+        $expectedDrawerCash = max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
 
         $limit = max(10, (int)$request->get('limit', $request->get('per_page', 50)));
         $recentTransactions = $transactions->take($limit)->map(function ($tx) {
@@ -510,20 +657,28 @@ class CashierController extends Controller
                 'booking_code' => $tx->booking?->booking_code,
                 'customer_name' => $tx->booking?->customer?->name ?? 'Pelanggan',
                 'customer_phone' => $tx->booking?->customer?->phone ?? '',
-                'branch_id' => $tx->booking?->affiliate_id,
-                'branch_name' => $tx->booking?->affiliate?->name ?? ($tx->booking?->affiliate_id ? 'Cabang #' . $tx->booking->affiliate_id : 'Tidak Teridentifikasi'),
-                'is_central' => (bool)($tx->booking?->affiliate?->is_central ?? false),
+                'branch_id' => $tx->branch_id ?? $tx->booking?->affiliate_id,
+                'branch_name' => $tx->branch?->name ?? ($tx->booking?->affiliate?->name ?? ($tx->booking?->affiliate_id ? 'Cabang #' . $tx->booking->affiliate_id : 'Tidak Teridentifikasi')),
+                'is_central' => (bool)($tx->branch?->is_central ?? ($tx->booking?->affiliate?->is_central ?? false)),
+                'status' => $tx->status ?? 'completed',
+                'direction' => $tx->direction ?? ($tx->type === 'refund' ? 'outflow' : 'inflow'),
                 'cashier_name' => $tx->processedBy?->name ?? 'Kasir',
                 'amount' => (float)$tx->amount,
                 'payment_method' => $tx->paymentMethod?->name ?? 'Tunai',
                 'type' => $tx->type,
                 'type_label' => $tx->type === 'penalty'
                     ? 'Denda Keterlambatan (Late Return Penalty)'
-                    : ($tx->type === 'extension' ? 'Perpanjangan Sewa' : ($tx->type === 'dp' ? 'Uang Muka (DP)' : 'Sewa Kontrak Pokok')),
+                    : ($tx->type === 'extension'
+                        ? 'Perpanjangan Sewa'
+                        : ($tx->type === 'refund'
+                            ? 'Pengembalian Dana / Deposit (Refund)'
+                            : ($tx->type === 'dp' ? 'Uang Muka (DP)' : 'Sewa Kontrak Pokok'))),
                 'cash_received' => (float)$tx->cash_received,
                 'cash_change' => (float)$tx->cash_change,
                 'notes' => $tx->notes,
                 'transacted_at' => $tx->transacted_at?->toISOString() ?? (string)$tx->transacted_at,
+                'void_reason' => $tx->void_reason,
+                'void_by' => $tx->voidBy?->name,
                 'items_summary' => $tx->booking?->items?->map(function ($item) {
                     $mName = $item->asset?->model?->name ?? 'Perangkat Apple';
                     $sn = $item->asset?->serial_number;
@@ -546,11 +701,139 @@ class CashierController extends Controller
                 'end_date' => $end->toDateString(),
                 'total_revenue' => (float)$totalRevenue,
                 'total_transactions' => (int)$totalTransactions,
+                'total_expenses' => (float)$totalExpenses,
+                'cash_drawer_expenses' => (float)$cashDrawerExpenses,
+                'expense_breakdown' => (object)$expenseCategoryBreakdown,
+                'cash_reconciliation' => [
+                    'opening_cash_float' => (float)$openingFloat,
+                    'net_cash_revenue' => (float)$totalCashRevenue,
+                    'cash_drawer_expenses' => (float)$cashDrawerExpenses,
+                    'expected_cash_in_drawer' => (float)$expectedDrawerCash,
+                    'active_shift' => $activeShiftData,
+                ],
                 'breakdown_by_type' => (object)$typeBreakdown,
                 'breakdown_by_method' => (object)$breakdown,
                 'breakdown_by_branch' => $branchBreakdownList,
                 'recent_transactions' => $recentTransactions,
             ],
         ]);
+    }
+
+    /**
+     * Void a payment transaction.
+     * Enforces authority (Manager PIN or Owner/Admin role), marks status void,
+     * recalibrates linked booking payment status, and writes security audit log.
+     */
+    public function voidTransaction(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'reason' => 'required|string|min:5|max:255',
+            'manager_pin' => 'nullable|string',
+        ]);
+
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId() ?? $user->current_business_id ?? $user->business_id;
+
+        $transaction = PaymentTransaction::where('id', $id)
+            ->where('business_id', $businessId)
+            ->firstOrFail();
+
+        if ($transaction->status === 'void') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Transaksi ini sudah dibatalkan (void) sebelumnya.',
+            ], 422);
+        }
+
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->role === 'admin') : ($user->isSuperAdmin() || $user->isOwner());
+
+        $voidedByUserId = $user->id;
+
+        if (!$isOwnerOrAdmin) {
+            // Staff attempting void requires manager PIN
+            if (empty($request->manager_pin)) {
+                throw ValidationException::withMessages([
+                    'manager_pin' => ['Pembatalan transaksi pembayaran kasir wajib disetujui menggunakan PIN Manager Cabang.'],
+                ]);
+            }
+
+            $branchId = $transaction->branch_id ?? $user->affiliate_id;
+            $manager = User::where(function ($q) use ($branchId, $businessId) {
+                if ($branchId) {
+                    $q->where('affiliate_id', $branchId);
+                }
+                if ($businessId) {
+                    $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
+                        $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
+                    });
+                }
+            })
+            ->whereNotNull('manager_override_pin')
+            ->first();
+
+            if (!$manager || !password_verify($request->manager_pin, $manager->manager_override_pin)) {
+                throw ValidationException::withMessages([
+                    'manager_pin' => ['PIN Manager Cabang tidak valid.'],
+                ]);
+            }
+
+            $voidedByUserId = $manager->id;
+        }
+
+        return DB::transaction(function () use ($transaction, $request, $voidedByUserId, $user) {
+            $transaction->status = 'void';
+            $transaction->void_reason = $request->reason;
+            $transaction->void_by = $voidedByUserId;
+            $transaction->save();
+
+            // Recalculate related booking payment status if linked
+            if ($transaction->booking_id) {
+                $booking = Booking::find($transaction->booking_id);
+                if ($booking) {
+                    $validPaid = (float)$booking->payments()
+                        ->whereIn('type', ['dp', 'settlement', 'extension'])
+                        ->where(function ($q) {
+                            $q->whereNull('status')->orWhere('status', '!=', 'void');
+                        })
+                        ->sum('amount');
+
+                    $newPaymentStatus = ($validPaid >= (float)$booking->total_bill)
+                        ? 'paid'
+                        : ($validPaid > 0 ? 'partial' : 'unpaid');
+
+                    $booking->update(['payment_status' => $newPaymentStatus]);
+                }
+            }
+
+            AuditLogService::log(
+                $user,
+                'cashier.transaction_voided',
+                'PaymentTransaction',
+                $transaction->transaction_code,
+                [
+                    'reason' => $request->reason,
+                    'amount' => (float)$transaction->amount,
+                    'void_by' => $voidedByUserId,
+                    'booking_id' => $transaction->booking_id,
+                ],
+                null,
+                request()?->ip(),
+                $transaction->branch_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Transaksi ' . ($transaction->receipt_number ?? $transaction->transaction_code) . ' berhasil dibatalkan (void).',
+                'data' => [
+                    'id' => $transaction->id,
+                    'transaction_code' => $transaction->transaction_code,
+                    'status' => $transaction->status,
+                    'void_reason' => $transaction->void_reason,
+                    'void_by' => $transaction->voidBy?->name ?? 'Manager',
+                ],
+            ]);
+        });
     }
 }

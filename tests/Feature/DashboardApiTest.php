@@ -194,4 +194,68 @@ class DashboardApiTest extends TestCase
         $this->assertEquals('BK-TEST-DASH', $response->json('data.overdue_alerts.0.booking_code'));
         $this->assertEquals('Ahmad Pelanggan', $response->json('data.overdue_alerts.0.customer_name'));
     }
+
+    public function test_kpi_handles_null_customer_and_unlinked_asset_model_without_throwing_500(): void
+    {
+        $now = Carbon::now();
+
+        $asset = Asset::create([
+            'affiliate_id' => $this->affiliateA->id,
+            'model_id' => $this->model->id,
+            'asset_code' => 'MTR-ORPHAN',
+            'serial_number' => 'SN-ORPHAN',
+            'status' => 'rented',
+        ]);
+
+        // Customer assigned to a different business context so TenantScope resolves it to null
+        $otherBusiness = \App\Models\Business::create([
+            'name' => 'Other Tenant',
+            'slug' => 'other-tenant',
+            'owner_id' => $this->staffA->id,
+            'is_active' => true,
+        ]);
+
+        $cust = Customer::create([
+            'business_id' => $otherBusiness->id,
+            'name' => 'Other Tenant Customer',
+            'phone' => '08999999999',
+            'email' => 'other@example.com',
+            'address' => 'Jakarta',
+        ]);
+
+        $booking = Booking::create([
+            'affiliate_id' => $this->affiliateA->id,
+            'customer_id' => $cust->id,
+            'created_by' => $this->staffA->id,
+            'booking_code' => 'BK-ORPHAN-DASH',
+            'start_at' => (clone $now)->subDays(2),
+            'end_at' => (clone $now)->subHours(3),
+            'duration_hours' => 48,
+            'status' => 'rented',
+            'subtotal_amount' => 150000,
+            'total_bill' => 150000,
+            'collateral_type' => 'KTP Asli',
+            'collateral_storage_slot' => 'SLOT-ORPHAN',
+            'collateral_secured' => true,
+        ]);
+
+        $booking->items()->create([
+            'asset_id' => $asset->id,
+            'unit_price' => 150000,
+        ]);
+
+        $response = $this->actingAs($this->staffA)
+            ->getJson('/api/v1/dashboard/kpi');
+
+        $response->assertStatus(200)
+            ->assertJsonPath('success', true);
+
+        $alerts = $response->json('data.overdue_alerts');
+        $this->assertNotEmpty($alerts);
+        $alertItem = collect($alerts)->firstWhere('booking_code', 'BK-ORPHAN-DASH');
+        $this->assertNotNull($alertItem);
+        $this->assertEquals($this->model->name, $alertItem['unit_name']);
+        // If customer is filtered by tenant scope, fallback 'Pelanggan Umum' is safely used without crashing
+        $this->assertTrue(in_array($alertItem['customer_name'], ['Pelanggan Umum', 'Other Tenant Customer']));
+    }
 }

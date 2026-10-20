@@ -28,8 +28,11 @@ class DashboardController extends Controller
         $isStaff = $member ? $member->isStaff() : ($user && $user->isStaff());
 
         // Resolve requested branch from query parameter or header
-        $rawBranchId = $request->get('branch_id') ?? $request->get('affiliate_id') ?? $request->header('X-Branch-Id');
-        $requestedBranchId = $rawBranchId !== null ? (int)$rawBranchId : null;
+        $isAllBranches = $request->boolean('all_branches') || $request->get('branch_id') === 'all' || $request->get('branch_id') === '-1';
+        $rawHeaderBranch = $request->header('X-Branch-Id');
+        $effectiveHeaderBranch = ($rawHeaderBranch !== null && $rawHeaderBranch !== '') ? $rawHeaderBranch : null;
+        $rawBranchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id') ?? $effectiveHeaderBranch);
+        $requestedBranchId = ($rawBranchId !== null && $rawBranchId !== '') ? (int)$rawBranchId : null;
         $targetBranchId = null;
 
         // Authorize branch scope
@@ -135,18 +138,18 @@ class DashboardController extends Controller
             $runningFee = $billableHours * 15000;
 
             $firstItem = $booking->items->first();
-            $unitName = $firstItem && $firstItem->asset ? $firstItem->asset->model->name : 'Unit Gadget';
+            $unitName = $firstItem?->asset?->model?->name ?? ($firstItem?->asset?->asset_code ?? 'Unit Gadget');
 
             return [
                 'booking_id' => $booking->id,
                 'booking_code' => $booking->booking_code,
-                'customer_name' => $booking->customer->name,
-                'customer_phone' => $booking->customer->phone,
+                'customer_name' => $booking->customer?->name ?? 'Pelanggan Umum',
+                'customer_phone' => $booking->customer?->phone ?? '-',
                 'unit_name' => $unitName,
                 'late_duration_text' => sprintf('%02d jam %02d mnt', $hours, $mins),
                 'late_minutes' => $lateMinutes,
                 'running_penalty' => $runningFee,
-                'end_at' => $booking->end_at->format('d M Y, H:i'),
+                'end_at' => $endAt->format('d M Y, H:i'),
                 'collateral_storage_slot' => $booking->collateral_storage_slot,
             ];
         });
@@ -160,30 +163,66 @@ class DashboardController extends Controller
             ->get()
             ->map(function ($booking) {
                 $firstItem = $booking->items->first();
-                $unitName = $firstItem && $firstItem->asset ? $firstItem->asset->model->name : 'Unit Gadget';
+                $unitName = $firstItem?->asset?->model?->name ?? ($firstItem?->asset?->asset_code ?? 'Unit Gadget');
+                $expectedReturn = $booking->end_at ? Carbon::parse($booking->end_at)->format('H:i \W\I\B') : '-';
 
                 return [
                     'booking_id' => $booking->id,
                     'booking_code' => $booking->booking_code,
-                    'customer_name' => $booking->customer->name,
-                    'customer_phone' => $booking->customer->phone,
+                    'customer_name' => $booking->customer?->name ?? 'Pelanggan Umum',
+                    'customer_phone' => $booking->customer?->phone ?? '-',
                     'unit_name' => $unitName,
-                    'expected_return_at' => $booking->end_at->format('H:i \W\I\B'),
+                    'expected_return_at' => $expectedReturn,
                     'collateral_storage_slot' => $booking->collateral_storage_slot,
                 ];
             });
 
-        // 4. Financial Summary Today (Scoped by original transaction branch)
-        $paymentQuery = PaymentTransaction::whereBetween('transacted_at', [$todayStart, $todayEnd]);
-        if ($businessId) {
-            $paymentQuery->where('business_id', $businessId);
-        }
-        if ($targetBranchId !== null) {
-            $paymentQuery->whereHas('booking', function ($bq) use ($targetBranchId) {
-                $bq->where('affiliate_id', $targetBranchId);
+        // 4. Financial Summary Today (Scoped by original transaction branch, excluding void, accounting for refunds)
+        $hasStatusColumn = \Illuminate\Support\Facades\Schema::hasColumn('payment_transactions', 'status');
+        $hasDirectionColumn = \Illuminate\Support\Facades\Schema::hasColumn('payment_transactions', 'direction');
+
+        $paymentQuery = PaymentTransaction::whereBetween('payment_transactions.transacted_at', [$todayStart, $todayEnd]);
+        if ($hasStatusColumn) {
+            $paymentQuery->where(function ($q) {
+                $q->whereNull('payment_transactions.status')->orWhere('payment_transactions.status', '!=', 'void');
             });
         }
-        $todayRevenue = (float)$paymentQuery->sum('amount');
+
+        if ($businessId) {
+            $paymentQuery->where(function ($q) use ($businessId) {
+                $q->where('payment_transactions.business_id', $businessId)
+                  ->orWhereHas('booking', fn($bq) => $bq->where('business_id', $businessId));
+            });
+        }
+        if ($targetBranchId !== null) {
+            $paymentQuery->where(function ($q) use ($targetBranchId) {
+                $q->where('payment_transactions.branch_id', $targetBranchId)
+                  ->orWhere(function ($fallbackQ) use ($targetBranchId) {
+                      $fallbackQ->whereNull('payment_transactions.branch_id')
+                                ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $targetBranchId));
+                  });
+            });
+        }
+
+        $inflowQuery = (clone $paymentQuery)->where('payment_transactions.type', '!=', 'refund');
+        if ($hasDirectionColumn) {
+            $inflowQuery->where(function ($q) {
+                $q->whereNull('payment_transactions.direction')->orWhere('payment_transactions.direction', '!=', 'outflow');
+            });
+        }
+        $inflow = (float)$inflowQuery->sum('payment_transactions.amount');
+
+        $outflowQuery = (clone $paymentQuery);
+        if ($hasDirectionColumn) {
+            $outflowQuery->where(function ($q) {
+                $q->where('payment_transactions.type', 'refund')->orWhere('payment_transactions.direction', 'outflow');
+            });
+        } else {
+            $outflowQuery->where('payment_transactions.type', 'refund');
+        }
+        $outflow = (float)$outflowQuery->sum('payment_transactions.amount');
+
+        $todayRevenue = max(0.00, $inflow - $outflow);
         $todayTransactionsCount = (int)$paymentQuery->count();
 
         return response()->json([

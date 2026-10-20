@@ -8,7 +8,9 @@ use App\Http\Controllers\Api\V1\CashierController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\CustomerController;
 use App\Http\Controllers\Api\V1\DashboardController;
+use App\Http\Controllers\Api\V1\ExpenseController;
 use App\Http\Controllers\Api\V1\ProductController;
+use App\Http\Controllers\Api\V1\ShiftController;
 use App\Http\Controllers\Api\V1\TransferController;
 use App\Http\Controllers\Api\V1\VoucherController;
 use Illuminate\Support\Facades\Route;
@@ -103,6 +105,8 @@ Route::prefix('v1')->group(function () {
             Route::get('/bookings/{id}', [BookingController::class, 'show']);
             Route::post('/bookings/{id}/extend', [BookingController::class, 'extend']);
             Route::post('/bookings/{id}/return', [BookingController::class, 'processReturn']);
+            Route::get('/bookings/{id}/available-replacements', [BookingController::class, 'availableReplacements']);
+            Route::post('/bookings/{id}/exchange', [BookingController::class, 'exchange']);
 
             // Customers & Identity Verification
             Route::get('/customers', [CustomerController::class, 'index']);
@@ -115,7 +119,18 @@ Route::prefix('v1')->group(function () {
             Route::get('/cashier/closing-summary', [CashierController::class, 'closingSummary']);
             Route::get('/cashier/payment-methods', [CashierController::class, 'paymentMethods']);
             Route::post('/cashier/pay', [CashierController::class, 'processPayment']);
+            Route::post('/cashier/transactions/{id}/void', [CashierController::class, 'voidTransaction']);
             Route::get('/cashier/transactions/{id}/receipt', [CashierController::class, 'receipt']);
+
+            // Branch Operating Expenses
+            Route::get('/cashier/expenses', [ExpenseController::class, 'index']);
+            Route::post('/cashier/expenses', [ExpenseController::class, 'store']);
+            Route::post('/cashier/expenses/{id}/approve', [ExpenseController::class, 'approve']);
+
+            // Cash Drawer Shifts
+            Route::get('/cashier/shift/current', [ShiftController::class, 'currentShift']);
+            Route::post('/cashier/shift/open', [ShiftController::class, 'openShift']);
+            Route::post('/cashier/shift/close', [ShiftController::class, 'closeShift']);
         });
     });
 });
