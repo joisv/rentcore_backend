@@ -10,6 +10,7 @@ use App\Services\PricingService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class ProductController extends Controller
@@ -55,6 +56,15 @@ class ProductController extends Controller
             $query->where('category_id', $request->category_id);
         }
 
+        if ($request->has('is_addon')) {
+            $isAddonFilter = filter_var($request->is_addon, FILTER_VALIDATE_BOOLEAN);
+            if ($isAddonFilter) {
+                $query->addons();
+            } else {
+                $query->devices();
+            }
+        }
+
         if ($request->has('is_active')) {
             $query->where('is_active', filter_var($request->is_active, FILTER_VALIDATE_BOOLEAN));
         }
@@ -76,7 +86,12 @@ class ProductController extends Controller
             ]);
         }
 
-        $products = $query->orderBy('created_at', 'desc')->paginate($request->get('per_page', 20));
+        $perPage = (int) $request->get('per_page', 20);
+        $products = $query->orderBy('created_at', 'desc')->paginate($perPage);
+
+        if ($products->currentPage() > $products->lastPage() && $products->lastPage() > 0) {
+            $products = $query->orderBy('created_at', 'desc')->paginate($perPage, ['*'], 'page', $products->lastPage());
+        }
 
         return response()->json([
             'success' => true,
@@ -158,6 +173,7 @@ class ProductController extends Controller
             'has_serial_number' => 'nullable|boolean',
             'requires_frp_check' => 'nullable|boolean',
             'specifications' => 'nullable|array',
+            'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
@@ -188,6 +204,7 @@ class ProductController extends Controller
             'has_serial_number' => $validated['has_serial_number'] ?? true,
             'requires_frp_check' => $validated['requires_frp_check'] ?? false,
             'specifications' => $validated['specifications'] ?? null,
+            'is_addon' => $validated['is_addon'] ?? false,
             'is_active' => $validated['is_active'] ?? true,
         ]);
 
@@ -233,7 +250,7 @@ class ProductController extends Controller
     }
 
     /**
-     * Update product details.
+     * Update product details and optionally synchronize pricing tiers.
      */
     public function update(Request $request, int $id): JsonResponse
     {
@@ -273,26 +290,69 @@ class ProductController extends Controller
             'has_serial_number' => 'nullable|boolean',
             'requires_frp_check' => 'nullable|boolean',
             'specifications' => 'nullable|array',
+            'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
+            'rates' => 'nullable|array',
+            'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
+            'rates.*.duration_value' => 'required_with:rates|integer|min:1',
+            'rates.*.price' => 'required_with:rates|numeric|min:0',
+            'rates.*.extension_hourly_rate' => 'nullable|numeric|min:0',
+            'rates.*.is_active' => 'nullable|boolean',
         ]);
 
-        $product->update(array_filter($validated, fn($v) => $v !== null));
+        return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
+            $productFields = collect($validated)->except(['rates'])->filter(fn($v) => $v !== null)->toArray();
+            if (!empty($productFields)) {
+                $product->update($productFields);
+            }
 
-        AuditLogService::log(
-            $request->user(),
-            'product.updated',
-            'AssetModel',
-            $product->id,
-            $product->toArray(),
-            $old,
-            $request->ip()
-        );
+            if ($request->has('rates') && is_array($request->rates)) {
+                $submittedKeys = [];
+                foreach ($request->rates as $rate) {
+                    $unit = strtolower($rate['duration_unit']);
+                    $val = (int)$rate['duration_value'];
+                    $hours = $this->pricingService->computeDurationHours($unit, $val);
+                    $submittedKeys[] = $unit . '_' . $val;
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Data produk rental berhasil diperbarui.',
-            'data' => $product->fresh(['category', 'pricingTiers']),
-        ]);
+                    PricingTier::updateOrCreate(
+                        [
+                            'model_id' => $product->id,
+                            'duration_unit' => $unit,
+                            'duration_value' => $val,
+                        ],
+                        [
+                            'business_id' => $businessId,
+                            'duration_hours' => $hours,
+                            'price' => $rate['price'],
+                            'extension_hourly_rate' => $rate['extension_hourly_rate'] ?? 15000.00,
+                            'is_active' => $rate['is_active'] ?? true,
+                        ]
+                    );
+                }
+
+                if (!empty($submittedKeys)) {
+                    PricingTier::where('model_id', $product->id)
+                        ->whereNotIn(DB::raw("CONCAT(duration_unit, '_', duration_value)"), $submittedKeys)
+                        ->update(['is_active' => false]);
+                }
+            }
+
+            AuditLogService::log(
+                $request->user(),
+                'product.updated',
+                'AssetModel',
+                $product->id,
+                $product->toArray(),
+                $old,
+                $request->ip()
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Data produk rental berhasil diperbarui.',
+                'data' => $product->fresh(['category', 'pricingTiers']),
+            ]);
+        });
     }
 
     /**

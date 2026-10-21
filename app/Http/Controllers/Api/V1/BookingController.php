@@ -45,7 +45,7 @@ class BookingController extends Controller
 
         $query = Booking::with([
             'customer',
-            'items.asset.model',
+            'items.asset.model.category',
             'payments.paymentMethod',
             'payments.processedBy',
             'exchanges.oldAsset.model',
@@ -195,6 +195,8 @@ class BookingController extends Controller
             'identity_photo_base64' => 'nullable|string',
             'asset_ids' => 'required|array|min:1',
             'asset_ids.*' => 'integer|exists:assets,id',
+            'addon_asset_ids' => 'nullable|array',
+            'addon_asset_ids.*' => 'integer|exists:assets,id',
             'duration_hours' => 'nullable|integer|min:1',
             'duration_unit' => 'nullable|string|in:hour,day,week,month',
             'duration_value' => 'nullable|integer|min:1',
@@ -240,7 +242,7 @@ class BookingController extends Controller
     {
         $booking = Booking::with([
             'customer.identities',
-            'items.asset.model',
+            'items.asset.model.category',
             'payments.paymentMethod',
             'payments.processedBy',
             'voucher',

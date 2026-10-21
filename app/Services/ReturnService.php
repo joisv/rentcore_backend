@@ -34,6 +34,9 @@ class ReturnService
                 foreach ($booking->items as $item) {
                     $model = $item->asset?->model;
                     if ($model) {
+                        if ($item->item_type === 'addon' || $model->isAddon()) {
+                            continue;
+                        }
                         $isFrpBrand = in_array(strtolower($model->brand ?? ''), ['apple', 'samsung', 'google', 'xiaomi', 'oppo', 'vivo']);
                         $isFrpName = (bool)preg_match('/(iphone|ipad|galaxy|pixel)/i', $model->name ?? '');
                         if ($model->requires_frp_check || $isFrpBrand || $isFrpName) {

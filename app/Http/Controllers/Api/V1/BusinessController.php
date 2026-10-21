@@ -241,6 +241,103 @@ class BusinessController extends Controller
     }
 
     /**
+     * Get rental rules & policies for the active business.
+     */
+    public function getRentalRules(Request $request, ?int $id = null): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $isMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->exists();
+
+        if (!$isMember && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akses ditolak. Anda bukan anggota aktif dari bisnis ini.',
+            ], 403);
+        }
+
+        $business = Business::findOrFail($businessId);
+
+        return response()->json([
+            'success' => true,
+            'data' => $business->getRentalRules(),
+        ]);
+    }
+
+    /**
+     * Update rental rules & policies for the active business (Owner/Admin only).
+     */
+    public function updateRentalRules(Request $request, ?int $id = null): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $member = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$member || !$member->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berhak mengubah kebijakan rental bisnis.',
+            ], 403);
+        }
+
+        $business = Business::findOrFail($businessId);
+
+        $validated = $request->validate([
+            'id_document_limit_enabled' => 'nullable|boolean',
+            'max_primary_devices_per_id' => 'nullable|integer|min:1',
+            'addons_enabled' => 'nullable|boolean',
+            'max_addons_per_rental' => 'nullable|integer|min:1',
+            'allow_unlimited_addons' => 'nullable|boolean',
+        ]);
+
+        $updates = [];
+        if (array_key_exists('id_document_limit_enabled', $validated)) {
+            $updates['id_document_limit_enabled'] = (bool)$validated['id_document_limit_enabled'];
+        }
+        if (array_key_exists('max_primary_devices_per_id', $validated)) {
+            $updates['max_primary_devices_per_id'] = (int)$validated['max_primary_devices_per_id'];
+        }
+        if (array_key_exists('addons_enabled', $validated)) {
+            $updates['addons_enabled'] = (bool)$validated['addons_enabled'];
+        }
+        if (!empty($validated['allow_unlimited_addons'])) {
+            $updates['max_addons_per_rental'] = null;
+        } elseif (array_key_exists('max_addons_per_rental', $validated)) {
+            $updates['max_addons_per_rental'] = $validated['max_addons_per_rental'] !== null
+                ? (int)$validated['max_addons_per_rental']
+                : null;
+        }
+
+        $business->update($updates);
+
+        AuditLogService::log(
+            $user,
+            'business.rental_rules_updated',
+            'Business',
+            $business->id,
+            $updates,
+            null,
+            $request->ip()
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kebijakan sewa dan add-on berhasil diperbarui.',
+            'data' => $business->getRentalRules(),
+        ]);
+    }
+
+    /**
      * List members/staff of the active business.
      */
     public function members(Request $request, ?int $id = null): JsonResponse

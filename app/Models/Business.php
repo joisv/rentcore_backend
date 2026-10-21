@@ -25,11 +25,29 @@ class Business extends Model
         'logo_path',
         'owner_id',
         'is_active',
+        'id_document_limit_enabled',
+        'max_primary_devices_per_id',
+        'addons_enabled',
+        'max_addons_per_rental',
     ];
 
     protected $casts = [
         'is_active' => 'boolean',
+        'id_document_limit_enabled' => 'boolean',
+        'addons_enabled' => 'boolean',
+        'max_primary_devices_per_id' => 'integer',
+        'max_addons_per_rental' => 'integer',
     ];
+
+    public function getRentalRules(): array
+    {
+        return [
+            'id_document_limit_enabled' => $this->id_document_limit_enabled !== null ? (bool)$this->id_document_limit_enabled : true,
+            'max_primary_devices_per_id' => (int)($this->max_primary_devices_per_id ?? 1),
+            'addons_enabled' => $this->addons_enabled !== null ? (bool)$this->addons_enabled : true,
+            'max_addons_per_rental' => $this->max_addons_per_rental !== null ? (int)$this->max_addons_per_rental : 5,
+        ];
+    }
 
     protected static function boot()
     {

@@ -16,12 +16,24 @@ class AssetCategory extends Model
         'name',
         'slug',
         'description',
+        'is_addon',
         'is_active',
     ];
 
     protected $casts = [
+        'is_addon' => 'boolean',
         'is_active' => 'boolean',
     ];
+
+    public function scopeAddons($query)
+    {
+        return $query->where('is_addon', true);
+    }
+
+    public function scopeDevices($query)
+    {
+        return $query->where('is_addon', false);
+    }
 
     protected static function booted(): void
     {

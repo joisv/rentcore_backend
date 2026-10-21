@@ -13,6 +13,7 @@ class BookingItem extends Model
     protected $fillable = [
         'booking_id',
         'asset_id',
+        'item_type',
         'unit_price',
         'duration_unit',
         'duration_value',
@@ -31,6 +32,18 @@ class BookingItem extends Model
     public function scopeActive($query)
     {
         return $query->where('status', 'active');
+    }
+
+    public function scopePrimary($query)
+    {
+        return $query->where(function ($q) {
+            $q->where('item_type', 'primary')->orWhereNull('item_type');
+        });
+    }
+
+    public function scopeAddons($query)
+    {
+        return $query->where('item_type', 'addon');
     }
 
     public function booking(): BelongsTo

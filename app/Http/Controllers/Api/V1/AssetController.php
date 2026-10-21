@@ -8,6 +8,8 @@ use App\Models\AssetModel;
 use App\Services\AuditLogService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class AssetController extends Controller
 {
@@ -19,7 +21,20 @@ class AssetController extends Controller
         $tenantContext = app(\App\Tenancy\TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
 
-        $query = Asset::with(['model.category', 'model.pricingTiers']);
+        \Illuminate\Support\Facades\Log::info('GET /assets called', [
+            'user_id' => $request->user()?->id,
+            'user_email' => $request->user()?->email,
+            'business_id' => $businessId,
+            'branch_id_param' => $request->get('branch_id'),
+            'affiliate_id_param' => $request->get('affiliate_id'),
+            'header_branch' => $request->header('X-Branch-Id'),
+            'header_business' => $request->header('X-Business-Id'),
+            'status_filter' => $request->get('status'),
+            'category_id' => $request->get('category_id'),
+            'search' => $request->get('search'),
+        ]);
+
+        $query = Asset::with(['model.category', 'model.pricingTiers', 'affiliate']);
 
         $branchId = $request->get('branch_id') 
             ?? $request->get('affiliate_id') 
@@ -92,7 +107,20 @@ class AssetController extends Controller
             });
         }
 
-        $assets = $query->paginate($request->get('per_page', 20));
+        if ($request->boolean('all', false)) {
+            $assets = $query->get();
+            return response()->json([
+                'success' => true,
+                'data' => $assets,
+            ]);
+        }
+
+        $perPage = (int) $request->get('per_page', 20);
+        $assets = $query->paginate($perPage);
+
+        if ($assets->currentPage() > $assets->lastPage() && $assets->lastPage() > 0) {
+            $assets = $query->paginate($perPage, ['*'], 'page', $assets->lastPage());
+        }
 
         return response()->json([
             'success' => true,
@@ -118,11 +146,24 @@ class AssetController extends Controller
      */
     public function models(Request $request): JsonResponse
     {
-        $models = AssetModel::with(['category', 'pricingTiers' => function ($q) {
+        $query = AssetModel::with(['category', 'pricingTiers' => function ($q) {
             $q->where('is_active', true);
         }])
-        ->where('is_active', true)
-        ->get();
+        ->where('is_active', true);
+
+        if ($request->filled('category_id')) {
+            $query->where('category_id', $request->category_id);
+        }
+
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('brand', 'like', "%{$search}%");
+            });
+        }
+
+        $models = $query->get();
 
         return response()->json([
             'success' => true,
@@ -236,38 +277,171 @@ class AssetController extends Controller
     }
 
     /**
-     * Update asset condition, notes, or maintenance status.
+     * Update asset condition, identifiers, model, notes, or maintenance status.
      */
     public function update(Request $request, int $id): JsonResponse
     {
         $asset = Asset::findOrFail($id);
-        $oldValues = $asset->only(['condition_grade', 'battery_health', 'status', 'notes']);
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $asset->business_id ?? $tenantContext->getBusinessId();
+        $user = $request->user();
 
+        // 1. Enforce branch authorization for staff
+        if ($user && $tenantContext->isStaff()) {
+            $member = $tenantContext->getMember();
+            if ($member) {
+                $allowedBranches = $member->branchMembers()->pluck('affiliate_id')->map(fn($b) => (int)$b)->toArray();
+                if (!empty($allowedBranches) && !in_array((int)$asset->affiliate_id, $allowedBranches)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Akses cabang ditolak. Anda tidak berwenang mengedit unit di cabang ini.',
+                        'code' => 'BRANCH_ACCESS_DENIED',
+                    ], 403);
+                }
+            }
+        }
+
+        // 2. Prevent reassignment of business_id or affiliate_id through edit request
+        if ($request->has('business_id') && (int)$request->business_id !== (int)$asset->business_id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Bisnis pemilik unit tidak dapat diubah.',
+                'code' => 'BUSINESS_REASSIGNMENT_FORBIDDEN',
+            ], 422);
+        }
+
+        if ($request->has('affiliate_id') && (int)$request->affiliate_id !== (int)$asset->affiliate_id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cabang penempatan unit tidak dapat diubah secara langsung melalui form edit. Gunakan fitur Mutasi Stok Antar-Cabang.',
+                'code' => 'BRANCH_REASSIGNMENT_FORBIDDEN',
+            ], 422);
+        }
+
+        // 3. Validation
         $validated = $request->validate([
+            'model_id' => [
+                'nullable',
+                Rule::exists('asset_models', 'id')->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'asset_code' => [
+                'nullable',
+                'string',
+                'max:50',
+                Rule::unique('assets', 'asset_code')->ignore($asset->id)->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'serial_number' => [
+                'nullable',
+                'string',
+                'max:100',
+                Rule::unique('assets', 'serial_number')->ignore($asset->id)->where(function ($q) use ($businessId) {
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
+            'imei_1' => 'nullable|string|max:50',
+            'imei_2' => 'nullable|string|max:50',
+            'status' => 'nullable|in:ready,reserved,rented,maintenance,in_transit,retired,lost',
             'condition_grade' => 'nullable|in:A,B,C',
             'battery_health' => 'nullable|integer|min:0|max:100',
-            'status' => 'nullable|in:ready,maintenance,retired,lost',
             'notes' => 'nullable|string',
         ]);
 
-        $asset->update(array_filter($validated, fn($v) => $v !== null));
+        // 4. Guard model_id change
+        if (isset($validated['model_id']) && (int)$validated['model_id'] !== (int)$asset->model_id) {
+            if ($asset->bookingItems()->exists()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Tidak dapat mengubah model katalog unit karena unit memiliki riwayat booking/transaksi rental.',
+                    'code' => 'MODEL_CHANGE_RESTRICTED',
+                ], 422);
+            }
+            if (in_array($asset->status, ['rented', 'reserved', 'in_transit'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Tidak dapat mengubah model katalog saat unit sedang aktif disewa, dipesan, atau dalam proses mutasi.',
+                    'code' => 'ACTIVE_STATE_RESTRICTED',
+                ], 422);
+            }
+        }
 
-        AuditLogService::log(
-            $request->user(),
-            'asset.updated',
-            'Asset',
-            $asset->id,
-            $asset->only(['condition_grade', 'battery_health', 'status', 'notes']),
-            $oldValues,
-            $request->ip(),
-            $asset->affiliate_id
-        );
+        // 5. Guard status change
+        if (isset($validated['status']) && $validated['status'] !== $asset->status) {
+            if ($asset->status === 'rented') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Status unit tidak dapat diubah secara manual saat unit sedang aktif disewa pelanggan. Selesaikan pengembalian (return) terlebih dahulu.',
+                    'code' => 'RENTED_STATUS_LOCKED',
+                ], 422);
+            }
+            if ($asset->status === 'in_transit') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Status unit tidak dapat diubah secara manual saat unit dalam proses mutasi antar cabang. Selesaikan atau batalkan mutasi terlebih dahulu.',
+                    'code' => 'IN_TRANSIT_STATUS_LOCKED',
+                ], 422);
+            }
+        }
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Data perangkat berhasil diperbarui.',
-            'data' => $asset->fresh(['model.category', 'affiliate']),
-        ]);
+        // Format uppercase identifiers
+        if (isset($validated['asset_code'])) {
+            $validated['asset_code'] = strtoupper(trim($validated['asset_code']));
+        }
+        if (isset($validated['serial_number'])) {
+            $validated['serial_number'] = strtoupper(trim($validated['serial_number']));
+        }
+
+        return DB::transaction(function () use ($request, $asset, $validated) {
+            $oldValues = $asset->only([
+                'model_id',
+                'asset_code',
+                'serial_number',
+                'imei_1',
+                'imei_2',
+                'status',
+                'condition_grade',
+                'battery_health',
+                'notes',
+            ]);
+
+            $asset->update(array_filter($validated, fn($v) => $v !== null));
+
+            AuditLogService::log(
+                $request->user(),
+                'asset.updated',
+                'Asset',
+                $asset->id,
+                $asset->only([
+                    'model_id',
+                    'asset_code',
+                    'serial_number',
+                    'imei_1',
+                    'imei_2',
+                    'status',
+                    'condition_grade',
+                    'battery_health',
+                    'notes',
+                ]),
+                $oldValues,
+                $request->ip(),
+                $asset->affiliate_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Data perangkat berhasil diperbarui.',
+                'data' => $asset->fresh(['model.category', 'affiliate']),
+            ]);
+        });
     }
 
     /**

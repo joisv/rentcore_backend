@@ -26,6 +26,8 @@ class Booking extends Model
         'duration_value',
         'status',
         'subtotal_amount',
+        'primary_subtotal',
+        'addon_subtotal',
         'deposit_fee',
         'discount_type',
         'discount_amount',
@@ -46,6 +48,8 @@ class Booking extends Model
         'duration_hours' => 'integer',
         'duration_value' => 'integer',
         'subtotal_amount' => 'decimal:2',
+        'primary_subtotal' => 'decimal:2',
+        'addon_subtotal' => 'decimal:2',
         'deposit_fee' => 'decimal:2',
         'discount_amount' => 'decimal:2',
         'total_bill' => 'decimal:2',
@@ -55,22 +59,62 @@ class Booking extends Model
     protected $appends = [
         'active_item',
         'active_asset',
+        'primary_item',
+        'primary_asset',
+        'addon_items',
     ];
 
     public function getActiveItemAttribute(): ?BookingItem
     {
         if ($this->relationLoaded('items')) {
+            // Priority 1: Active primary item
+            $primaryActive = $this->items->first(fn ($item) => 
+                ($item->item_type === 'primary' || $item->item_type === null) && 
+                ($item->status === 'active' || $item->status === null)
+            );
+            if ($primaryActive) return $primaryActive;
+
+            // Priority 2: Any primary item
+            $primary = $this->items->first(fn ($item) => 
+                $item->item_type === 'primary' || $item->item_type === null
+            );
+            if ($primary) return $primary;
+
+            // Priority 3: Fallback to first active item or first item
             return $this->items->first(fn ($item) => $item->status === 'active' || $item->status === null)
                 ?? $this->items->first();
         }
 
-        return $this->activeItems()->with('asset.model')->first()
-            ?? $this->items()->with('asset.model')->latest('id')->first();
+        return $this->activePrimaryItems()->with('asset.model.category')->first()
+            ?? $this->primaryItems()->with('asset.model.category')->first()
+            ?? $this->activeItems()->with('asset.model.category')->first()
+            ?? $this->items()->with('asset.model.category')->first();
     }
 
     public function getActiveAssetAttribute(): ?Asset
     {
         return $this->active_item?->asset;
+    }
+
+    public function getPrimaryItemAttribute(): ?BookingItem
+    {
+        return $this->active_item;
+    }
+
+    public function getPrimaryAssetAttribute(): ?Asset
+    {
+        return $this->active_asset;
+    }
+
+    public function getAddonItemsAttribute(): array
+    {
+        if ($this->relationLoaded('items')) {
+            return $this->items->filter(fn ($item) => $item->item_type === 'addon')
+                ->values()
+                ->all();
+        }
+
+        return $this->addonItems()->with('asset.model.category')->get()->all();
     }
 
     protected static function booted(): void
@@ -110,7 +154,29 @@ class Booking extends Model
 
     public function items(): HasMany
     {
-        return $this->hasMany(BookingItem::class)->orderByRaw("CASE WHEN status = 'active' OR status IS NULL THEN 0 ELSE 1 END, id DESC");
+        return $this->hasMany(BookingItem::class)
+            ->orderByRaw("CASE WHEN item_type = 'primary' OR item_type IS NULL THEN 0 ELSE 1 END, CASE WHEN status = 'active' OR status IS NULL THEN 0 ELSE 1 END, id ASC");
+    }
+
+    public function primaryItems(): HasMany
+    {
+        return $this->hasMany(BookingItem::class)
+            ->where(function ($q) {
+                $q->where('item_type', 'primary')->orWhereNull('item_type');
+            })
+            ->orderByRaw("CASE WHEN status = 'active' OR status IS NULL THEN 0 ELSE 1 END, id ASC");
+    }
+
+    public function activePrimaryItems(): HasMany
+    {
+        return $this->primaryItems()->where('status', 'active');
+    }
+
+    public function addonItems(): HasMany
+    {
+        return $this->hasMany(BookingItem::class)
+            ->where('item_type', 'addon')
+            ->orderByRaw("CASE WHEN status = 'active' OR status IS NULL THEN 0 ELSE 1 END, id ASC");
     }
 
     public function extensions(): HasMany

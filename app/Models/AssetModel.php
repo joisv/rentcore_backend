@@ -24,6 +24,7 @@ class AssetModel extends Model
         'has_serial_number',
         'requires_frp_check',
         'specifications',
+        'is_addon',
         'is_active',
     ];
 
@@ -32,8 +33,35 @@ class AssetModel extends Model
         'specifications' => 'array',
         'has_serial_number' => 'boolean',
         'requires_frp_check' => 'boolean',
+        'is_addon' => 'boolean',
         'is_active' => 'boolean',
     ];
+
+    public function isAddon(): bool
+    {
+        return (bool)($this->is_addon || ($this->category && $this->category->is_addon));
+    }
+
+    public function scopeAddons($query)
+    {
+        return $query->where(function ($q) {
+            $q->where('asset_models.is_addon', true)
+              ->orWhereHas('category', function ($cq) {
+                  $cq->where('is_addon', true);
+              });
+        });
+    }
+
+    public function scopeDevices($query)
+    {
+        return $query->where('asset_models.is_addon', false)
+            ->where(function ($q) {
+                $q->whereDoesntHave('category')
+                  ->orWhereHas('category', function ($cq) {
+                      $cq->where('is_addon', false);
+                  });
+            });
+    }
 
     protected static function booted(): void
     {

@@ -22,6 +22,10 @@ class CategoryController extends Controller
             $query->where('is_active', filter_var($request->is_active, FILTER_VALIDATE_BOOLEAN));
         }
 
+        if ($request->has('is_addon')) {
+            $query->where('is_addon', filter_var($request->is_addon, FILTER_VALIDATE_BOOLEAN));
+        }
+
         if ($request->filled('search')) {
             $search = $request->search;
             $query->where(function ($q) use ($search) {
@@ -38,7 +42,12 @@ class CategoryController extends Controller
             ]);
         }
 
-        $categories = $query->orderBy('name')->paginate($request->get('per_page', 20));
+        $perPage = (int) $request->get('per_page', 20);
+        $categories = $query->orderBy('name')->paginate($perPage);
+
+        if ($categories->currentPage() > $categories->lastPage() && $categories->lastPage() > 0) {
+            $categories = $query->orderBy('name')->paginate($perPage, ['*'], 'page', $categories->lastPage());
+        }
 
         return response()->json([
             'success' => true,
@@ -88,6 +97,7 @@ class CategoryController extends Controller
                 }),
             ],
             'description' => 'nullable|string',
+            'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
         ]);
 
@@ -98,6 +108,7 @@ class CategoryController extends Controller
             'name' => $validated['name'],
             'slug' => $slug,
             'description' => $validated['description'] ?? null,
+            'is_addon' => $validated['is_addon'] ?? false,
             'is_active' => $validated['is_active'] ?? true,
         ]);
 
@@ -158,6 +169,7 @@ class CategoryController extends Controller
                 }),
             ],
             'description' => 'nullable|string',
+            'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
         ]);
 

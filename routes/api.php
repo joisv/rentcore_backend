@@ -48,6 +48,8 @@ Route::prefix('v1')->group(function () {
 
             // Business & Branch Settings
             Route::put('/businesses/{id}', [BusinessController::class, 'update']);
+            Route::get('/businesses/{id}/rental-rules', [BusinessController::class, 'getRentalRules']);
+            Route::put('/businesses/{id}/rental-rules', [BusinessController::class, 'updateRentalRules']);
             Route::get('/businesses/{id}/branches', [BusinessController::class, 'branches']);
             Route::get('/businesses/{id}/members', [BusinessController::class, 'members']);
             Route::post('/businesses/{id}/members', [BusinessController::class, 'addMember']);

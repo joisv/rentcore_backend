@@ -53,7 +53,9 @@ class BookingService
                 $affiliateId = $cashier->affiliate_id;
             }
 
-            $assetIds = (array)($data['asset_ids'] ?? []);
+            $rawPrimaryIds = (array)($data['asset_ids'] ?? []);
+            $rawAddonIds = (array)($data['addon_asset_ids'] ?? []);
+            $assetIds = array_values(array_unique(array_filter(array_merge($rawPrimaryIds, $rawAddonIds))));
 
             // Fallback to the business's central/default active branch
             if (empty($affiliateId) && $businessId) {
@@ -189,6 +191,7 @@ class BookingService
 
             // 2. Lock and verify Assets with Pessimistic Concurrency (SELECT ... FOR UPDATE)
             $assetQuery = Asset::withoutGlobalScopes()
+                ->with(['model.category'])
                 ->whereIn('id', $assetIds)
                 ->where('affiliate_id', $affiliateId);
 
@@ -216,6 +219,85 @@ class BookingService
                 }
             }
 
+            // Classify assets into primary devices and add-on items
+            $rawAddonInts = array_map('intval', $rawAddonIds);
+            $primaryAssets = [];
+            $addonAssets = [];
+            foreach ($assets as $asset) {
+                $isAddon = in_array((int)$asset->id, $rawAddonInts, true) || ($asset->model && $asset->model->isAddon());
+                if ($isAddon) {
+                    $addonAssets[] = $asset;
+                } else {
+                    $primaryAssets[] = $asset;
+                }
+            }
+
+            // 2b. Validate Business Policies (Add-ons and Identity Document Limit)
+            $business = $businessId ? \App\Models\Business::find($businessId) : null;
+            if ($business) {
+                // Policy: Add-on enable/disable and quantity limit
+                if (!$business->addons_enabled && count($addonAssets) > 0) {
+                    throw ValidationException::withMessages([
+                        'addon_asset_ids' => ['Fitur sewa add-on / aksesoris sedang dinonaktifkan untuk bisnis ini.'],
+                    ]);
+                }
+
+                if ($business->max_addons_per_rental !== null && count($addonAssets) > $business->max_addons_per_rental) {
+                    throw ValidationException::withMessages([
+                        'addon_asset_ids' => [
+                            'Jumlah unit add-on (' . count($addonAssets) . ') melebihi batas maksimal yang diizinkan (' . $business->max_addons_per_rental . ' unit per transaksi).'
+                        ],
+                    ]);
+                }
+
+                // Policy: Identity Document Rental Limit (Applies only to PRIMARY devices)
+                if ($business->id_document_limit_enabled) {
+                    $identityNumber = !empty($data['identity_number']) ? trim($data['identity_number']) : null;
+                    if (!$identityNumber) {
+                        $existingIdDoc = CustomerIdentity::where('customer_id', $customer->id)->latest()->first();
+                        $identityNumber = $existingIdDoc?->identity_number;
+                    }
+
+                    if ($identityNumber) {
+                        $normalizedId = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', $identityNumber));
+                        $relatedCustomerIds = CustomerIdentity::whereRaw("UPPER(REPLACE(REPLACE(identity_number, ' ', ''), '-', '')) = ?", [$normalizedId])
+                            ->pluck('customer_id')
+                            ->push($customer->id)
+                            ->unique()
+                            ->toArray();
+
+                        $activeBookingIds = Booking::withoutGlobalScopes()
+                            ->where('business_id', $businessId)
+                            ->whereIn('customer_id', $relatedCustomerIds)
+                            ->whereIn('status', ['rented', 'reserved', 'active', 'confirmed'])
+                            ->pluck('id');
+
+                        $activePrimaryCount = BookingItem::whereIn('booking_id', $activeBookingIds)
+                            ->where(function ($q) {
+                                $q->where('item_type', 'primary')->orWhereNull('item_type');
+                            })
+                            ->where(function ($q) {
+                                $q->where('status', 'active')->orWhereNull('status');
+                            })
+                            ->count();
+
+                        $newPrimaryCount = count($primaryAssets);
+                        $maxLimit = (int)($business->max_primary_devices_per_id ?? 1);
+
+                        if (($activePrimaryCount + $newPrimaryCount) > $maxLimit) {
+                            $maskedId = strlen($identityNumber) > 8
+                                ? substr($identityNumber, 0, 4) . '****' . substr($identityNumber, -4)
+                                : $identityNumber;
+                            throw ValidationException::withMessages([
+                                'identity_number' => [
+                                    "Batas kuota sewa tercapai. Dokumen identitas ({$maskedId}) telah memiliki {$activePrimaryCount} perangkat utama aktif (Maksimal: {$maxLimit} unit utama). Selesaikan atau kembalikan sewa sebelumnya."
+                                ],
+                            ]);
+                        }
+                    }
+                }
+            }
+
             // 3. Duration & Time Calculation
             $durationUnit = $data['duration_unit'] ?? 'hour';
             $durationValue = (int)($data['duration_value'] ?? $data['duration_hours'] ?? 1);
@@ -228,17 +310,25 @@ class BookingService
             $endAt = $this->pricingService->computeEndAt($startAt, $durationUnit, $durationValue);
 
             // 4. Subtotal calculation based on Pricing Tiers or default rates
-            $subtotal = 0.00;
+            $primarySubtotal = 0.00;
+            $addonSubtotal = 0.00;
+            $addonAssetIdsList = array_map(fn($a) => (int)$a->id, $addonAssets);
             $itemPrices = [];
             $itemSnapshots = [];
             foreach ($assets as $asset) {
+                $isAddonItem = in_array((int)$asset->id, $addonAssetIdsList, true) || ($asset->model && $asset->model->isAddon());
+                $passedPrice = null;
+                if (!empty($data['unit_prices']) && is_array($data['unit_prices'])) {
+                    $passedPrice = $data['unit_prices'][$asset->id] ?? $data['unit_prices'][(string)$asset->id] ?? null;
+                }
+
                 try {
                     $calc = $this->pricingService->calculate($asset->model, $durationUnit, $durationValue, $startAt);
-                    $unitPrice = isset($data['unit_prices'][$asset->id]) ? (float)$data['unit_prices'][$asset->id] : $calc['price'];
+                    $unitPrice = $passedPrice !== null ? (float)$passedPrice : $calc['price'];
                     $snapshot = $calc['rate_snapshot'];
                 } catch (ValidationException $e) {
-                    if (isset($data['unit_prices'][$asset->id])) {
-                        $unitPrice = (float)$data['unit_prices'][$asset->id];
+                    if ($passedPrice !== null) {
+                        $unitPrice = (float)$passedPrice;
                         $snapshot = [
                             'tier_id' => null,
                             'duration_unit' => $durationUnit,
@@ -252,15 +342,39 @@ class BookingService
                             'category_name' => $asset->model->category?->name,
                             'calculated_at' => Carbon::now()->toIso8601String(),
                         ];
+                    } elseif ($isAddonItem) {
+                        // Fallback for add-ons: use their first active tier or standard rate
+                        $firstTier = $asset->model ? $asset->model->pricingTiers()->where('is_active', true)->first() : null;
+                        $unitPrice = $firstTier ? (float)$firstTier->price : 20000.00;
+                        $snapshot = [
+                            'tier_id' => $firstTier?->id,
+                            'duration_unit' => $durationUnit,
+                            'duration_value' => $durationValue,
+                            'duration_hours' => $durationHours,
+                            'price' => $unitPrice,
+                            'extension_hourly_rate' => $firstTier ? (float)$firstTier->extension_hourly_rate : 5000.00,
+                            'model_id' => $asset->model?->id,
+                            'model_name' => $asset->model?->name,
+                            'brand' => $asset->model?->brand,
+                            'category_name' => $asset->model?->category?->name,
+                            'calculated_at' => Carbon::now()->toIso8601String(),
+                        ];
                     } else {
                         throw $e;
                     }
                 }
 
-                $subtotal += $unitPrice;
+                if (in_array((int)$asset->id, $addonAssetIdsList, true)) {
+                    $addonSubtotal += $unitPrice;
+                } else {
+                    $primarySubtotal += $unitPrice;
+                }
+
                 $itemPrices[$asset->id] = $unitPrice;
                 $itemSnapshots[$asset->id] = $snapshot;
             }
+
+            $subtotal = $primarySubtotal + $addonSubtotal;
 
             // 5. Discount Calculation (Voucher or Manual)
             $discountType = 'none';
@@ -341,6 +455,8 @@ class BookingService
                 'duration_value' => $durationValue,
                 'status' => 'rented',
                 'subtotal_amount' => $subtotal,
+                'primary_subtotal' => $primarySubtotal,
+                'addon_subtotal' => $addonSubtotal,
                 'deposit_fee' => $depositFee,
                 'discount_type' => $discountType,
                 'discount_amount' => $discountAmount,
@@ -357,9 +473,11 @@ class BookingService
 
             // 8. Create Booking Items & transition assets to 'rented'
             foreach ($assets as $asset) {
+                $itemType = in_array((int)$asset->id, $addonAssetIdsList, true) ? 'addon' : 'primary';
                 BookingItem::create([
                     'booking_id' => $booking->id,
                     'asset_id' => $asset->id,
+                    'item_type' => $itemType,
                     'unit_price' => $itemPrices[$asset->id],
                     'duration_unit' => $durationUnit,
                     'duration_value' => $durationValue,
