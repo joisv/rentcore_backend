@@ -60,7 +60,7 @@ class MultiCategoryRentalTest extends TestCase
 
     public function test_can_create_and_list_categories(): void
     {
-        $token = $this->cashier->createToken('Test')->plainTextToken;
+        $token = $this->superAdmin->createToken('Test')->plainTextToken;
 
         // Create new category
         $response = $this->withHeader('Authorization', "Bearer {$token}")
@@ -73,6 +73,15 @@ class MultiCategoryRentalTest extends TestCase
             ->assertJsonPath('data.name', 'Kamera & Lensa')
             ->assertJsonPath('data.slug', 'kamera-lensa');
 
+        // Create another category that yields the same base slug; verify deduplication
+        $response2 = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/categories', [
+                'name' => 'Kamera Lensa',
+                'description' => 'Variant category with duplicate slug',
+            ]);
+        $response2->assertStatus(201)
+            ->assertJsonPath('data.slug', 'kamera-lensa-2');
+
         // List categories
         $listResponse = $this->withHeader('Authorization', "Bearer {$token}")
             ->getJson('/api/v1/categories');
@@ -83,7 +92,7 @@ class MultiCategoryRentalTest extends TestCase
 
     public function test_can_create_product_with_multi_unit_rates(): void
     {
-        $token = $this->cashier->createToken('Test')->plainTextToken;
+        $token = $this->superAdmin->createToken('Test')->plainTextToken;
 
         $category = AssetCategory::create([
             'name' => 'Kamera',

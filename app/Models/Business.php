@@ -15,6 +15,7 @@ class Business extends Model
     protected $fillable = [
         'uuid',
         'name',
+        'slogan',
         'slug',
         'email',
         'phone',
@@ -29,14 +30,18 @@ class Business extends Model
         'max_primary_devices_per_id',
         'addons_enabled',
         'max_addons_per_rental',
+        'expense_pin_threshold',
+        'require_expense_pin',
     ];
 
     protected $casts = [
         'is_active' => 'boolean',
         'id_document_limit_enabled' => 'boolean',
         'addons_enabled' => 'boolean',
+        'require_expense_pin' => 'boolean',
         'max_primary_devices_per_id' => 'integer',
         'max_addons_per_rental' => 'integer',
+        'expense_pin_threshold' => 'decimal:2',
     ];
 
     public function getRentalRules(): array

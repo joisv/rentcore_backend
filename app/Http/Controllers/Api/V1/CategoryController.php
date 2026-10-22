@@ -69,10 +69,36 @@ class CategoryController extends Controller
     }
 
     /**
+     * Enforce Owner or Admin authority to manage categories.
+     */
+    protected function authorizeManageCategories(Request $request): void
+    {
+        $user = $request->user();
+        if ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin())) {
+            return;
+        }
+
+        $tenant = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenant->getBusinessId() ?? (int)$request->header('X-Business-Id');
+        $member = $tenant->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : false;
+
+        if (!$isOwnerOrAdmin) {
+            abort(response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner bisnis atau Admin yang berwenang mengelola kategori produk rental.',
+                'code' => 'FORBIDDEN',
+            ], 403));
+        }
+    }
+
+    /**
      * Create a new category.
      */
     public function store(Request $request): JsonResponse
     {
+        $this->authorizeManageCategories($request);
+
         $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
 
         $validated = $request->validate([
@@ -101,7 +127,13 @@ class CategoryController extends Controller
             'is_active' => 'nullable|boolean',
         ]);
 
-        $slug = !empty($validated['slug']) ? Str::slug($validated['slug']) : Str::slug($validated['name']);
+        $baseSlug = !empty($validated['slug']) ? Str::slug($validated['slug']) : Str::slug($validated['name']);
+        $slug = $baseSlug;
+        $counter = 1;
+        while (AssetCategory::withoutGlobalScopes()->where('business_id', $businessId)->where('slug', $slug)->exists()) {
+            $counter++;
+            $slug = "{$baseSlug}-{$counter}";
+        }
 
         $category = AssetCategory::create([
             'business_id' => $businessId,
@@ -134,6 +166,8 @@ class CategoryController extends Controller
      */
     public function update(Request $request, int $id): JsonResponse
     {
+        $this->authorizeManageCategories($request);
+
         $category = AssetCategory::findOrFail($id);
 
         if ($category->business_id === null && !$request->user()->isSuperAdmin()) {
@@ -201,6 +235,8 @@ class CategoryController extends Controller
      */
     public function destroy(Request $request, int $id): JsonResponse
     {
+        $this->authorizeManageCategories($request);
+
         $category = AssetCategory::findOrFail($id);
 
         if ($category->business_id === null && !$request->user()->isSuperAdmin()) {

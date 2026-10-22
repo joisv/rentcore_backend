@@ -409,7 +409,7 @@ class BookingService
                         ]);
                     }
                     // Validate Manager PIN
-                    $manager = User::where(function ($q) use ($affiliateId, $businessId) {
+                    $managers = User::where(function ($q) use ($affiliateId, $businessId) {
                             $q->where('affiliate_id', $affiliateId);
                             if ($businessId) {
                                 $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
@@ -418,14 +418,18 @@ class BookingService
                             }
                         })
                         ->whereNotNull('manager_override_pin')
-                        ->first();
+                        ->get();
 
-                    if (!$manager || !password_verify($data['manager_pin'], $manager->manager_override_pin)) {
+                    $matchingManager = $managers->first(function ($mgr) use ($data) {
+                        return password_verify($data['manager_pin'], $mgr->manager_override_pin);
+                    });
+
+                    if (!$matchingManager) {
                         throw ValidationException::withMessages([
                             'manager_pin' => ['PIN Manager tidak valid.'],
                         ]);
                     }
-                    $approvedBy = $manager->id;
+                    $approvedBy = $matchingManager->id;
                 } else {
                     $approvedBy = $cashier->id;
                 }

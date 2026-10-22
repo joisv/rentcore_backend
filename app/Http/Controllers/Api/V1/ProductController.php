@@ -20,6 +20,30 @@ class ProductController extends Controller
     ) {}
 
     /**
+     * Enforce Owner or Admin authority to manage catalog and rates.
+     */
+    protected function authorizeManageProducts(Request $request): void
+    {
+        $user = $request->user();
+        if ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin())) {
+            return;
+        }
+
+        $tenant = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenant->getBusinessId() ?? (int)$request->header('X-Business-Id');
+        $member = $tenant->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : false;
+
+        if (!$isOwnerOrAdmin) {
+            abort(response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner bisnis atau Admin yang berwenang mengelola katalog produk dan tarif rental.',
+                'code' => 'FORBIDDEN',
+            ], 403));
+        }
+    }
+
+    /**
      * List all rental products (models) with filters and pricing tiers.
      */
     public function index(Request $request): JsonResponse
@@ -140,6 +164,8 @@ class ProductController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        $this->authorizeManageProducts($request);
+
         $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
 
         $validated = $request->validate([
@@ -254,6 +280,8 @@ class ProductController extends Controller
      */
     public function update(Request $request, int $id): JsonResponse
     {
+        $this->authorizeManageProducts($request);
+
         $product = AssetModel::findOrFail($id);
         $old = $product->toArray();
 
@@ -360,6 +388,8 @@ class ProductController extends Controller
      */
     public function updateRates(Request $request, int $id): JsonResponse
     {
+        $this->authorizeManageProducts($request);
+
         $product = AssetModel::findOrFail($id);
 
         $request->validate([

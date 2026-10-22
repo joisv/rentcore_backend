@@ -8,10 +8,13 @@ use App\Models\BranchExpense;
 use App\Models\BusinessMember;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -95,24 +98,17 @@ class ExpenseController extends Controller
             }
         }
 
-        // Date filtering
+        // Date filtering with timezone-awareness
         $startDate = $request->get('start_date');
         $endDate = $request->get('end_date');
         $dateParam = $request->get('date');
 
-        if ($startDate && $endDate) {
-            $start = Carbon::parse($startDate)->startOfDay();
-            $end = Carbon::parse($endDate)->endOfDay();
-        } elseif ($dateParam) {
-            $start = Carbon::parse($dateParam)->startOfDay();
-            $end = Carbon::parse($dateParam)->endOfDay();
-        } else {
-            $start = Carbon::today()->startOfDay();
-            $end = Carbon::today()->endOfDay();
-        }
+        $business = $businessId ? \App\Models\Business::find($businessId) : null;
+        $tz = $business?->timezone ?? 'Asia/Jakarta';
+        $bounds = TimezoneService::resolveQueryBounds($startDate, $endDate, $dateParam, $tz);
 
-        $query = BranchExpense::with(['branch', 'requestedBy', 'approvedBy'])
-            ->whereBetween('created_at', [$start, $end]);
+        $query = BranchExpense::with(['branch', 'requestedBy', 'approvedBy', 'voidBy'])
+            ->whereBetween(DB::raw('COALESCE(branch_expenses.disbursed_at, branch_expenses.created_at)'), [$bounds['start_utc'], $bounds['end_utc']]);
 
         if ($businessId) {
             $query->where('business_id', $businessId);
@@ -128,7 +124,7 @@ class ExpenseController extends Controller
         $categoryBreakdown = [];
 
         foreach ($expenses as $exp) {
-            if ($exp->status === 'rejected') {
+            if ($exp->status === 'rejected' || $exp->status === 'void') {
                 continue;
             }
             $amt = (float)$exp->amount;
@@ -150,6 +146,10 @@ class ExpenseController extends Controller
             'data' => [
                 'branch_id' => $targetBranchId,
                 'is_consolidated' => $targetBranchId === null,
+                'start_date' => $bounds['start_date'],
+                'end_date' => $bounds['end_date'],
+                'date' => $bounds['date_label'],
+                'timezone' => $tz,
                 'summary' => [
                     'total_expenses' => $totalExpenses,
                     'cash_drawer_expenses' => $cashDrawerExpenses,
@@ -169,6 +169,9 @@ class ExpenseController extends Controller
                         'status' => $exp->status,
                         'requested_by_name' => $exp->requestedBy?->name ?? 'Staff',
                         'approved_by_name' => $exp->approvedBy?->name,
+                        'void_by_name' => $exp->voidBy?->name,
+                        'void_reason' => $exp->void_reason,
+                        'voided_at' => $exp->voided_at?->toIso8601String(),
                         'receipt_image_url' => $exp->receipt_image_path ? Storage::disk('public')->url($exp->receipt_image_path) : null,
                         'notes' => $exp->notes,
                         'disbursed_at' => $exp->disbursed_at?->toIso8601String(),
@@ -232,24 +235,50 @@ class ExpenseController extends Controller
         $status = 'approved';
         $approvedBy = null;
 
+        $business = $businessId ? \App\Models\Business::find($businessId) : null;
+        $threshold = (float)($branch->expense_pin_threshold_override ?? $business?->expense_pin_threshold ?? 100000.00);
+
         if ($isOwnerOrAdmin) {
             $approvedBy = $user->id;
         } else {
-            // Staff limit: <= Rp 100.000 auto-approved
-            if ($amount <= 100000.00) {
+            // Check dynamic threshold for staff
+            $requirePin = ($business?->require_expense_pin ?? true) && ($amount > $threshold);
+
+            if (!$requirePin) {
                 $approvedBy = $user->id;
             } else {
-                // > 100k requires manager PIN
                 if (empty($validated['manager_pin'])) {
                     throw ValidationException::withMessages([
                         'manager_pin' => [
-                            'Pengeluaran kas cabang di atas Rp 100.000 (Rp ' . number_format($amount, 0, ',', '.') . 
+                            'Pengeluaran kas cabang di atas Rp ' . number_format($threshold, 0, ',', '.') . 
+                            ' (Rp ' . number_format($amount, 0, ',', '.') . 
                             ') wajib diverifikasi menggunakan PIN Manager Cabang.'
                         ],
                     ]);
                 }
 
-                $manager = User::where(function ($q) use ($branchId, $businessId) {
+                $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
+                if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+                    $seconds = RateLimiter::availableIn($throttleKey);
+                    AuditLogService::log(
+                        $user,
+                        'security.pin_brute_force_lockout',
+                        'BranchExpense',
+                        'LOCKOUT',
+                        ['seconds_remaining' => $seconds, 'ip' => $request->ip()],
+                        null,
+                        $request->ip(),
+                        $branchId
+                    );
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Terlalu banyak percobaan PIN Manager yang salah. Akses PIN dikunci sementara. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
+                        'code' => 'PIN_RATE_LIMITED',
+                        'retry_after' => $seconds,
+                    ], 429);
+                }
+
+                $managers = User::where(function ($q) use ($branchId, $businessId) {
                         $q->where('affiliate_id', $branchId);
                         if ($businessId) {
                             $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
@@ -258,14 +287,22 @@ class ExpenseController extends Controller
                         }
                     })
                     ->whereNotNull('manager_override_pin')
-                    ->first();
+                    ->get();
 
-                if (!$manager || !password_verify($validated['manager_pin'], $manager->manager_override_pin)) {
+                $matchingManager = $managers->first(function ($mgr) use ($validated) {
+                    return password_verify($validated['manager_pin'], $mgr->manager_override_pin);
+                });
+
+                if (!$matchingManager) {
+                    RateLimiter::hit($throttleKey, 900);
+                    $remaining = 5 - RateLimiter::attempts($throttleKey);
                     throw ValidationException::withMessages([
-                        'manager_pin' => ['PIN Manager Cabang tidak valid.'],
+                        'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : ' Akun Anda dikunci sementara.')],
                     ]);
                 }
-                $approvedBy = $manager->id;
+
+                RateLimiter::clear($throttleKey);
+                $approvedBy = $matchingManager->id;
             }
         }
 
@@ -384,6 +421,120 @@ class ExpenseController extends Controller
             'success' => true,
             'message' => 'Pengeluaran cabang berhasil disetujui.',
             'data' => $expense,
+        ]);
+    }
+
+    /**
+     * Void a branch expense.
+     * Enforces authority (Manager PIN or Owner/Admin role), marks status void,
+     * records void metadata, and writes security audit log.
+     */
+    public function voidExpense(Request $request, int $id): JsonResponse
+    {
+        $request->validate([
+            'reason' => 'required|string|min:5|max:255',
+            'manager_pin' => 'nullable|string',
+        ]);
+
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId() ?? $user->current_business_id ?? $user->business_id;
+
+        $expense = BranchExpense::where('id', $id)
+            ->where(function ($q) use ($businessId) {
+                if ($businessId) {
+                    $q->where('business_id', $businessId);
+                }
+            })
+            ->firstOrFail();
+
+        if ($expense->status === 'void') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Pengeluaran ini sudah dibatalkan (void) sebelumnya.',
+            ], 422);
+        }
+
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->role === 'admin') : ($user->isSuperAdmin() || $user->isOwner());
+
+        $voidedByUserId = $user->id;
+
+        if (!$isOwnerOrAdmin) {
+            if (empty($request->manager_pin)) {
+                throw ValidationException::withMessages([
+                    'manager_pin' => ['Pembatalan pengeluaran kas wajib disetujui menggunakan PIN Manager Cabang.'],
+                ]);
+            }
+
+            $branchId = $expense->branch_id ?? $user->affiliate_id;
+            $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
+
+            if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+                $seconds = RateLimiter::availableIn($throttleKey);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Terlalu banyak percobaan PIN salah. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
+                    'code' => 'PIN_RATE_LIMITED',
+                    'retry_after' => $seconds,
+                ], 429);
+            }
+
+            $managers = User::where(function ($q) use ($branchId, $businessId) {
+                if ($branchId) {
+                    $q->where('affiliate_id', $branchId);
+                }
+                if ($businessId) {
+                    $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
+                        $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
+                    });
+                }
+            })
+            ->whereNotNull('manager_override_pin')
+            ->get();
+
+            $matchingManager = $managers->first(function ($mgr) use ($request) {
+                return password_verify($request->manager_pin, $mgr->manager_override_pin);
+            });
+
+            if (!$matchingManager) {
+                RateLimiter::hit($throttleKey, 900);
+                $remaining = 5 - RateLimiter::attempts($throttleKey);
+                throw ValidationException::withMessages([
+                    'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining}." : '')],
+                ]);
+            }
+
+            RateLimiter::clear($throttleKey);
+            $voidedByUserId = $matchingManager->id;
+        }
+
+        $expense->update([
+            'status' => 'void',
+            'void_reason' => $request->reason,
+            'void_by' => $voidedByUserId,
+            'voided_at' => Carbon::now(),
+        ]);
+
+        AuditLogService::log(
+            $user,
+            'branch_expense.voided',
+            'BranchExpense',
+            $expense->expense_number,
+            [
+                'reason' => $request->reason,
+                'amount' => (float)$expense->amount,
+                'void_by' => $voidedByUserId,
+            ],
+            null,
+            request()?->ip(),
+            $expense->branch_id
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Pengeluaran ' . $expense->expense_number . ' berhasil dibatalkan (void).',
+            'data' => $expense->fresh(['requestedBy', 'approvedBy', 'voidBy']),
         ]);
     }
 }

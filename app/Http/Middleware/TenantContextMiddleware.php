@@ -88,7 +88,7 @@ class TenantContextMiddleware
         $isAllBranches = $request->boolean('all_branches') || $request->get('branch_id') === 'all' || $request->get('branch_id') === '-1';
         $rawHeaderBranch = $request->header('X-Branch-Id');
         $effectiveHeaderBranch = ($rawHeaderBranch !== null && $rawHeaderBranch !== '') ? $rawHeaderBranch : null;
-        $branchId = $isAllBranches ? null : ($request->get('branch_id') ?? $request->get('affiliate_id') ?? $effectiveHeaderBranch);
+        $branchId = $isAllBranches ? null : ($effectiveHeaderBranch ?? $request->get('branch_id') ?? ($request->isMethod('GET') ? $request->get('affiliate_id') : null));
         $branch = null;
         $isBranchRestricted = false;
 
@@ -107,6 +107,12 @@ class TenantContextMiddleware
                     ], 403);
                 }
                 $branchId = $branchId ?? $allowedBranches[0];
+            } else {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses cabang ditolak. Akun staf Anda belum ditugaskan ke cabang manapun oleh Owner.',
+                    'code' => 'NO_BRANCH_ASSIGNMENT',
+                ], 403);
             }
         }
 

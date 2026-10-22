@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\V1\AssetController;
+use App\Http\Controllers\Api\V1\AuditLogController;
 use App\Http\Controllers\Api\V1\AuthController;
 use App\Http\Controllers\Api\V1\BookingController;
 use App\Http\Controllers\Api\V1\BusinessController;
@@ -36,6 +37,8 @@ Route::prefix('v1')->group(function () {
 
         // Session & Profile
         Route::get('/auth/me', [AuthController::class, 'me']);
+        Route::put('/auth/profile', [AuthController::class, 'updateProfile']);
+        Route::put('/auth/password', [AuthController::class, 'updatePassword']);
         Route::post('/auth/logout', [AuthController::class, 'logout']);
 
         // Business Onboarding & Organization Management (Non-tenant scoped)
@@ -53,10 +56,19 @@ Route::prefix('v1')->group(function () {
             Route::get('/businesses/{id}/branches', [BusinessController::class, 'branches']);
             Route::get('/businesses/{id}/members', [BusinessController::class, 'members']);
             Route::post('/businesses/{id}/members', [BusinessController::class, 'addMember']);
+            Route::put('/businesses/{id}/members/{memberId}', [BusinessController::class, 'updateMemberRole']);
+            Route::delete('/businesses/{id}/members/{memberId}', [BusinessController::class, 'removeMember']);
+            Route::post('/businesses/{id}/members/{memberId}/reassign-branch', [BusinessController::class, 'reassignBranch']);
+            Route::delete('/businesses/{id}/members/{memberId}/branches/{branchId}', [BusinessController::class, 'removeBranchMember']);
+            Route::put('/businesses/{id}/members/{memberId}/pin', [BusinessController::class, 'setManagerPin']);
+            Route::delete('/businesses/{id}/members/{memberId}/pin', [BusinessController::class, 'revokeManagerPin']);
             Route::post('/businesses/{id}/branches', [BusinessController::class, 'addBranch']);
 
             // Dashboard KPI & Overdue Alerts
             Route::get('/dashboard/kpi', [DashboardController::class, 'kpi']);
+
+            // Security Audit Logs (Owner governance)
+            Route::get('/audit-logs', [AuditLogController::class, 'index']);
 
             // Categories & Taxonomy
             Route::get('/categories', [CategoryController::class, 'index']);
@@ -79,6 +91,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/assets/models', [AssetController::class, 'models']);
             Route::get('/assets/{id}', [AssetController::class, 'show']);
             Route::put('/assets/{id}', [AssetController::class, 'update']);
+            Route::delete('/assets/{id}', [AssetController::class, 'destroy']);
             Route::get('/assets/{id}/availability', [AssetController::class, 'checkAvailability']);
 
             // Inter-Affiliate Stock Transfers
@@ -128,6 +141,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/cashier/expenses', [ExpenseController::class, 'index']);
             Route::post('/cashier/expenses', [ExpenseController::class, 'store']);
             Route::post('/cashier/expenses/{id}/approve', [ExpenseController::class, 'approve']);
+            Route::post('/cashier/expenses/{id}/void', [ExpenseController::class, 'voidExpense']);
 
             // Cash Drawer Shifts
             Route::get('/cashier/shift/current', [ShiftController::class, 'currentShift']);

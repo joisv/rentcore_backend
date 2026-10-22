@@ -25,11 +25,15 @@ class BranchExpense extends Model
         'disbursed_at',
         'receipt_image_path',
         'notes',
+        'void_reason',
+        'void_by',
+        'voided_at',
     ];
 
     protected $casts = [
         'amount' => 'decimal:2',
         'disbursed_at' => 'datetime',
+        'voided_at' => 'datetime',
     ];
 
     protected static function booted(): void
@@ -55,5 +59,10 @@ class BranchExpense extends Model
     public function approvedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'approved_by');
+    }
+
+    public function voidBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'void_by');
     }
 }

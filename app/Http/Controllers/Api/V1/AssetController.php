@@ -177,18 +177,46 @@ class AssetController extends Controller
     public function store(Request $request): JsonResponse
     {
         $user = $request->user();
-        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
 
         $affiliateId = $request->get('affiliate_id') 
             ?? $request->header('X-Branch-Id') 
-            ?? app(\App\Tenancy\TenantContext::class)->getBranchId();
+            ?? $tenantContext->getBranchId();
 
         if (empty($affiliateId)) {
-            $defaultBranch = \App\Models\Affiliate::where('business_id', $businessId)
-                ->where('is_active', true)
-                ->orderBy('is_central', 'desc')
-                ->first();
+            $defaultBranch = $businessId
+                ? \App\Models\Affiliate::where('business_id', $businessId)
+                    ->where('is_active', true)
+                    ->orderBy('is_central', 'desc')
+                    ->first()
+                : null;
             $affiliateId = $defaultBranch?->id ?? $user->affiliate_id;
+        }
+
+        // Branch authorization check for staff: staff can only register into their own assigned branch
+        if (!$isOwnerOrAdmin && $user && !$user->isSuperAdmin()) {
+            $allowedBranches = $member ? $member->branchMembers()->pluck('affiliate_id')->map(fn($b) => (int)$b)->toArray() : [];
+            if (empty($allowedBranches) && $user->affiliate_id) {
+                $allowedBranches = [(int)$user->affiliate_id];
+            }
+            if ($affiliateId && !in_array((int)$affiliateId, $allowedBranches, true)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses cabang ditolak. Anda tidak berwenang mendaftarkan unit di cabang ini.',
+                    'code' => 'BRANCH_ACCESS_DENIED',
+                ], 403);
+            }
+            if (empty($allowedBranches)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akun Anda belum ditugaskan ke cabang manapun untuk mendaftarkan unit inventaris.',
+                    'code' => 'NO_BRANCH_ASSIGNMENT',
+                ], 403);
+            }
         }
 
         if ($affiliateId && !$user->isSuperAdmin()) {
@@ -508,6 +536,129 @@ class AssetController extends Controller
             'data' => [
                 'is_available' => $allAvailable,
                 'assets' => $results,
+            ],
+        ]);
+    }
+
+    /**
+     * Delete or archive an individual inventory asset unit safely.
+     */
+    public function destroy(Request $request, int $id): JsonResponse
+    {
+        $asset = Asset::findOrFail($id);
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $asset->business_id ?? $tenantContext->getBusinessId();
+        $user = $request->user();
+
+        // 1. Enforce role authorization: Only Owner or Admin can delete units
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+
+        if (!$isOwnerOrAdmin) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang memiliki wewenang untuk menghapus unit inventaris.',
+                'code' => 'FORBIDDEN_ACTION',
+            ], 403);
+        }
+
+        // 2. Branch authorization check if user is branch-constrained
+        if ($user && $tenantContext->isStaff()) {
+            $allowedBranches = $member ? $member->branchMembers()->pluck('affiliate_id')->map(fn($b) => (int)$b)->toArray() : [];
+            if (!empty($allowedBranches) && !in_array((int)$asset->affiliate_id, $allowedBranches)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses cabang ditolak. Anda tidak berwenang mengelola unit di cabang ini.',
+                    'code' => 'BRANCH_ACCESS_DENIED',
+                ], 403);
+            }
+        }
+
+        // 3. Operational status checks
+        if ($asset->status === 'rented' || $asset->bookingItems()->whereHas('booking', fn($q) => $q->whereIn('status', ['active', 'rented', 'confirmed', 'overdue']))->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unit sedang dalam masa sewa aktif dan tidak dapat dihapus.',
+                'code' => 'ASSET_RENTED_ACTIVE',
+            ], 422);
+        }
+
+        if ($asset->status === 'in_transit') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unit sedang dalam proses mutasi transfer antar cabang dan tidak dapat dihapus.',
+                'code' => 'ASSET_IN_TRANSIT',
+            ], 422);
+        }
+
+        if ($asset->status === 'reserved') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unit telah direservasi untuk pesanan sewa mendatang dan tidak dapat dihapus.',
+                'code' => 'ASSET_RESERVED',
+            ], 422);
+        }
+
+        // 4. Historical integrity check (Bookings, Transfers, Exchanges)
+        $hasHistoricalBookings = $asset->bookingItems()->exists();
+        $hasHistoricalTransfers = \App\Models\InventoryTransfer::where('asset_id', $asset->id)->exists();
+        $hasHistoricalExchanges = $asset->exchangesAsOld()->exists() || $asset->exchangesAsNew()->exists();
+
+        $hasHistory = $hasHistoricalBookings || $hasHistoricalTransfers || $hasHistoricalExchanges;
+
+        if ($hasHistory) {
+            // Cannot hard delete without breaking database foreign key constraints & financial history.
+            // Safely transition status to 'retired' (archived)
+            $oldStatus = $asset->status;
+            $asset->update([
+                'status' => 'retired',
+                'notes' => trim(($asset->notes ?? '') . " [Diarsipkan dari inventaris aktif oleh {$user->name} pada " . now()->format('Y-m-d H:i') . "]"),
+            ]);
+
+            AuditLogService::log(
+                $user,
+                'asset.retired',
+                'Asset',
+                $asset->id,
+                ['status' => 'retired', 'reason' => 'historical_integrity_preservation'],
+                ['status' => $oldStatus],
+                $request->ip(),
+                $asset->affiliate_id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Unit memiliki riwayat transaksi sewa/mutasi, sehingga status unit berhasil diarsipkan menjadi "Retired" untuk menjaga integritas data akuntansi.',
+                'data' => [
+                    'id' => $asset->id,
+                    'status' => 'retired',
+                    'action' => 'archived',
+                ],
+            ]);
+        }
+
+        // 5. If completely pristine (no transaction history), execute clean hard delete
+        $oldData = $asset->toArray();
+        $affiliateId = $asset->affiliate_id;
+        $asset->delete();
+
+        AuditLogService::log(
+            $user,
+            'asset.deleted',
+            'Asset',
+            $id,
+            null,
+            $oldData,
+            $request->ip(),
+            $affiliateId
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Unit inventaris berhasil dihapus permanen.',
+            'data' => [
+                'id' => $id,
+                'action' => 'deleted',
             ],
         ]);
     }

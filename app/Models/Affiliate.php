@@ -23,6 +23,7 @@ class Affiliate extends Model
         'royalty_percentage',
         'cashier_discount_limit_percent',
         'cashier_discount_limit_nominal',
+        'expense_pin_threshold_override',
         'is_active',
     ];
 
@@ -32,6 +33,7 @@ class Affiliate extends Model
         'royalty_percentage' => 'decimal:2',
         'cashier_discount_limit_percent' => 'decimal:2',
         'cashier_discount_limit_nominal' => 'decimal:2',
+        'expense_pin_threshold_override' => 'decimal:2',
     ];
 
     protected static function booted(): void

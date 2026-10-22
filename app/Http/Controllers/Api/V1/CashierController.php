@@ -8,11 +8,13 @@ use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 
 class CashierController extends Controller
@@ -343,25 +345,17 @@ class CashierController extends Controller
         $endDate = $request->get('end_date');
         $dateParam = $request->get('date');
 
-        if ($startDate && $endDate) {
-            $start = Carbon::parse($startDate)->startOfDay();
-            $end = Carbon::parse($endDate)->endOfDay();
-            $dateLabel = $startDate . ' - ' . $endDate;
-        } elseif ($dateParam) {
-            $start = Carbon::parse($dateParam)->startOfDay();
-            $end = Carbon::parse($dateParam)->endOfDay();
-            $dateLabel = $dateParam;
-        } else {
-            $today = Carbon::today()->toDateString();
-            $start = Carbon::today()->startOfDay();
-            $end = Carbon::today()->endOfDay();
-            $dateLabel = $today;
-        }
-
         $user = $request->user();
         $tenantContext = app(\App\Tenancy\TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
         $isSuperAdmin = $user && $user->isSuperAdmin();
+
+        $business = $businessId ? \App\Models\Business::find($businessId) : null;
+        $tz = $business?->timezone ?? 'Asia/Jakarta';
+        $bounds = TimezoneService::resolveQueryBounds($startDate, $endDate, $dateParam, $tz);
+        $start = $bounds['start_utc'];
+        $end = $bounds['end_utc'];
+        $dateLabel = $bounds['date_label'];
 
         $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
         $isOwner = $member ? $member->isOwner() : ($isSuperAdmin || ($user && $user->isPlatformAdmin()));
@@ -588,7 +582,7 @@ class CashierController extends Controller
         }
 
         // Fetch Branch Operating Expenses in this period
-        $expenseQuery = \App\Models\BranchExpense::whereBetween('created_at', [$start, $end])
+        $expenseQuery = \App\Models\BranchExpense::whereBetween(DB::raw('COALESCE(branch_expenses.disbursed_at, branch_expenses.created_at)'), [$start, $end])
             ->whereIn('status', ['approved', 'disbursed']);
 
         if ($businessId) {
@@ -604,6 +598,9 @@ class CashierController extends Controller
         $expenseCategoryBreakdown = [];
 
         foreach ($expenses as $exp) {
+            if ($exp->status === 'void') {
+                continue;
+            }
             $expAmt = (float)$exp->amount;
             $totalExpenses += $expAmt;
             if ($exp->payment_source === 'cash_drawer') {
@@ -647,7 +644,7 @@ class CashierController extends Controller
 
         $expectedDrawerCash = max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
 
-        $limit = max(10, (int)$request->get('limit', $request->get('per_page', 50)));
+        $limit = max(10, min(500, (int)$request->get('limit', $request->get('per_page', 50))));
         $recentTransactions = $transactions->take($limit)->map(function ($tx) {
             return [
                 'id' => $tx->id,
@@ -697,8 +694,9 @@ class CashierController extends Controller
                 'branch_id' => $targetBranchId,
                 'is_consolidated' => $targetBranchId === null,
                 'date' => $dateLabel,
-                'start_date' => $start->toDateString(),
-                'end_date' => $end->toDateString(),
+                'start_date' => $bounds['start_date'],
+                'end_date' => $bounds['end_date'],
+                'timezone' => $tz,
                 'total_revenue' => (float)$totalRevenue,
                 'total_transactions' => (int)$totalTransactions,
                 'total_expenses' => (float)$totalExpenses,
@@ -760,7 +758,19 @@ class CashierController extends Controller
             }
 
             $branchId = $transaction->branch_id ?? $user->affiliate_id;
-            $manager = User::where(function ($q) use ($branchId, $businessId) {
+            $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
+
+            if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+                $seconds = RateLimiter::availableIn($throttleKey);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Terlalu banyak percobaan PIN Manager salah. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
+                    'code' => 'PIN_RATE_LIMITED',
+                    'retry_after' => $seconds,
+                ], 429);
+            }
+
+            $managers = User::where(function ($q) use ($branchId, $businessId) {
                 if ($branchId) {
                     $q->where('affiliate_id', $branchId);
                 }
@@ -771,15 +781,22 @@ class CashierController extends Controller
                 }
             })
             ->whereNotNull('manager_override_pin')
-            ->first();
+            ->get();
 
-            if (!$manager || !password_verify($request->manager_pin, $manager->manager_override_pin)) {
+            $matchingManager = $managers->first(function ($mgr) use ($request) {
+                return password_verify($request->manager_pin, $mgr->manager_override_pin);
+            });
+
+            if (!$matchingManager) {
+                RateLimiter::hit($throttleKey, 900);
+                $remaining = 5 - RateLimiter::attempts($throttleKey);
                 throw ValidationException::withMessages([
-                    'manager_pin' => ['PIN Manager Cabang tidak valid.'],
+                    'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : ' Akun Anda dikunci sementara.')],
                 ]);
             }
 
-            $voidedByUserId = $manager->id;
+            RateLimiter::clear($throttleKey);
+            $voidedByUserId = $matchingManager->id;
         }
 
         return DB::transaction(function () use ($transaction, $request, $voidedByUserId, $user) {

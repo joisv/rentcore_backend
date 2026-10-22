@@ -69,6 +69,7 @@ class AuthController extends Controller
                     'email' => $user->email,
                     'phone' => $user->phone,
                     'role' => $user->role,
+                    'has_password' => !empty($user->password),
                     'affiliate' => $user->affiliate ? [
                         'id' => $user->affiliate->id,
                         'code' => $user->affiliate->code,
@@ -242,6 +243,7 @@ class AuthController extends Controller
                     'phone' => $user->phone,
                     'role' => $user->role,
                     'is_platform_admin' => (bool) $user->is_platform_admin,
+                    'has_password' => !empty($user->password),
                 ],
                 'businesses' => $businesses,
             ],
@@ -289,6 +291,91 @@ class AuthController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Sesi berhasil diakhiri.',
+        ]);
+    }
+
+    /**
+     * Update authenticated user profile.
+     */
+    public function updateProfile(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:150',
+            'phone' => 'nullable|string|max:30',
+        ]);
+
+        $user = $request->user();
+        $user->name = $validated['name'];
+        if (array_key_exists('phone', $validated)) {
+            $user->phone = $validated['phone'];
+        }
+        $user->save();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Profil berhasil diperbarui.',
+            'data' => [
+                'user' => $user->fresh()->load('affiliate'),
+            ],
+        ]);
+    }
+
+    /**
+     * Create or update authenticated user password.
+     */
+    public function updatePassword(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        // 1. User without existing password (e.g. Google-authenticated user) -> set password for first time
+        if (empty($user->password)) {
+            $request->validate([
+                'new_password' => 'required|string|min:8|confirmed',
+            ], [
+                'new_password.required' => 'Kata sandi baru wajib diisi.',
+                'new_password.min' => 'Kata sandi minimal 8 karakter.',
+                'new_password.confirmed' => 'Konfirmasi kata sandi baru tidak cocok.',
+            ]);
+
+            $user->password = $request->new_password;
+            $user->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Kata sandi berhasil dibuat. Anda sekarang dapat masuk menggunakan email dan kata sandi.',
+                'data' => [
+                    'has_password' => true,
+                ],
+            ]);
+        }
+
+        // 2. User with existing password -> verify current password before update
+        $request->validate([
+            'current_password' => 'required|string',
+            'new_password' => 'required|string|min:8|confirmed|different:current_password',
+        ], [
+            'current_password.required' => 'Kata sandi saat ini wajib diisi.',
+            'new_password.required' => 'Kata sandi baru wajib diisi.',
+            'new_password.min' => 'Kata sandi minimal 8 karakter.',
+            'new_password.confirmed' => 'Konfirmasi kata sandi baru tidak cocok.',
+            'new_password.different' => 'Kata sandi baru harus berbeda dengan kata sandi saat ini.',
+        ]);
+
+        if (!Hash::check($request->current_password, $user->password)) {
+            throw ValidationException::withMessages([
+                'current_password' => ['Kata sandi saat ini tidak cocok.'],
+            ]);
+        }
+
+        $user->password = $request->new_password;
+        $user->save();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kata sandi berhasil diperbarui.',
+            'data' => [
+                'has_password' => true,
+            ],
         ]);
     }
 }

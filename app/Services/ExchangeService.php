@@ -300,7 +300,7 @@ class ExchangeService
                 $businessId = $booking->business_id;
                 $affiliateId = $booking->affiliate_id;
 
-                $manager = User::where(function ($q) use ($affiliateId, $businessId) {
+                $managers = User::where(function ($q) use ($affiliateId, $businessId) {
                         $q->where('affiliate_id', $affiliateId);
                         if ($businessId) {
                             $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
@@ -309,15 +309,19 @@ class ExchangeService
                         }
                     })
                     ->whereNotNull('manager_override_pin')
-                    ->first();
+                    ->get();
 
-                if (!$manager || !password_verify($data['manager_pin'], $manager->manager_override_pin)) {
+                $matchingManager = $managers->first(function ($mgr) use ($data) {
+                    return password_verify($data['manager_pin'], $mgr->manager_override_pin);
+                });
+
+                if (!$matchingManager) {
                     throw ValidationException::withMessages([
                         'manager_pin' => ['PIN Manager tidak valid.'],
                     ]);
                 }
 
-                $managerApprovedBy = $manager->id;
+                $managerApprovedBy = $matchingManager->id;
             }
 
             // If fee is waived by manager, differential payable is 0

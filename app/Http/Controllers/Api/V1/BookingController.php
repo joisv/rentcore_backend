@@ -46,6 +46,9 @@ class BookingController extends Controller
         $query = Booking::with([
             'customer',
             'items.asset.model.category',
+            'items.asset.model.pricingTiers' => function ($pq) {
+                $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
+            },
             'payments.paymentMethod',
             'payments.processedBy',
             'exchanges.oldAsset.model',
@@ -243,6 +246,9 @@ class BookingController extends Controller
         $booking = Booking::with([
             'customer.identities',
             'items.asset.model.category',
+            'items.asset.model.pricingTiers' => function ($pq) {
+                $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
+            },
             'payments.paymentMethod',
             'payments.processedBy',
             'voucher',
@@ -320,18 +326,32 @@ class BookingController extends Controller
                 ], 422);
             }
 
-            // Authoritative calculation from PricingTier
-            $hourlyRate = 15000.00;
+            // Authoritative server-side price calculation from PricingTier
             $firstItem = $booking->active_item ?? $booking->items()->first();
-            if ($firstItem && $firstItem->asset) {
-                $tier = PricingTier::where('model_id', $firstItem->asset->model_id)->first();
-                if ($tier && (float)$tier->extension_hourly_rate > 0) {
-                    $hourlyRate = (float)$tier->extension_hourly_rate;
+            $modelId = $firstItem?->asset?->model_id;
+            $additionalFee = 0.0;
+
+            if ($modelId) {
+                // Check if an exact active tier exists matching this duration
+                $exactTier = PricingTier::where('model_id', $modelId)
+                    ->where('is_active', true)
+                    ->where('duration_hours', $additionalHours)
+                    ->first();
+
+                if ($exactTier) {
+                    $additionalFee = (float)$exactTier->price;
+                } else {
+                    // Fallback to model's configured extension hourly rate
+                    $anyTier = PricingTier::where('model_id', $modelId)
+                        ->where('is_active', true)
+                        ->where('extension_hourly_rate', '>', 0)
+                        ->first();
+                    $hourlyRate = $anyTier ? (float)$anyTier->extension_hourly_rate : 15000.00;
+                    $additionalFee = $additionalHours * $hourlyRate;
                 }
+            } else {
+                $additionalFee = $additionalHours * 15000.00;
             }
-            $additionalFee = $request->filled('additional_fee')
-                ? (float)$request->additional_fee
-                : ($additionalHours * $hourlyRate);
 
             $extension = RentalExtension::create([
                 'booking_id' => $booking->id,

@@ -35,6 +35,15 @@ class User extends Authenticatable
         'manager_override_pin',
     ];
 
+    protected $appends = [
+        'has_password',
+    ];
+
+    public function getHasPasswordAttribute(): bool
+    {
+        return !empty($this->password);
+    }
+
     protected $casts = [
         'email_verified_at' => 'datetime',
         'last_login_at' => 'datetime',

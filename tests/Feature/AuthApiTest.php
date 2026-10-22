@@ -130,4 +130,105 @@ class AuthApiTest extends TestCase
             ->assertJsonPath('data.businesses.0.name', 'RentCore Express')
             ->assertJsonPath('data.businesses.0.branches.0.code', 'EXP');
     }
+
+    public function test_authenticated_user_can_update_profile(): void
+    {
+        $user = User::create([
+            'name' => 'Original Name',
+            'email' => 'editor@rentcore.id',
+            'phone' => '08123456789',
+            'password' => Hash::make('password123'),
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+
+        $token = $user->createToken('Test')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->putJson('/api/v1/auth/profile', [
+                'name' => 'Updated Name',
+                'phone' => '08987654321',
+            ]);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.user.name', 'Updated Name')
+            ->assertJsonPath('data.user.phone', '08987654321')
+            ->assertJsonPath('data.user.has_password', true);
+
+        $this->assertDatabaseHas('users', [
+            'id' => $user->id,
+            'name' => 'Updated Name',
+            'phone' => '08987654321',
+        ]);
+    }
+
+    public function test_google_user_without_password_can_create_password_without_current_password(): void
+    {
+        $user = User::create([
+            'name' => 'Google User',
+            'email' => 'google@rentcore.id',
+            'google_id' => 'google-oauth-sub-12345',
+            'password' => null,
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+
+        $this->assertFalse($user->has_password);
+
+        $token = $user->createToken('Test')->plainTextToken;
+
+        // Creating password for first time without current_password
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->putJson('/api/v1/auth/password', [
+                'new_password' => 'newSecretPass123',
+                'new_password_confirmation' => 'newSecretPass123',
+            ]);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.has_password', true);
+
+        $user->refresh();
+        $this->assertTrue($user->has_password);
+        $this->assertTrue(Hash::check('newSecretPass123', $user->password));
+    }
+
+    public function test_user_with_existing_password_must_provide_correct_current_password_to_change(): void
+    {
+        $user = User::create([
+            'name' => 'Password User',
+            'email' => 'pwd@rentcore.id',
+            'password' => Hash::make('oldSecretPass123'),
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+
+        $token = $user->createToken('Test')->plainTextToken;
+
+        // Attempt change with wrong current password
+        $failResponse = $this->withHeader('Authorization', "Bearer {$token}")
+            ->putJson('/api/v1/auth/password', [
+                'current_password' => 'wrongCurrentPassword',
+                'new_password' => 'newerSecretPass456',
+                'new_password_confirmation' => 'newerSecretPass456',
+            ]);
+
+        $failResponse->assertStatus(422)
+            ->assertJsonValidationErrors(['current_password']);
+
+        // Attempt change with valid current password
+        $successResponse = $this->withHeader('Authorization', "Bearer {$token}")
+            ->putJson('/api/v1/auth/password', [
+                'current_password' => 'oldSecretPass123',
+                'new_password' => 'newerSecretPass456',
+                'new_password_confirmation' => 'newerSecretPass456',
+            ]);
+
+        $successResponse->assertStatus(200)
+            ->assertJsonPath('success', true);
+
+        $user->refresh();
+        $this->assertTrue(Hash::check('newerSecretPass456', $user->password));
+    }
 }

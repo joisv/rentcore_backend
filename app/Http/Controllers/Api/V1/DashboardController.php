@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Asset;
 use App\Models\Booking;
 use App\Models\PaymentTransaction;
+use App\Services\TimezoneService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -82,9 +83,12 @@ class DashboardController extends Controller
             }
         }
 
+        $business = $businessId ? \App\Models\Business::find($businessId) : null;
+        $tz = $business?->timezone ?? 'Asia/Jakarta';
+        $bounds = TimezoneService::resolveQueryBounds(null, null, null, $tz);
+        $todayStart = $bounds['start_utc'];
+        $todayEnd = $bounds['end_utc'];
         $now = Carbon::now();
-        $todayStart = Carbon::today()->startOfDay();
-        $todayEnd = Carbon::today()->endOfDay();
 
         // 1. Asset Inventory Breakdown (Scoped to target branch or consolidated)
         $assetQuery = Asset::query();

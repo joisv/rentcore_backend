@@ -207,6 +207,50 @@ class CustomerController extends Controller
     public function toggleBlacklist(Request $request, int $id): JsonResponse
     {
         $customer = Customer::findOrFail($id);
+        $user = $request->user();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $customer->business_id ?? $tenantContext->getBusinessId();
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+
+        if (!$isOwnerOrAdmin) {
+            $reason = $request->input('blacklist_reason');
+            $hasValidReason = !empty($reason) && strlen(trim($reason)) >= 5;
+            $managerPin = $request->input('manager_pin');
+
+            if (!$hasValidReason && empty($managerPin)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Pencatatan daftar hitam oleh staf wajib menyertakan alasan keterangan yang jelas (minimal 5 karakter) atau otorisasi PIN Manager.',
+                    'code' => 'BLACKLIST_REASON_REQUIRED',
+                ], 422);
+            }
+
+            if (!empty($managerPin)) {
+                $branchId = $tenantContext->getBranchId() ?? $user->affiliate_id;
+                $managers = \App\Models\User::where(function ($q) use ($branchId, $businessId) {
+                    if ($branchId) {
+                        $q->where('affiliate_id', $branchId);
+                    }
+                    if ($businessId) {
+                        $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
+                            $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
+                        });
+                    }
+                })
+                ->whereNotNull('manager_override_pin')
+                ->get();
+
+                $matchingManager = $managers->first(fn($mgr) => password_verify($managerPin, $mgr->manager_override_pin));
+                if (!$matchingManager) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'PIN Manager tidak valid.',
+                        'code' => 'INVALID_PIN',
+                    ], 422);
+                }
+            }
+        }
 
         $request->validate([
             'is_blacklisted' => 'required|boolean',

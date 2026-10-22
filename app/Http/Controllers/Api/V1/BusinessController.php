@@ -7,6 +7,7 @@ use App\Models\Affiliate;
 use App\Models\Business;
 use App\Models\BusinessMember;
 use App\Models\BranchMember;
+use App\Models\CashDrawerShift;
 use App\Models\User;
 use App\Services\AuditLogService;
 use App\Tenancy\TenantContext;
@@ -14,6 +15,7 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
@@ -37,8 +39,10 @@ class BusinessController extends Controller
                 'id' => $biz->id,
                 'uuid' => $biz->uuid,
                 'name' => $biz->name,
+                'slogan' => $biz->slogan,
                 'slug' => $biz->slug,
                 'phone' => $biz->phone,
+                'address' => $biz->address,
                 'city' => $biz->city,
                 'currency' => $biz->currency,
                 'role' => $membership->role,
@@ -225,6 +229,7 @@ class BusinessController extends Controller
 
         $validated = $request->validate([
             'name' => 'nullable|string|max:150',
+            'slogan' => 'nullable|string|max:255',
             'phone' => 'nullable|string|max:30',
             'email' => 'nullable|email|max:150',
             'address' => 'nullable|string',
@@ -519,5 +524,388 @@ class BusinessController extends Controller
             'message' => 'Cabang baru berhasil ditambahkan.',
             'data' => $branch,
         ], 201);
+    }
+
+    /**
+     * Reassign a staff member to another branch.
+     */
+    public function reassignBranch(Request $request, int $id, int $memberId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang memindahkan cabang staf.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'from_branch_id' => 'nullable|integer|exists:affiliates,id',
+            'to_branch_id' => 'required|integer|exists:affiliates,id',
+            'reason' => 'nullable|string|max:255',
+        ]);
+
+        $targetMember = BusinessMember::where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        $toBranch = Affiliate::where('business_id', $businessId)
+            ->where('id', $validated['to_branch_id'])
+            ->where('is_active', true)
+            ->firstOrFail();
+
+        $fromBranchId = $validated['from_branch_id'] ?? null;
+        if (!$fromBranchId) {
+            $firstBranch = $targetMember->branchMembers()->first();
+            $fromBranchId = $firstBranch?->affiliate_id;
+        }
+
+        if ($fromBranchId && (int)$fromBranchId === (int)$toBranch->id) {
+            throw ValidationException::withMessages([
+                'to_branch_id' => ['Cabang tujuan tidak boleh sama dengan cabang asal.'],
+            ]);
+        }
+
+        // Operational guardrail: check if user has an active unclosed shift at fromBranchId
+        if ($fromBranchId) {
+            $hasActiveShift = CashDrawerShift::where('branch_id', $fromBranchId)
+                ->where('opened_by', $targetMember->user_id)
+                ->where('status', 'open')
+                ->exists();
+
+            if ($hasActiveShift) {
+                throw ValidationException::withMessages([
+                    'from_branch_id' => [
+                        'Staf masih memiliki shift kasir aktif yang belum ditutup pada cabang asal. ' .
+                        'Tutup shift kasir terlebih dahulu sebelum memindahkan penugasan staf.'
+                    ],
+                ]);
+            }
+        }
+
+        return DB::transaction(function () use ($targetMember, $fromBranchId, $toBranch, $user, $validated) {
+            if ($fromBranchId) {
+                BranchMember::where('business_member_id', $targetMember->id)
+                    ->where('affiliate_id', $fromBranchId)
+                    ->delete();
+            } else {
+                BranchMember::where('business_member_id', $targetMember->id)->delete();
+            }
+
+            BranchMember::firstOrCreate([
+                'business_member_id' => $targetMember->id,
+                'affiliate_id' => $toBranch->id,
+            ]);
+
+            AuditLogService::log(
+                $user,
+                'business_member.branch_reassigned',
+                'BusinessMember',
+                (string)$targetMember->id,
+                [
+                    'target_user' => $targetMember->user?->name ?? $targetMember->user_id,
+                    'from_branch_id' => $fromBranchId,
+                    'to_branch_id' => $toBranch->id,
+                    'to_branch_name' => $toBranch->name,
+                    'reason' => $validated['reason'] ?? 'Mutasi/penugasan cabang oleh admin',
+                ],
+                null,
+                request()?->ip(),
+                $toBranch->id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Penugasan cabang staf berhasil dipindahkan ke ' . $toBranch->name . '.',
+                'data' => $targetMember->fresh(['user', 'branchMembers.branch']),
+            ]);
+        });
+    }
+
+    /**
+     * Remove branch assignment from a staff member.
+     */
+    public function removeBranchMember(Request $request, int $id, int $memberId, int $branchId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mencabut penugasan cabang staf.',
+            ], 403);
+        }
+
+        $targetMember = BusinessMember::where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        $hasActiveShift = CashDrawerShift::where('branch_id', $branchId)
+            ->where('opened_by', $targetMember->user_id)
+            ->where('status', 'open')
+            ->exists();
+
+        if ($hasActiveShift) {
+            throw ValidationException::withMessages([
+                'branch_id' => [
+                    'Staf masih memiliki shift kasir aktif di cabang ini. Tutup shift kasir terlebih dahulu.'
+                ],
+            ]);
+        }
+
+        BranchMember::where('business_member_id', $targetMember->id)
+            ->where('affiliate_id', $branchId)
+            ->delete();
+
+        AuditLogService::log(
+            $user,
+            'business_member.branch_removed',
+            'BusinessMember',
+            (string)$targetMember->id,
+            [
+                'target_user' => $targetMember->user?->name ?? $targetMember->user_id,
+                'removed_branch_id' => $branchId,
+            ],
+            null,
+            request()?->ip(),
+            $branchId
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Penugasan cabang berhasil dicabut.',
+            'data' => $targetMember->fresh(['user', 'branchMembers.branch']),
+        ]);
+    }
+
+    /**
+     * Update a business member's role (admin / staff).
+     */
+    public function updateMemberRole(Request $request, int $id, int $memberId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mengubah peran staf.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'role' => 'required|in:admin,staff',
+        ]);
+
+        $targetMember = BusinessMember::where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        if ($targetMember->isOwner()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Peran Owner bisnis tidak dapat diubah.',
+            ], 422);
+        }
+
+        $targetMember->update(['role' => $validated['role']]);
+
+        AuditLogService::log(
+            $user,
+            'business_member.role_updated',
+            'BusinessMember',
+            (string)$targetMember->id,
+            [
+                'target_user' => $targetMember->user?->name ?? $targetMember->user_id,
+                'new_role' => $validated['role'],
+            ]
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Peran anggota berhasil diperbarui menjadi ' . ucfirst($validated['role']) . '.',
+            'data' => $targetMember->fresh(['user', 'branchMembers.branch']),
+        ]);
+    }
+
+    /**
+     * Deactivate a member from the business.
+     */
+    public function removeMember(Request $request, int $id, int $memberId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang menonaktifkan staf dari bisnis.',
+            ], 403);
+        }
+
+        $targetMember = BusinessMember::where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        if ($targetMember->isOwner()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Owner bisnis tidak dapat dinonaktifkan.',
+            ], 422);
+        }
+
+        // Guardrail: check active shifts across any branch of this business
+        $businessBranchIds = Affiliate::where('business_id', $businessId)->pluck('id');
+        $hasActiveShift = CashDrawerShift::whereIn('branch_id', $businessBranchIds)
+            ->where('opened_by', $targetMember->user_id)
+            ->where('status', 'open')
+            ->exists();
+
+        if ($hasActiveShift) {
+            throw ValidationException::withMessages([
+                'member' => [
+                    'Staf masih memiliki shift kasir yang sedang aktif. Tutup shift kasir terlebih dahulu.'
+                ],
+            ]);
+        }
+
+        return DB::transaction(function () use ($targetMember, $user) {
+            BranchMember::where('business_member_id', $targetMember->id)->delete();
+            $targetMember->update(['is_active' => false]);
+
+            AuditLogService::log(
+                $user,
+                'business_member.deactivated',
+                'BusinessMember',
+                (string)$targetMember->id,
+                [
+                    'target_user' => $targetMember->user?->name ?? $targetMember->user_id,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Anggota staf berhasil dinonaktifkan dari bisnis rental.',
+            ]);
+        });
+    }
+
+    /**
+     * Set or update a manager override PIN for a member.
+     */
+    public function setManagerPin(Request $request, int $id, int $memberId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mengatur PIN Manager.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'pin' => 'required|string|regex:/^\d{6}$/',
+        ]);
+
+        $targetMember = BusinessMember::with('user')
+            ->where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        $targetUser = $targetMember->user;
+        $targetUser->manager_override_pin = Hash::make($validated['pin']);
+        $targetUser->save();
+
+        AuditLogService::log(
+            $user,
+            'security.manager_pin_updated',
+            'User',
+            (string)$targetUser->id,
+            ['target_user' => $targetUser->name]
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'PIN Manager untuk ' . $targetUser->name . ' berhasil diperbarui.',
+        ]);
+    }
+
+    /**
+     * Revoke a manager override PIN for a member.
+     */
+    public function revokeManagerPin(Request $request, int $id, int $memberId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int)$id : $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mencabut PIN Manager.',
+            ], 403);
+        }
+
+        $targetMember = BusinessMember::with('user')
+            ->where('business_id', $businessId)
+            ->where('id', $memberId)
+            ->firstOrFail();
+
+        $targetUser = $targetMember->user;
+        $targetUser->manager_override_pin = null;
+        $targetUser->save();
+
+        AuditLogService::log(
+            $user,
+            'security.manager_pin_revoked',
+            'User',
+            (string)$targetUser->id,
+            ['target_user' => $targetUser->name]
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'PIN Manager untuk ' . $targetUser->name . ' berhasil dicabut.',
+        ]);
     }
 }
