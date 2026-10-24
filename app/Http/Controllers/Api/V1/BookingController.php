@@ -45,6 +45,7 @@ class BookingController extends Controller
 
         $query = Booking::with([
             'customer',
+            'returnInspection',
             'items.asset.model.category',
             'items.asset.model.pricingTiers' => function ($pq) {
                 $pq->where('is_active', true)->orderBy('duration_hours', 'asc');

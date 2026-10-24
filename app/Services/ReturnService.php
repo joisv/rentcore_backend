@@ -72,7 +72,9 @@ class ReturnService
                     $firstItem = $booking->items()->first();
                     $hourlyRate = 15000.00;
                     if ($firstItem && $firstItem->asset) {
-                        $tier = PricingTier::where('model_id', $firstItem->asset->model_id)->first();
+                        $tier = PricingTier::where('model_id', $firstItem->asset->model_id)
+                            ->where('is_active', true)
+                            ->first();
                         if ($tier && (float)$tier->extension_hourly_rate > 0) {
                             $hourlyRate = (float)$tier->extension_hourly_rate;
                         }
@@ -183,8 +185,15 @@ class ReturnService
                         'transacted_at' => Carbon::now(),
                     ]);
 
+                    $isRentalSettled = ((float)$booking->payments()
+                        ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                        ->where(function ($q) {
+                            $q->whereNull('status')->orWhere('status', '!=', 'void');
+                        })
+                        ->sum('amount') >= (float)$booking->total_bill);
+
                     $booking->update([
-                        'payment_status' => 'paid',
+                        'payment_status' => $isRentalSettled ? 'paid' : 'partial',
                     ]);
                 }
             }

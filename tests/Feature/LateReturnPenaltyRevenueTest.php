@@ -203,6 +203,111 @@ class LateReturnPenaltyRevenueTest extends TestCase
         ]);
     }
 
+    public function test_09_exchange_payment_counts_as_rental_paid_and_prevents_duplicate_collection(): void
+    {
+        [$booking] = $this->createRentedBooking(
+            $this->branchA1,
+            $this->staffA1,
+            Carbon::now()->subHours(26),
+            Carbon::now()->subMinutes(135)
+        );
+
+        // Simulate paid upgrade exchange: differential added to total_bill + 'exchange' payment
+        PaymentTransaction::create([
+            'business_id' => $booking->business_id,
+            'transaction_code' => 'TX-EXC-' . uniqid(),
+            'receipt_number' => 'REC-EXC-' . uniqid(),
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staffA1->id,
+            'type' => 'exchange',
+            'amount' => 50000.00,
+            'cash_received' => 50000.00,
+            'cash_change' => 0.00,
+            'transacted_at' => Carbon::now()->subHours(3),
+        ]);
+        $booking->update(['total_bill' => 350000.00]);
+
+        $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson("/api/v1/bookings/{$booking->id}/return", [
+                'condition_grade' => 'A',
+                'checklist_results' => ['icloud_removed' => true],
+            ])->assertOk();
+
+        // Pay full penalty -> booking must become fully paid
+        $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $booking->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'payment_type' => 'penalty',
+                'cash_received' => 1000000.00,
+            ])->assertStatus(201);
+
+        $this->assertEquals('paid', $booking->fresh()->payment_status);
+
+        // A settlement attempt must be rejected (no duplicate collection of the exchange differential)
+        $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $booking->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'payment_type' => 'settlement',
+                'cash_received' => 50000.00,
+            ])->assertStatus(422);
+
+        $this->assertEquals(0, PaymentTransaction::where('booking_id', $booking->id)->where('type', 'settlement')->where('amount', 50000.00)->count());
+    }
+
+    public function test_10_inactive_pricing_tier_ignored_and_unsettled_rental_remains_partial(): void
+    {
+        // Deactivate tier so extension_hourly_rate of 20,000 is ignored, falling back to default 15,000
+        PricingTier::where('model_id', $this->model->id)->update(['is_active' => false]);
+
+        [$booking] = $this->createRentedBooking(
+            $this->branchA1,
+            $this->staffA1,
+            Carbon::now()->subHours(26),
+            Carbon::now()->subMinutes(135)
+        );
+
+        // Make rental partially paid (total_bill = 300k, paid = 150k DP)
+        PaymentTransaction::where('booking_id', $booking->id)->delete();
+        PaymentTransaction::create([
+            'business_id' => $booking->business_id,
+            'transaction_code' => 'TX-DP-' . uniqid(),
+            'receipt_number' => 'REC-DP-' . uniqid(),
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staffA1->id,
+            'type' => 'dp',
+            'amount' => 150000.00,
+            'cash_received' => 150000.00,
+            'cash_change' => 0.00,
+            'transacted_at' => Carbon::now()->subHours(24),
+        ]);
+        $booking->update(['payment_status' => 'partial']);
+
+        // Process return with penalty paid at return
+        // 2 billable hours * 15,000 fallback = 30,000
+        $resp = $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson("/api/v1/bookings/{$booking->id}/return", [
+                'condition_grade' => 'A',
+                'checklist_results' => ['icloud_removed' => true],
+                'penalty_payment_method_id' => $this->cashMethod->id,
+                'cash_received' => 50000.00,
+            ]);
+
+        $resp->assertOk()
+            ->assertJsonPath('data.late_fee', '30000.00')
+            ->assertJsonPath('data.total_penalty', '30000.00');
+
+        // Penalty is paid, but rental bill still has 150k outstanding -> status MUST be 'partial', NOT 'paid'
+        $this->assertEquals('partial', $booking->fresh()->payment_status);
+    }
+
     private function createRentedBooking(Affiliate $branch, User $creator, Carbon $startAt, Carbon $endAt): array
     {
         $customer = Customer::create([
@@ -435,6 +540,15 @@ class LateReturnPenaltyRevenueTest extends TestCase
         $returnResp->assertOk();
         $this->assertEquals('partial', $booking->fresh()->payment_status);
         $this->assertEquals(0, PaymentTransaction::where('booking_id', $booking->id)->where('type', 'penalty')->count());
+
+        // Verify index endpoint eagerly loads return_inspection for POS table and queue
+        $listResp = $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->withHeader('X-Branch-Id', (string)$this->branchA1->id)
+            ->getJson('/api/v1/bookings');
+        $listResp->assertOk();
+        $this->assertNotNull($listResp->json('data.data.0.return_inspection'));
+        $this->assertEquals(40000.00, (float)$listResp->json('data.data.0.return_inspection.total_penalty'));
 
         // Process penalty payment via Cashier POS endpoint
         $cashierPayResp = $this->actingAs($this->staffA1)

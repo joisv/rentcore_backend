@@ -96,7 +96,7 @@ class CashierController extends Controller
 
             if ($type === 'settlement' || $type === 'extension') {
                 $alreadyPaid = (float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -186,7 +186,7 @@ class CashierController extends Controller
             // Update booking payment status
             if ($type === 'settlement' || $type === 'extension') {
                 $newTotalPaid = (float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -202,7 +202,7 @@ class CashierController extends Controller
                     ->sum('amount');
                 $totalPenaltyDue = (float)($lockedBooking->returnInspection?->total_penalty ?? 0.0);
                 $isRentalSettled = ((float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -810,7 +810,7 @@ class CashierController extends Controller
                 $booking = Booking::find($transaction->booking_id);
                 if ($booking) {
                     $validPaid = (float)$booking->payments()
-                        ->whereIn('type', ['dp', 'settlement', 'extension'])
+                        ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                         ->where(function ($q) {
                             $q->whereNull('status')->orWhere('status', '!=', 'void');
                         })
