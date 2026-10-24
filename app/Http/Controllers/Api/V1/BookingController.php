@@ -163,13 +163,21 @@ class BookingController extends Controller
             $query->where('bookings.payment_status', $request->payment_status);
         }
 
-        if ($request->has('search')) {
-            $search = $request->search;
+        if ($request->filled('search')) {
+            $search = trim($request->search);
             $query->where(function ($q) use ($search) {
                 $q->where('bookings.booking_code', 'like', "%{$search}%")
                   ->orWhereHas('customer', function ($cq) use ($search) {
                       $cq->where('name', 'like', "%{$search}%")
                          ->orWhere('phone', 'like', "%{$search}%");
+                  })
+                  ->orWhereHas('items.asset', function ($aq) use ($search) {
+                      $aq->where('asset_code', 'like', "%{$search}%")
+                         ->orWhere('serial_number', 'like', "%{$search}%")
+                         ->orWhereHas('model', function ($mq) use ($search) {
+                             $mq->where('name', 'like', "%{$search}%")
+                                ->orWhere('brand', 'like', "%{$search}%");
+                         });
                   });
             });
         }
