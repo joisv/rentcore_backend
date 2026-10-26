@@ -10,7 +10,9 @@ use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\CustomerController;
 use App\Http\Controllers\Api\V1\DashboardController;
 use App\Http\Controllers\Api\V1\ExpenseController;
+use App\Http\Controllers\Api\V1\NotificationController;
 use App\Http\Controllers\Api\V1\ProductController;
+use App\Http\Controllers\Api\V1\ResignationController;
 use App\Http\Controllers\Api\V1\ShiftController;
 use App\Http\Controllers\Api\V1\TransferController;
 use App\Http\Controllers\Api\V1\VoucherController;
@@ -28,12 +30,14 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('v1')->group(function () {
 
     // --- Authentication (Public) ---
-    Route::post('/auth/login', [AuthController::class, 'login']);
-    Route::post('/auth/google', [AuthController::class, 'googleSignIn']);
-    Route::post('/auth/google-sign-in', [AuthController::class, 'googleSignIn']);
+    Route::middleware('throttle:auth')->group(function () {
+        Route::post('/auth/login', [AuthController::class, 'login']);
+        Route::post('/auth/google', [AuthController::class, 'googleSignIn']);
+        Route::post('/auth/google-sign-in', [AuthController::class, 'googleSignIn']);
+    });
 
     // --- Protected Routes (Sanctum Authenticated) ---
-    Route::middleware('auth:sanctum')->group(function () {
+    Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
 
         // Session & Profile
         Route::get('/auth/me', [AuthController::class, 'me']);
@@ -64,8 +68,20 @@ Route::prefix('v1')->group(function () {
             Route::delete('/businesses/{id}/members/{memberId}/pin', [BusinessController::class, 'revokeManagerPin']);
             Route::post('/businesses/{id}/branches', [BusinessController::class, 'addBranch']);
 
+            // Staff Resignation Lifecycle
+            Route::get('/businesses/{id}/resignation-requests', [ResignationController::class, 'index']);
+            Route::post('/businesses/{id}/resignation-requests', [ResignationController::class, 'store']);
+            Route::post('/businesses/{id}/resignation-requests/{requestId}/cancel', [ResignationController::class, 'cancel']);
+            Route::post('/businesses/{id}/resignation-requests/{requestId}/approve', [ResignationController::class, 'approve']);
+            Route::post('/businesses/{id}/resignation-requests/{requestId}/reject', [ResignationController::class, 'reject']);
+
             // Dashboard KPI & Overdue Alerts
             Route::get('/dashboard/kpi', [DashboardController::class, 'kpi']);
+
+            // Tenant Notifications
+            Route::get('/notifications', [NotificationController::class, 'index']);
+            Route::patch('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
+            Route::post('/notifications/read-all', [NotificationController::class, 'markAllAsRead']);
 
             // Security Audit Logs (Owner governance)
             Route::get('/audit-logs', [AuditLogController::class, 'index']);
@@ -119,6 +135,7 @@ Route::prefix('v1')->group(function () {
             Route::post('/bookings', [BookingController::class, 'store']);
             Route::get('/bookings/{id}', [BookingController::class, 'show']);
             Route::post('/bookings/{id}/extend', [BookingController::class, 'extend']);
+            Route::post('/bookings/{id}/adjust-duration', [BookingController::class, 'adjustDuration']);
             Route::post('/bookings/{id}/return', [BookingController::class, 'processReturn']);
             Route::get('/bookings/{id}/available-replacements', [BookingController::class, 'availableReplacements']);
             Route::post('/bookings/{id}/exchange', [BookingController::class, 'exchange']);
@@ -127,6 +144,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/customers', [CustomerController::class, 'index']);
             Route::get('/customers/lookup', [CustomerController::class, 'lookup']);
             Route::post('/customers', [CustomerController::class, 'store']);
+            Route::get('/customers/{id}/identity-document', [CustomerController::class, 'getIdentityDocument']);
             Route::post('/customers/{id}/identity-document', [CustomerController::class, 'uploadIdentityDocument']);
             Route::put('/customers/{id}/blacklist', [CustomerController::class, 'toggleBlacklist']);
 
@@ -140,6 +158,7 @@ Route::prefix('v1')->group(function () {
             // Branch Operating Expenses
             Route::get('/cashier/expenses', [ExpenseController::class, 'index']);
             Route::post('/cashier/expenses', [ExpenseController::class, 'store']);
+            Route::get('/cashier/expenses/{id}/receipt-file', [ExpenseController::class, 'getReceiptFile']);
             Route::post('/cashier/expenses/{id}/approve', [ExpenseController::class, 'approve']);
             Route::post('/cashier/expenses/{id}/void', [ExpenseController::class, 'voidExpense']);
 

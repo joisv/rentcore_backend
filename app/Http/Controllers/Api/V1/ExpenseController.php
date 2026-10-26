@@ -172,7 +172,7 @@ class ExpenseController extends Controller
                         'void_by_name' => $exp->voidBy?->name,
                         'void_reason' => $exp->void_reason,
                         'voided_at' => $exp->voided_at?->toIso8601String(),
-                        'receipt_image_url' => $exp->receipt_image_path ? Storage::disk('public')->url($exp->receipt_image_path) : null,
+                        'receipt_image_url' => $exp->receipt_image_path ? url("/api/v1/cashier/expenses/{$exp->id}/receipt-file") : null,
                         'notes' => $exp->notes,
                         'disbursed_at' => $exp->disbursed_at?->toIso8601String(),
                         'created_at' => $exp->created_at?->toIso8601String(),
@@ -321,15 +321,15 @@ class ExpenseController extends Controller
             if ($decoded !== false) {
                 $filename = 'exp_' . time() . '_' . Str::random(8) . '.' . $ext;
                 $imagePath = 'receipt_expenses/' . $filename;
-                Storage::disk('public')->put($imagePath, $decoded);
+                Storage::disk('local')->put($imagePath, $decoded);
             }
         }
 
         $datePrefix = Carbon::now()->format('ymd');
-        $countToday = BranchExpense::withoutGlobalScopes()
+        $countToday = BranchExpense::where('business_id', $businessId)
             ->whereDate('created_at', Carbon::today())
             ->count() + 1;
-        $expenseNumber = sprintf('EXP-%s-%s-%04d', $branch->code ?? 'CBG', $datePrefix, $countToday);
+        $expenseNumber = sprintf('EXP-%s-%s-%04d-%s', $branch->code ?? 'CBG', $datePrefix, $countToday, strtoupper(Str::random(3)));
 
         $disbursedAt = null;
         if ($status === 'approved' && $validated['payment_source'] === 'cash_drawer') {
@@ -536,5 +536,33 @@ class ExpenseController extends Controller
             'message' => 'Pengeluaran ' . $expense->expense_number . ' berhasil dibatalkan (void).',
             'data' => $expense->fresh(['requestedBy', 'approvedBy', 'voidBy']),
         ]);
+    }
+
+    /**
+     * Retrieve expense receipt photo document securely under tenant authorization.
+     */
+    public function getReceiptFile(Request $request, int $id): \Symfony\Component\HttpFoundation\Response
+    {
+        $expense = BranchExpense::findOrFail($id);
+        if (empty($expense->receipt_image_path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Foto bukti pengeluaran tidak ditemukan.',
+            ], 404);
+        }
+
+        $disk = 'local';
+        if (!Storage::disk('local')->exists($expense->receipt_image_path) && Storage::disk('public')->exists($expense->receipt_image_path)) {
+            $disk = 'public'; // Backward compatibility for legacy uploads
+        }
+
+        if (!Storage::disk($disk)->exists($expense->receipt_image_path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'File bukti fisik tidak ditemukan pada server.',
+            ], 404);
+        }
+
+        return Storage::disk($disk)->response($expense->receipt_image_path);
     }
 }

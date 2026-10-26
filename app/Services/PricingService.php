@@ -192,4 +192,61 @@ class PricingService
 
         return !$collisionQuery->exists();
     }
+
+    /**
+     * Authoritatively resolve price for a given model and cumulative duration in hours.
+     */
+    public function calculateItemPriceForDuration(AssetModel $model, int $hours): float
+    {
+        if ($hours <= 0) {
+            return 0.00;
+        }
+
+        // 1. Exact active tier matching duration_hours
+        $exactTier = PricingTier::where('model_id', $model->id)
+            ->where('is_active', true)
+            ->where('duration_hours', $hours)
+            ->first();
+
+        if ($exactTier) {
+            return (float)$exactTier->price;
+        }
+
+        // 2. Day equivalent tier
+        if ($hours % 24 === 0) {
+            $dayTier = PricingTier::where('model_id', $model->id)
+                ->where('is_active', true)
+                ->where('duration_unit', 'day')
+                ->where('duration_value', intdiv($hours, 24))
+                ->first();
+            if ($dayTier) {
+                return (float)$dayTier->price;
+            }
+        }
+
+        // 3. Fallback: use extension hourly rate
+        $anyTier = PricingTier::where('model_id', $model->id)
+            ->where('is_active', true)
+            ->where('extension_hourly_rate', '>', 0)
+            ->first();
+
+        $isAddon = $model->isAddon();
+        $defaultHourly = $isAddon ? 5000.00 : 15000.00;
+        $hourlyRate = $anyTier ? (float)$anyTier->extension_hourly_rate : $defaultHourly;
+
+        // If hours is larger than an available tier, use base tier + remainder
+        $baseTier = PricingTier::where('model_id', $model->id)
+            ->where('is_active', true)
+            ->where('duration_hours', '<', $hours)
+            ->orderBy('duration_hours', 'desc')
+            ->first();
+
+        if ($baseTier) {
+            $remainderHours = $hours - (int)$baseTier->duration_hours;
+            $rate = (float)$baseTier->extension_hourly_rate > 0 ? (float)$baseTier->extension_hourly_rate : $hourlyRate;
+            return (float)$baseTier->price + ($remainderHours * $rate);
+        }
+
+        return (float)($hours * $hourlyRate);
+    }
 }

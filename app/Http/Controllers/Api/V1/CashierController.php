@@ -90,7 +90,8 @@ class CashierController extends Controller
             }
         }
 
-        return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey) {
+        try {
+            return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey) {
             // Re-fetch booking with row-level pessimistic lock
             $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->first();
 
@@ -159,8 +160,11 @@ class CashierController extends Controller
             }
 
             $datePrefix = Carbon::now()->format('ymd');
-            $txCode = sprintf('TX-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
-            $receiptNumber = sprintf('REC-%s-%s-%04d', $booking->affiliate->code ?? 'PST', $datePrefix, $booking->id);
+            $txEntropy = strtoupper(\Illuminate\Support\Str::random(4));
+            $txBusinessId = $booking->business_id ?? $user->business_id;
+            $txCount = (int)PaymentTransaction::where('business_id', $txBusinessId)->count() + 1;
+            $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
+            $receiptNumber = sprintf('REC-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(6)));
 
             $cashierBranchId = $request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id;
 
@@ -244,6 +248,31 @@ class CashierController extends Controller
                 ],
             ], 201);
         });
+        } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
+            if ($idempotencyKey) {
+                $existingTx = PaymentTransaction::where('business_id', $booking->business_id ?? $user->business_id)
+                    ->where('idempotency_key', $idempotencyKey)
+                    ->first();
+                if ($existingTx) {
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Pembayaran telah diproses sebelumnya (Idempotent).',
+                        'data' => [
+                            'transaction_id' => $existingTx->id,
+                            'transaction_code' => $existingTx->transaction_code,
+                            'receipt_number' => $existingTx->receipt_number,
+                            'amount' => (float)$existingTx->amount,
+                            'cash_received' => (float)$existingTx->cash_received,
+                            'cash_change' => (float)$existingTx->cash_change,
+                            'status' => $existingTx->status,
+                            'payment' => $existingTx->load('paymentMethod'),
+                            'is_idempotent' => true,
+                        ],
+                    ]);
+                }
+            }
+            throw $e;
+        }
     }
 
     /**
@@ -430,19 +459,10 @@ class CashierController extends Controller
             }
         }
 
-        $query = PaymentTransaction::with([
-            'paymentMethod',
-            'branch',
-            'booking' => fn($q) => $q->withoutGlobalScope(\App\Scopes\TenantScope::class),
-            'booking.affiliate',
-            'booking.customer',
-            'booking.items.asset.model',
-            'processedBy'
-        ])
-        ->whereBetween('transacted_at', [$start, $end]);
+        $baseQuery = PaymentTransaction::whereBetween('payment_transactions.transacted_at', [$start, $end]);
 
         if ($businessId) {
-            $query->where(function ($q) use ($businessId) {
+            $baseQuery->where(function ($q) use ($businessId) {
                 $q->where('payment_transactions.business_id', $businessId)
                   ->orWhereHas('booking', function ($bq) use ($businessId) {
                       $bq->where('business_id', $businessId);
@@ -451,7 +471,7 @@ class CashierController extends Controller
         }
 
         if ($targetBranchId !== null) {
-            $query->where(function ($q) use ($targetBranchId) {
+            $baseQuery->where(function ($q) use ($targetBranchId) {
                 $q->where('payment_transactions.branch_id', $targetBranchId)
                   ->orWhere(function ($fallbackQ) use ($targetBranchId) {
                       $fallbackQ->whereNull('payment_transactions.branch_id')
@@ -460,11 +480,29 @@ class CashierController extends Controller
             });
         }
 
-        $transactions = $query->latest('transacted_at')->get();
+        $totalTransactions = (clone $baseQuery)->count();
+
+        // Lightweight selection for summary metrics: loads only necessary scalar columns
+        // Avoiding hydration of thousands of deep booking.items.asset.model relationships
+        $txSummaryList = (clone $baseQuery)
+            ->select([
+                'payment_transactions.id',
+                'payment_transactions.amount',
+                'payment_transactions.type',
+                'payment_transactions.status',
+                'payment_transactions.direction',
+                'payment_transactions.payment_method_id',
+                'payment_transactions.branch_id',
+                'payment_transactions.booking_id',
+            ])
+            ->with([
+                'paymentMethod:id,name,code',
+                'booking' => fn($q) => $q->withoutGlobalScope(\App\Scopes\TenantScope::class)->select(['id', 'affiliate_id']),
+            ])
+            ->get();
 
         $breakdown = [];
         $totalRevenue = 0.00;
-        $totalTransactions = $transactions->count();
 
         $branchStats = [];
         if ($businessId) {
@@ -492,7 +530,7 @@ class CashierController extends Controller
             'refund' => ['label' => 'Pengembalian Dana / Titipan Jaminan (Refund)', 'count' => 0, 'total' => 0.00],
         ];
 
-        foreach ($transactions as $tx) {
+        foreach ($txSummaryList as $tx) {
             // Exclude void transactions from revenue calculations
             if (($tx->status ?? 'completed') === 'void') {
                 continue;
@@ -645,7 +683,21 @@ class CashierController extends Controller
         $expectedDrawerCash = max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
 
         $limit = max(10, min(500, (int)$request->get('limit', $request->get('per_page', 50))));
-        $recentTransactions = $transactions->take($limit)->map(function ($tx) {
+        $recentTransactions = (clone $baseQuery)
+            ->with([
+                'paymentMethod',
+                'branch',
+                'booking' => fn($q) => $q->withoutGlobalScope(\App\Scopes\TenantScope::class),
+                'booking.affiliate',
+                'booking.customer',
+                'booking.items.asset.model',
+                'processedBy',
+                'voidBy'
+            ])
+            ->latest('payment_transactions.transacted_at')
+            ->limit($limit)
+            ->get()
+            ->map(function ($tx) {
             return [
                 'id' => $tx->id,
                 'transaction_code' => $tx->transaction_code,

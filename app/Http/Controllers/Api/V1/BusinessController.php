@@ -417,53 +417,101 @@ class BusinessController extends Controller
             }
         }
 
-        // Check if user exists, or create a pending placeholder user
-        $user = User::where('email', $validated['email'])->first();
-        if (!$user) {
-            $user = User::create([
-                'email' => $validated['email'],
-                'name' => $validated['name'] ?? explode('@', $validated['email'])[0],
-                'password' => null,
-                'role' => 'staff',
-                'is_active' => true,
-                'is_platform_admin' => false,
-            ]);
-        }
-
-        // Check existing membership
-        $existing = BusinessMember::where('business_id', $businessId)
-            ->where('user_id', $user->id)
-            ->first();
-
-        if ($existing) {
-            throw ValidationException::withMessages([
-                'email' => ['Pengguna ini sudah terdaftar sebagai anggota bisnis.'],
-            ]);
-        }
-
-        $member = BusinessMember::create([
-            'business_id' => $businessId,
-            'user_id' => $user->id,
-            'role' => $validated['role'],
-            'is_active' => true,
-            'invited_by' => $request->user()->id,
-            'joined_at' => Carbon::now(),
-        ]);
-
-        if (!empty($validated['branch_ids'])) {
-            foreach ($validated['branch_ids'] as $branchId) {
-                BranchMember::create([
-                    'business_member_id' => $member->id,
-                    'affiliate_id' => $branchId,
+        return DB::transaction(function () use ($validated, $businessId, $request) {
+            // Check if user exists, or create a pending placeholder user
+            $user = User::where('email', $validated['email'])->first();
+            if (!$user) {
+                $user = User::create([
+                    'email' => $validated['email'],
+                    'name' => $validated['name'] ?? explode('@', $validated['email'])[0],
+                    'password' => null,
+                    'role' => 'staff',
+                    'is_active' => true,
+                    'is_platform_admin' => false,
                 ]);
             }
-        }
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Staf berhasil didaftarkan ke bisnis rental.',
-            'data' => $member->load(['user', 'branchMembers.branch']),
-        ], 201);
+            // Acquire exclusive lock on target user to prevent concurrent multi-employment race conditions
+            User::where('id', $user->id)->lockForUpdate()->first();
+
+            // Constraint: a user may hold at most one active staff/employment membership in an independently owned business
+            $hasOtherStaffEmployment = BusinessMember::join('businesses', 'businesses.id', '=', 'business_members.business_id')
+                ->where('business_members.user_id', $user->id)
+                ->where('business_members.is_active', true)
+                ->where('businesses.owner_id', '!=', $user->id)
+                ->where('business_members.business_id', '!=', $businessId)
+                ->exists();
+
+            if ($hasOtherStaffEmployment) {
+                throw ValidationException::withMessages([
+                    'email' => [
+                        'Pengguna ini sudah terdaftar sebagai staf aktif di bisnis rental lain. ' .
+                        'Berdasarkan kebijakan sistem, satu akun hanya dapat aktif bekerja pada satu bisnis rental pihak lain dalam satu waktu.'
+                    ],
+                ]);
+            }
+
+            // Check existing membership in this business
+            $existing = BusinessMember::where('business_id', $businessId)
+                ->where('user_id', $user->id)
+                ->first();
+
+            if ($existing) {
+                if ($existing->is_active) {
+                    throw ValidationException::withMessages([
+                        'email' => ['Pengguna ini sudah terdaftar sebagai anggota aktif bisnis ini.'],
+                    ]);
+                }
+
+                // Reactivate previously resigned or deactivated membership
+                $existing->update([
+                    'role' => $validated['role'],
+                    'is_active' => true,
+                    'joined_at' => Carbon::now(),
+                    'invited_by' => $request->user()->id,
+                ]);
+                $member = $existing;
+            } else {
+                $member = BusinessMember::create([
+                    'business_id' => $businessId,
+                    'user_id' => $user->id,
+                    'role' => $validated['role'],
+                    'is_active' => true,
+                    'invited_by' => $request->user()->id,
+                    'joined_at' => Carbon::now(),
+                ]);
+            }
+
+            // Sync branch assignments
+            BranchMember::where('business_member_id', $member->id)->delete();
+            if (!empty($validated['branch_ids'])) {
+                foreach ($validated['branch_ids'] as $branchId) {
+                    BranchMember::create([
+                        'business_member_id' => $member->id,
+                        'affiliate_id' => $branchId,
+                    ]);
+                }
+            }
+
+            AuditLogService::log(
+                $request->user(),
+                'business_member.added',
+                'BusinessMember',
+                (string)$member->id,
+                [
+                    'target_user' => $user->name,
+                    'email' => $user->email,
+                    'role' => $member->role,
+                    'reactivated' => (bool)$existing,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Staf berhasil didaftarkan ke bisnis rental.',
+                'data' => $member->load(['user', 'branchMembers.branch']),
+            ], 201);
+        });
     }
 
     /**

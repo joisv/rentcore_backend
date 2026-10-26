@@ -21,6 +21,19 @@ class ReturnService
     public function processReturn(Booking $booking, array $data, User $inspector): ReturnInspection
     {
         return DB::transaction(function () use ($booking, $data, $inspector) {
+            // Idempotent retry handling: if booking was already marked returned and idempotency key supplied
+            if ($booking->status === 'returned') {
+                if (!empty($data['idempotency_key'])) {
+                    $existingInspection = ReturnInspection::where('booking_id', $booking->id)->first();
+                    if ($existingInspection) {
+                        return $existingInspection->load(['inspector', 'booking']);
+                    }
+                }
+                throw ValidationException::withMessages([
+                    'booking' => ["Booking {$booking->booking_code} tidak dalam status sewa aktif (status saat ini: {$booking->status})."],
+                ]);
+            }
+
             if ($booking->status !== 'rented') {
                 throw ValidationException::withMessages([
                     'booking' => ["Booking {$booking->booking_code} tidak dalam status sewa aktif (status saat ini: {$booking->status})."],
@@ -165,25 +178,33 @@ class ReturnService
                         ->count() + 1;
                     $randomSuffix = strtoupper(substr(uniqid(), -4));
                     $txCode = sprintf('TX-PEN-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
-                    $receiptNumber = sprintf('REC-PEN-%s-%s-%04d', $booking->affiliate->code ?? 'CTR', $datePrefix, $booking->id);
+                    $receiptNumber = sprintf('REC-PEN-%s-%s-%s', $booking->affiliate->code ?? 'CTR', $datePrefix, $randomSuffix);
 
-                    PaymentTransaction::create([
-                        'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
-                        'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
-                        'transaction_code' => $txCode,
-                        'receipt_number' => $receiptNumber,
-                        'booking_id' => $booking->id,
-                        'payment_method_id' => $paymentMethod->id,
-                        'processed_by' => $inspector->id,
-                        'type' => 'penalty',
-                        'status' => 'completed',
-                        'direction' => 'inflow',
-                        'amount' => $amountToPay,
-                        'cash_received' => $cashReceived,
-                        'cash_change' => $cashChange,
-                        'notes' => 'Pembayaran denda keterlambatan/kerusakan unit',
-                        'transacted_at' => Carbon::now(),
-                    ]);
+                    $idempotencyKey = $data['idempotency_key'] ?? null;
+                    try {
+                        PaymentTransaction::create([
+                            'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
+                            'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
+                            'transaction_code' => $txCode,
+                            'receipt_number' => $receiptNumber,
+                            'idempotency_key' => $idempotencyKey,
+                            'booking_id' => $booking->id,
+                            'payment_method_id' => $paymentMethod->id,
+                            'processed_by' => $inspector->id,
+                            'type' => 'penalty',
+                            'status' => 'completed',
+                            'direction' => 'inflow',
+                            'amount' => $amountToPay,
+                            'cash_received' => $cashReceived,
+                            'cash_change' => $cashChange,
+                            'notes' => 'Pembayaran denda keterlambatan/kerusakan unit',
+                            'transacted_at' => Carbon::now(),
+                        ]);
+                    } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
+                        if (!$idempotencyKey || !PaymentTransaction::where('idempotency_key', $idempotencyKey)->exists()) {
+                            throw $e;
+                        }
+                    }
 
                     $isRentalSettled = ((float)$booking->payments()
                         ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
@@ -214,7 +235,7 @@ class ReturnService
                         ->count() + 1;
                     $randomSuffix = strtoupper(substr(uniqid(), -4));
                     $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
-                    $receiptNumber = sprintf('REC-REF-%s-%s-%04d', $booking->affiliate->code ?? 'CTR', $datePrefix, $booking->id);
+                    $receiptNumber = sprintf('REC-REF-%s-%s-%s', $booking->affiliate->code ?? 'CTR', $datePrefix, $randomSuffix);
 
                     PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),

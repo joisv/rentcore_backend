@@ -171,7 +171,7 @@ class BookingService
                     }
                     $filename = 'id_' . $customer->id . '_' . time() . '_' . Str::random(6) . '.' . $ext;
                     $identityFilePath = 'customer_identities/' . $filename;
-                    Storage::disk('public')->put($identityFilePath, $decoded);
+                    Storage::disk('local')->put($identityFilePath, $decoded);
                 }
             }
 
@@ -438,12 +438,13 @@ class BookingService
             $depositFee = (float)($data['deposit_fee'] ?? 0.00);
             $totalBill = max(0, $subtotal + $depositFee - $discountAmount);
 
-            // 6. Generate Booking Code: RC-YYMMDD-XXXX
+            // 6. Generate Booking Code: RC-YYMMDD-XXXX-YYY (Tenant scoped + entropy)
             $datePrefix = Carbon::now()->format('ymd');
             $countToday = Booking::withoutGlobalScopes()
+                ->where('business_id', $businessId)
                 ->whereDate('created_at', Carbon::today())
                 ->count() + 1;
-            $bookingCode = sprintf('RC-%s-%04d', $datePrefix, $countToday);
+            $bookingCode = sprintf('RC-%s-%04d-%s', $datePrefix, $countToday, strtoupper(Str::random(3)));
 
             // 7. Create Booking (Direct activation: status = 'rented')
             $booking = Booking::withoutGlobalScopes()->create([
@@ -523,8 +524,10 @@ class BookingService
                 : $totalBill;
             $cashChange = $isCash ? max(0, $cashReceived - $totalBill) : 0.00;
 
-            $txCode = sprintf('TX-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
-            $receiptNumber = sprintf('REC-%s-%s-%04d', $affiliate->code ?? 'CTR', $datePrefix, $booking->id);
+            $txEntropy = strtoupper(Str::random(4));
+            $txCount = (int)PaymentTransaction::where('business_id', $businessId)->count() + 1;
+            $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
+            $receiptNumber = sprintf('REC-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6)));
 
             PaymentTransaction::create([
                 'business_id' => $businessId,

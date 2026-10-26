@@ -9,6 +9,7 @@ use App\Models\BusinessMember;
 use App\Models\InventoryTransfer;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\NotificationService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
@@ -18,6 +19,10 @@ use Illuminate\Validation\ValidationException;
 
 class TransferController extends Controller
 {
+    public function __construct(
+        protected NotificationService $notificationService
+    ) {}
+
     /**
      * List inventory transfers involving the authenticated user's branch / business.
      */
@@ -304,6 +309,12 @@ class TransferController extends Controller
             ? 'Mutasi unit antar cabang berhasil diinisiasi dan langsung dalam pengiriman.'
             : 'Pengajuan mutasi berhasil dikirim dan menunggu persetujuan Owner.';
 
+        if ($isOwner) {
+            $this->notificationService->notifyTransferApproved($transfer);
+        } else {
+            $this->notificationService->notifyTransferRequested($transfer);
+        }
+
         return response()->json([
             'success' => true,
             'message' => $message,
@@ -369,6 +380,15 @@ class TransferController extends Controller
                 $request->ip(),
                 $transfer->from_affiliate_id
             );
+
+            $this->notificationService->notifyTransferApproved($transfer->fresh([
+                'asset.model.category',
+                'fromAffiliate',
+                'toAffiliate',
+                'sender',
+                'recipient',
+                'approver',
+            ]));
 
             return response()->json([
                 'success' => true,
@@ -449,6 +469,11 @@ class TransferController extends Controller
                 ],
                 $request->ip(),
                 $transfer->from_affiliate_id
+            );
+
+            $this->notificationService->notifyTransferRejected(
+                $transfer->fresh(['asset.model.category', 'fromAffiliate', 'toAffiliate', 'sender']),
+                $validated['rejection_reason']
             );
 
             return response()->json([
@@ -551,6 +576,10 @@ class TransferController extends Controller
                 $transfer->to_affiliate_id
             );
 
+            $this->notificationService->notifyTransferReceived(
+                $transfer->fresh(['asset.model.category', 'fromAffiliate', 'toAffiliate', 'sender', 'receiver'])
+            );
+
             return response()->json([
                 'success' => true,
                 'message' => 'Unit mutasi berhasil diterima dan kini siap disewakan di cabang Anda.',
@@ -627,6 +656,11 @@ class TransferController extends Controller
                 ],
                 $request->ip(),
                 $transfer->from_affiliate_id
+            );
+
+            $this->notificationService->notifyTransferCancelled(
+                $transfer->fresh(['asset.model.category', 'fromAffiliate', 'toAffiliate', 'sender']),
+                $user
             );
 
             return response()->json([

@@ -79,6 +79,11 @@ class User extends Authenticatable
         return $this->hasMany(Booking::class, 'created_by');
     }
 
+    public function resignationRequests(): HasMany
+    {
+        return $this->hasMany(StaffResignationRequest::class);
+    }
+
     public function isPlatformAdmin(): bool
     {
         return (bool) $this->is_platform_admin;

@@ -27,6 +27,8 @@ class DirectCounterRentalTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        \Illuminate\Support\Facades\Storage::fake('local');
+        \Illuminate\Support\Facades\Storage::fake('public');
 
         $this->affiliate = Affiliate::create([
             'code' => 'GNT',
@@ -244,6 +246,6 @@ class DirectCounterRentalTest extends TestCase
 
         $identity = \App\Models\CustomerIdentity::where('identity_number', '3271009988776655')->first();
         $this->assertNotNull($identity->file_path);
-        \Illuminate\Support\Facades\Storage::disk('public')->assertExists($identity->file_path);
+        \Illuminate\Support\Facades\Storage::disk('local')->assertExists($identity->file_path);
     }
 }

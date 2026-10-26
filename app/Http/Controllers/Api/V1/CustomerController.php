@@ -165,7 +165,7 @@ class CustomerController extends Controller
         if ($request->hasFile('photo')) {
             $file = $request->file('photo');
             $filename = 'id_' . $customer->id . '_' . time() . '.' . $file->getClientOriginalExtension();
-            $filePath = $file->storeAs('customer_identities', $filename, 'public');
+            $filePath = $file->storeAs('customer_identities', $filename, 'local');
         } else {
             $filePath = $this->saveIdentityPhoto($request->input('photo'), $customer->id);
         }
@@ -307,8 +307,38 @@ class CustomerController extends Controller
         $filename = 'id_' . $customerId . '_' . time() . '_' . Str::random(6) . '.' . $extension;
         $path = 'customer_identities/' . $filename;
 
-        Storage::disk('public')->put($path, $decoded);
+        Storage::disk('local')->put($path, $decoded);
 
         return $path;
+    }
+
+    /**
+     * Retrieve customer identity photo document securely under tenant authorization.
+     */
+    public function getIdentityDocument(Request $request, int $id): \Symfony\Component\HttpFoundation\Response
+    {
+        $customer = Customer::findOrFail($id);
+        $identity = $customer->identities()->latest()->first();
+
+        if (!$identity || empty($identity->file_path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Dokumen identitas pelanggan belum diunggah.',
+            ], 404);
+        }
+
+        $disk = 'local';
+        if (!Storage::disk('local')->exists($identity->file_path) && Storage::disk('public')->exists($identity->file_path)) {
+            $disk = 'public'; // Backward compatibility for legacy uploads
+        }
+
+        if (!Storage::disk($disk)->exists($identity->file_path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'File dokumen fisik tidak ditemukan pada server.',
+            ], 404);
+        }
+
+        return Storage::disk($disk)->response($identity->file_path);
     }
 }

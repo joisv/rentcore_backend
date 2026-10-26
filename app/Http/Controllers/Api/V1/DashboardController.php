@@ -182,15 +182,10 @@ class DashboardController extends Controller
             });
 
         // 4. Financial Summary Today (Scoped by original transaction branch, excluding void, accounting for refunds)
-        $hasStatusColumn = \Illuminate\Support\Facades\Schema::hasColumn('payment_transactions', 'status');
-        $hasDirectionColumn = \Illuminate\Support\Facades\Schema::hasColumn('payment_transactions', 'direction');
-
-        $paymentQuery = PaymentTransaction::whereBetween('payment_transactions.transacted_at', [$todayStart, $todayEnd]);
-        if ($hasStatusColumn) {
-            $paymentQuery->where(function ($q) {
+        $paymentQuery = PaymentTransaction::whereBetween('payment_transactions.transacted_at', [$todayStart, $todayEnd])
+            ->where(function ($q) {
                 $q->whereNull('payment_transactions.status')->orWhere('payment_transactions.status', '!=', 'void');
             });
-        }
 
         if ($businessId) {
             $paymentQuery->where(function ($q) use ($businessId) {
@@ -208,26 +203,19 @@ class DashboardController extends Controller
             });
         }
 
-        $inflowQuery = (clone $paymentQuery)->where('payment_transactions.type', '!=', 'refund');
-        if ($hasDirectionColumn) {
-            $inflowQuery->where(function ($q) {
-                $q->whereNull('payment_transactions.direction')->orWhere('payment_transactions.direction', '!=', 'outflow');
-            });
-        }
-        $inflow = (float)$inflowQuery->sum('payment_transactions.amount');
+        // Consolidated aggregate query: replaces 2 Schema::hasColumn calls and 3 separate queries with 1 single query
+        $financialSummary = (clone $paymentQuery)
+            ->selectRaw("
+                COUNT(*) as total_count,
+                COALESCE(SUM(CASE WHEN payment_transactions.type != 'refund' AND (payment_transactions.direction IS NULL OR payment_transactions.direction != 'outflow') THEN payment_transactions.amount ELSE 0 END), 0) as inflow,
+                COALESCE(SUM(CASE WHEN payment_transactions.type = 'refund' OR payment_transactions.direction = 'outflow' THEN payment_transactions.amount ELSE 0 END), 0) as outflow
+            ")
+            ->first();
 
-        $outflowQuery = (clone $paymentQuery);
-        if ($hasDirectionColumn) {
-            $outflowQuery->where(function ($q) {
-                $q->where('payment_transactions.type', 'refund')->orWhere('payment_transactions.direction', 'outflow');
-            });
-        } else {
-            $outflowQuery->where('payment_transactions.type', 'refund');
-        }
-        $outflow = (float)$outflowQuery->sum('payment_transactions.amount');
-
+        $inflow = (float)($financialSummary->inflow ?? 0);
+        $outflow = (float)($financialSummary->outflow ?? 0);
         $todayRevenue = max(0.00, $inflow - $outflow);
-        $todayTransactionsCount = (int)$paymentQuery->count();
+        $todayTransactionsCount = (int)($financialSummary->total_count ?? 0);
 
         return response()->json([
             'success' => true,

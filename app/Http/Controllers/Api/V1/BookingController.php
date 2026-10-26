@@ -4,18 +4,22 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Models\Booking;
+use App\Models\BookingItem;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\PricingTier;
 use App\Models\RentalExtension;
+use App\Models\User;
 use App\Services\AuditLogService;
 use App\Services\BookingService;
 use App\Services\ExchangeService;
+use App\Services\PricingService;
 use App\Services\ReturnService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 
 class BookingController extends Controller
@@ -23,7 +27,8 @@ class BookingController extends Controller
     public function __construct(
         protected BookingService $bookingService,
         protected ReturnService $returnService,
-        protected ExchangeService $exchangeService
+        protected ExchangeService $exchangeService,
+        protected PricingService $pricingService
     ) {}
 
     /**
@@ -293,9 +298,30 @@ class BookingController extends Controller
             'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
             'cash_received' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string|max:255',
+            'idempotency_key' => 'nullable|string|max:64',
         ]);
 
-        return DB::transaction(function () use ($request, $id) {
+        $idempotencyKey = $request->idempotency_key ?? $request->header('X-Idempotency-Key');
+        if ($idempotencyKey) {
+            $existingTx = PaymentTransaction::where('booking_id', $id)
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+            if ($existingTx) {
+                $booking = Booking::with(['items.asset.model', 'extensions', 'payments.paymentMethod'])->findOrFail($id);
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Permintaan perpanjangan sewa telah berhasil diproses sebelumnya (Idempotent).',
+                    'data' => [
+                        'booking' => $booking,
+                        'extension' => $booking->extensions()->latest()->first(),
+                        'payment' => $existingTx,
+                        'is_idempotent' => true,
+                    ],
+                ], 200);
+            }
+        }
+
+        return DB::transaction(function () use ($request, $id, $idempotencyKey) {
             $booking = Booking::with(['items.asset.model', 'affiliate'])
                 ->lockForUpdate()
                 ->findOrFail($id);
@@ -395,23 +421,40 @@ class BookingController extends Controller
                 }
 
                 $datePrefix = Carbon::now()->format('ymd');
-                $txCode = sprintf('TX-EXT-%s-%04d', $datePrefix, PaymentTransaction::count() + 1);
-                $receiptNumber = sprintf('REC-EXT-%s-%s-%04d', $booking->affiliate->code ?? 'PST', $datePrefix, $booking->id);
+                $countToday = PaymentTransaction::withoutGlobalScopes()
+                    ->where('business_id', $booking->business_id ?? $request->user()->business_id)
+                    ->whereDate('transacted_at', Carbon::today())
+                    ->count() + 1;
+                $randomSuffix = strtoupper(\Illuminate\Support\Str::random(3));
+                $txCode = sprintf('TX-EXT-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                $receiptNumber = sprintf('REC-EXT-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(4)));
 
-                $paymentTx = PaymentTransaction::create([
-                    'business_id' => $booking->business_id ?? $request->user()->business_id,
-                    'transaction_code' => $txCode,
-                    'receipt_number' => $receiptNumber,
-                    'booking_id' => $booking->id,
-                    'payment_method_id' => $paymentMethod->id,
-                    'processed_by' => $request->user()->id,
-                    'type' => 'extension',
-                    'amount' => $additionalFee,
-                    'cash_received' => $cashReceived,
-                    'cash_change' => $cashChange,
-                    'notes' => $request->notes ?? "Pembayaran perpanjangan sewa {$additionalHours} jam",
-                    'transacted_at' => Carbon::now(),
-                ]);
+                try {
+                    $paymentTx = PaymentTransaction::create([
+                        'business_id' => $booking->business_id ?? $request->user()->business_id,
+                        'branch_id' => $booking->affiliate_id,
+                        'status' => 'completed',
+                        'transaction_code' => $txCode,
+                        'receipt_number' => $receiptNumber,
+                        'idempotency_key' => $idempotencyKey,
+                        'booking_id' => $booking->id,
+                        'payment_method_id' => $paymentMethod->id,
+                        'processed_by' => $request->user()->id,
+                        'type' => 'extension',
+                        'amount' => $additionalFee,
+                        'cash_received' => $cashReceived,
+                        'cash_change' => $cashChange,
+                        'notes' => $request->notes ?? "Pembayaran perpanjangan sewa {$additionalHours} jam",
+                        'transacted_at' => Carbon::now(),
+                    ]);
+                } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
+                    if ($idempotencyKey) {
+                        $paymentTx = PaymentTransaction::where('idempotency_key', $idempotencyKey)->first();
+                    }
+                    if (!$paymentTx) {
+                        throw $e;
+                    }
+                }
             }
 
             $alreadyPaid = (float)$booking->payments()->whereIn('type', ['dp', 'settlement', 'extension'])->sum('amount')
@@ -459,6 +502,453 @@ class BookingController extends Controller
     }
 
     /**
+     * Adjust rental duration (increase or decrease) for primary device or specific add-on.
+     */
+    public function adjustDuration(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'booking_item_id' => 'nullable|integer|exists:booking_items,id',
+            'hours_delta' => 'required|integer|min:1|max:168',
+            'direction' => 'required|string|in:increase,decrease',
+            'manager_pin' => 'nullable|string',
+            'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'cash_received' => 'nullable|numeric|min:0',
+            'reason' => 'nullable|string|max:255',
+            'current_end_at' => 'nullable|date',
+            'additional_fee' => 'nullable|numeric|min:0',
+        ]);
+
+        return DB::transaction(function () use ($request, $validated, $id) {
+            $user = $request->user();
+            $tenantContext = app(\App\Tenancy\TenantContext::class);
+            $businessId = $tenantContext->getBusinessId() ?? $user->current_business_id ?? $user->business_id;
+
+            $booking = Booking::with(['items.asset.model.category', 'affiliate', 'payments'])
+                ->lockForUpdate()
+                ->findOrFail($id);
+
+            if ($businessId && $booking->business_id !== (int)$businessId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Anda tidak memiliki wewenang untuk mengubah durasi sewa pada bisnis ini.',
+                ], 403);
+            }
+
+            // Guardrail 1: Booking Status Check
+            if (!in_array($booking->status, ['rented', 'confirmed'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Penyesuaian durasi tidak diizinkan untuk rental berstatus '{$booking->status}'.",
+                ], 422);
+            }
+
+            // Guardrail 2: Overdue Check
+            if ($booking->status === 'rented' && Carbon::parse($booking->end_at)->isPast()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Rental yang sudah melewati batas waktu (overdue) tidak dapat dikurangi atau diubah durasinya melalui menu ini.',
+                ], 422);
+            }
+
+            $direction = $validated['direction'];
+            $hoursDelta = (int)$validated['hours_delta'];
+            $signedDelta = ($direction === 'increase') ? $hoursDelta : -$hoursDelta;
+            $previousEndAt = Carbon::parse($booking->end_at);
+            $newEndAt = (clone $previousEndAt);
+
+            // Optimistic Concurrency Check
+            if (!empty($validated['current_end_at'])) {
+                $clientEndAt = Carbon::parse($validated['current_end_at']);
+                if ($previousEndAt->ne($clientEndAt)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Data rental telah diperbarui oleh staf lain. Silakan muat ulang halaman sebelum mencoba kembali.',
+                    ], 409);
+                }
+            }
+
+            // Resolve target item
+            $targetItemId = $validated['booking_item_id'] ?? null;
+            $targetItem = null;
+            $isTargetAddon = false;
+
+            if ($targetItemId) {
+                $targetItem = $booking->items->where('id', $targetItemId)->first();
+                if (!$targetItem) {
+                    throw ValidationException::withMessages([
+                        'booking_item_id' => ['Item sewa tidak ditemukan dalam pesanan ini.'],
+                    ]);
+                }
+                $isTargetAddon = $targetItem->item_type === 'addon';
+            } else {
+                $targetItem = $booking->active_item ?? $booking->items->where('item_type', 'primary')->first() ?? $booking->items->first();
+                $isTargetAddon = false;
+            }
+
+            if (!$targetItem || !$targetItem->asset || !$targetItem->asset->model) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Data perangkat atau model unit tidak valid.',
+                ], 422);
+            }
+
+            $targetModel = $targetItem->asset->model;
+            $managerApprovedBy = null;
+            $feeDelta = 0.00;
+
+            if ($isTargetAddon) {
+                // --- TARGET: INDIVIDUAL ADD-ON ---
+                $currentAddonHours = (int)($targetItem->duration_value ?? $booking->duration_hours);
+                $newAddonHours = $currentAddonHours + $signedDelta;
+
+                if ($newAddonHours < 1) {
+                    throw ValidationException::withMessages([
+                        'hours_delta' => ["Durasi add-on tidak boleh kurang dari 1 jam (Durasi saat ini: {$currentAddonHours} jam)."],
+                    ]);
+                }
+
+                $newEndAt = $previousEndAt;
+                if ($direction === 'increase') {
+                    $potentialNewEndAt = Carbon::parse($booking->start_at)->addHours($newAddonHours);
+                    if ($potentialNewEndAt->gt($previousEndAt)) {
+                        // Forward Collision Check for this specific add-on asset
+                        $collision = Booking::where('id', '!=', $booking->id)
+                            ->whereIn('status', ['confirmed', 'rented'])
+                            ->whereHas('items', function ($iq) use ($targetItem) {
+                                $iq->where('asset_id', $targetItem->asset_id)
+                                   ->where(function ($sq) {
+                                       $sq->whereNull('status')->orWhere('status', 'active');
+                                   });
+                            })
+                            ->where(function ($tq) use ($previousEndAt, $potentialNewEndAt) {
+                                $tq->where('start_at', '<', $potentialNewEndAt)
+                                   ->where('end_at', '>', $previousEndAt);
+                            })
+                            ->first();
+
+                        if ($collision) {
+                            return response()->json([
+                                'success' => false,
+                                'message' => "Tidak dapat memperpanjang add-on. Aksesoris {$targetModel->name} telah dipesan untuk jadwal berikutnya (Booking: {$collision->booking_code}).",
+                            ], 422);
+                        }
+
+                        $newEndAt = $potentialNewEndAt;
+                        $booking->duration_hours = $newAddonHours;
+                        $booking->end_at = $newEndAt;
+                    }
+                }
+
+                $oldPrice = (float)$targetItem->unit_price;
+                if ($direction === 'increase' && $request->filled('additional_fee')) {
+                    $feeDelta = (float)$request->additional_fee;
+                    $newPrice = $oldPrice + $feeDelta;
+                } else {
+                    $newPrice = $this->pricingService->calculateItemPriceForDuration($targetModel, $newAddonHours);
+                    $feeDelta = $newPrice - $oldPrice;
+                }
+
+                $targetItem->update([
+                    'duration_value' => $newAddonHours,
+                    'unit_price' => $newPrice,
+                ]);
+
+                // Recalculate addon_subtotal
+                $newAddonSubtotal = (float)$booking->items()->where('item_type', 'addon')->sum('unit_price');
+                $booking->addon_subtotal = $newAddonSubtotal;
+            } else {
+                // --- TARGET: PRIMARY DEVICE (SHIFTS BOOKING RETURN TIME) ---
+                $currentBookingHours = (int)$booking->duration_hours;
+                $newBookingHours = $currentBookingHours + $signedDelta;
+
+                if ($newBookingHours < 1) {
+                    throw ValidationException::withMessages([
+                        'hours_delta' => ["Durasi rental tidak boleh kurang dari 1 jam (Durasi saat ini: {$currentBookingHours} jam)."],
+                    ]);
+                }
+
+                if ($direction === 'decrease') {
+                    $newEndAt = (clone $previousEndAt)->subHours($hoursDelta);
+                    if ($booking->status === 'rented' && $newEndAt->lt(Carbon::now())) {
+                        throw ValidationException::withMessages([
+                            'hours_delta' => [
+                                "Pengurangan durasi menghasilkan batas waktu di masa lalu ({$newEndAt->format('d M Y, H:i')}). " .
+                                "Untuk pengembalian unit sebelum jadwal, silakan gunakan menu Pengembalian Unit."
+                            ],
+                        ]);
+                    }
+                } else {
+                    $newEndAt = (clone $previousEndAt)->addHours($hoursDelta);
+
+                    // Forward Collision Check
+                    $activeItems = $booking->activeItems->isNotEmpty() ? $booking->activeItems : $booking->items;
+                    $assetIds = $activeItems->pluck('asset_id')->toArray();
+                    $collision = Booking::where('id', '!=', $booking->id)
+                        ->whereIn('status', ['confirmed', 'rented'])
+                        ->whereHas('items', function ($iq) use ($assetIds) {
+                            $iq->whereIn('asset_id', $assetIds)
+                               ->where(function ($sq) {
+                                   $sq->whereNull('status')->orWhere('status', 'active');
+                               });
+                        })
+                        ->where(function ($tq) use ($previousEndAt, $newEndAt) {
+                            $tq->where('start_at', '<', $newEndAt)
+                               ->where('end_at', '>', $previousEndAt);
+                        })
+                        ->first();
+
+                    if ($collision) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => "Tidak dapat memperpanjang sewa. Perangkat telah dipesan untuk jadwal berikutnya (Booking: {$collision->booking_code}).",
+                        ], 422);
+                    }
+                }
+
+                $oldPrimarySubtotal = (float)$booking->primary_subtotal;
+                if ($direction === 'increase' && $request->filled('additional_fee')) {
+                    $feeDelta = (float)$request->additional_fee;
+                    $newPrimarySubtotal = $oldPrimarySubtotal + $feeDelta;
+                } else {
+                    $newPrimarySubtotal = $this->pricingService->calculateItemPriceForDuration($targetModel, $newBookingHours);
+                }
+
+                $targetItem->update([
+                    'duration_value' => $newBookingHours,
+                    'unit_price' => $newPrimarySubtotal,
+                ]);
+
+                $booking->primary_subtotal = $newPrimarySubtotal;
+                $booking->duration_hours = $newBookingHours;
+                $booking->end_at = $newEndAt;
+
+                // Cap attached add-ons if primary device was reduced below their duration
+                if ($direction === 'decrease') {
+                    foreach ($booking->items->where('item_type', 'addon') as $addonItem) {
+                        if ($addonItem->duration_value > $newBookingHours) {
+                            $newAddonPrice = $this->pricingService->calculateItemPriceForDuration($addonItem->asset->model, $newBookingHours);
+                            $addonItem->update([
+                                'duration_value' => $newBookingHours,
+                                'unit_price' => $newAddonPrice,
+                            ]);
+                        }
+                    }
+                    $booking->addon_subtotal = (float)$booking->items()->where('item_type', 'addon')->sum('unit_price');
+                }
+
+                $newTotalSubtotal = (float)$booking->primary_subtotal + (float)$booking->addon_subtotal;
+                if (!($direction === 'increase' && $request->filled('additional_fee'))) {
+                    $feeDelta = $newTotalSubtotal - (float)$booking->subtotal_amount;
+                }
+            }
+
+            // Recalculate Subtotal & Total Bill
+            $newSubtotal = (float)$booking->primary_subtotal + (float)$booking->addon_subtotal;
+            $newTotalBill = max(0, $newSubtotal - (float)$booking->discount_amount + (float)$booking->deposit_fee);
+            $booking->subtotal_amount = $newSubtotal;
+            $booking->total_bill = $newTotalBill;
+
+            // Audit Net Payments Received
+            $inflowPaid = (float)$booking->payments()
+                ->whereIn('type', ['dp', 'settlement', 'extension'])
+                ->where('status', '!=', 'void')
+                ->sum('amount');
+            $outflowRefunds = (float)$booking->payments()
+                ->where('type', 'refund')
+                ->where('status', '!=', 'void')
+                ->sum('amount');
+            $alreadyPaidNet = max(0, $inflowPaid - $outflowRefunds);
+
+            $paymentTx = null;
+
+            if ($feeDelta > 0) {
+                // Additional Payment Needed (Price Increased)
+                if ($request->filled('payment_method_id')) {
+                    $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+                    $isCash = strtoupper($paymentMethod->code) === 'CASH';
+
+                    if ($isCash) {
+                        $cashReceived = (float)($request->cash_received ?? $feeDelta);
+                        if ($cashReceived < $feeDelta) {
+                            throw ValidationException::withMessages([
+                                'cash_received' => ['Uang tunai yang diterima kurang dari biaya penambahan durasi.'],
+                            ]);
+                        }
+                        $cashChange = max(0, $cashReceived - $feeDelta);
+                    } else {
+                        $cashReceived = $feeDelta;
+                        $cashChange = 0.00;
+                    }
+
+                    $datePrefix = Carbon::now()->format('ymd');
+                    $txNextId = ((int)PaymentTransaction::max('id')) + 1;
+                    $txCode = sprintf('TX-EXT-%s-%05d', $datePrefix, $txNextId);
+                    $receiptNumber = sprintf('REC-EXT-%s-%s-%05d', $booking->affiliate->code ?? 'PST', $datePrefix, $txNextId);
+
+                    $paymentTx = PaymentTransaction::create([
+                        'business_id' => $booking->business_id ?? $user->business_id,
+                        'branch_id' => $booking->affiliate_id,
+                        'status' => 'completed',
+                        'transaction_code' => $txCode,
+                        'receipt_number' => $receiptNumber,
+                        'booking_id' => $booking->id,
+                        'payment_method_id' => $paymentMethod->id,
+                        'processed_by' => $user->id,
+                        'type' => 'extension',
+                        'direction' => 'inflow',
+                        'amount' => $feeDelta,
+                        'cash_received' => $cashReceived,
+                        'cash_change' => $cashChange,
+                        'notes' => $request->notes ?? "Pembayaran penambahan durasi {$hoursDelta} jam",
+                        'transacted_at' => Carbon::now(),
+                    ]);
+
+                    $alreadyPaidNet += $feeDelta;
+                }
+                $booking->payment_status = ($alreadyPaidNet >= $newTotalBill) ? 'paid' : ($alreadyPaidNet > 0 ? 'partial' : 'pending');
+            } elseif ($feeDelta < 0) {
+                // Price Decreased -> Check if Overpayment / Refund is Produced
+                if ($alreadyPaidNet > $newTotalBill) {
+                    $refundAmount = $alreadyPaidNet - $newTotalBill;
+
+                    // Security: Manager PIN Verification
+                    if (empty($validated['manager_pin'])) {
+                        throw ValidationException::withMessages([
+                            'manager_pin' => [
+                                'Pengurangan durasi menghasilkan pengembalian dana (refund) sebesar Rp ' .
+                                number_format($refundAmount, 0, ',', '.') . '. Otorisasi PIN Manager diperlukan.'
+                            ],
+                        ]);
+                    }
+
+                    $branchId = $booking->affiliate_id;
+                    $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
+
+                    if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+                        $seconds = RateLimiter::availableIn($throttleKey);
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Terlalu banyak percobaan PIN Manager. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
+                            'code' => 'PIN_RATE_LIMITED',
+                        ], 429);
+                    }
+
+                    $managers = User::where(function ($q) use ($branchId, $businessId) {
+                        $q->where('affiliate_id', $branchId)
+                          ->where('role', 'admin')
+                          ->orWhereHas('businessMembers', function ($bm) use ($businessId) {
+                              $bm->where('business_id', $businessId)
+                                 ->whereIn('role', ['admin', 'owner'])
+                                 ->where('is_active', true);
+                          });
+                    })->whereNotNull('manager_override_pin')->get();
+
+                    $matchingManager = $managers->first(function ($mgr) use ($validated) {
+                        return password_verify($validated['manager_pin'], $mgr->manager_override_pin);
+                    });
+
+                    if (!$matchingManager) {
+                        RateLimiter::hit($throttleKey, 300);
+                        $remaining = RateLimiter::remaining($throttleKey, 5);
+                        throw ValidationException::withMessages([
+                            'manager_pin' => ['PIN Manager tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : '')],
+                        ]);
+                    }
+
+                    RateLimiter::clear($throttleKey);
+                    $managerApprovedBy = $matchingManager->id;
+
+                    // Record Outflow Refund PaymentTransaction
+                    $datePrefix = Carbon::now()->format('ymd');
+                    $refNextId = ((int)PaymentTransaction::max('id')) + 1;
+                    $txCode = sprintf('TX-REF-%s-%05d', $datePrefix, $refNextId);
+                    $receiptNumber = sprintf('REC-REF-%s-%s-%05d', $booking->affiliate->code ?? 'PST', $datePrefix, $refNextId);
+                    $latestPaymentId = $booking->payments()->where('direction', 'inflow')->latest('id')->value('id');
+
+                    $paymentMethodId = $request->payment_method_id ?? $booking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id') ?? 1;
+
+                    $paymentTx = PaymentTransaction::create([
+                        'business_id' => $booking->business_id ?? $user->business_id,
+                        'branch_id' => $booking->affiliate_id,
+                        'status' => 'completed',
+                        'transaction_code' => $txCode,
+                        'receipt_number' => $receiptNumber,
+                        'booking_id' => $booking->id,
+                        'payment_method_id' => $paymentMethodId,
+                        'processed_by' => $user->id,
+                        'reversal_of_id' => $latestPaymentId,
+                        'type' => 'refund',
+                        'direction' => 'outflow',
+                        'amount' => $refundAmount,
+                        'cash_received' => 0.00,
+                        'cash_change' => 0.00,
+                        'notes' => $request->reason ?? "Pengembalian dana pengurangan durasi {$hoursDelta} jam",
+                        'transacted_at' => Carbon::now(),
+                    ]);
+                }
+                $booking->payment_status = ($alreadyPaidNet >= $newTotalBill) ? 'paid' : ($alreadyPaidNet > 0 ? 'partial' : 'pending');
+            }
+
+            $booking->save();
+
+            // Record Extension/Adjustment History
+            $extension = RentalExtension::create([
+                'booking_id' => $booking->id,
+                'booking_item_id' => $isTargetAddon ? $targetItem->id : null,
+                'extended_by' => $user->id,
+                'adjustment_type' => $direction,
+                'hours_delta' => $signedDelta,
+                'fee_delta' => $feeDelta,
+                'reason' => $validated['reason'] ?? null,
+                'manager_approved_by' => $managerApprovedBy,
+                'previous_end_at' => $previousEndAt,
+                'new_end_at' => $newEndAt,
+                'additional_hours' => abs($signedDelta),
+                'additional_fee' => max(0, $feeDelta),
+            ]);
+
+            // Immutable Audit Log
+            AuditLogService::log(
+                $user,
+                $direction === 'increase' ? 'booking.duration_increased' : 'booking.duration_reduced',
+                'RentalExtension',
+                $extension->id,
+                [
+                    'booking_code' => $booking->booking_code,
+                    'target' => $isTargetAddon ? 'addon' : 'primary',
+                    'item_name' => $targetModel->name,
+                    'hours_delta' => $signedDelta,
+                    'fee_delta' => $feeDelta,
+                    'new_total_bill' => $newTotalBill,
+                    'new_end_at' => $newEndAt->toDateTimeString(),
+                    'refund_issued' => $paymentTx?->type === 'refund',
+                    'manager_approved_by' => $managerApprovedBy,
+                ],
+                [
+                    'previous_end_at' => $previousEndAt->toDateTimeString(),
+                ],
+                $request->ip(),
+                $booking->affiliate_id
+            );
+
+            $actionText = ($direction === 'increase') ? 'ditambah' : 'dikurangi';
+            $targetText = $isTargetAddon ? "add-on {$targetModel->name}" : "perangkat utama {$targetModel->name}";
+
+            return response()->json([
+                'success' => true,
+                'message' => "Durasi sewa {$targetText} berhasil {$actionText} {$hoursDelta} jam.",
+                'data' => [
+                    'booking' => $booking->fresh(['items.asset.model.category', 'extensions', 'payments.paymentMethod']),
+                    'adjustment' => $extension,
+                    'payment' => $paymentTx,
+                    'fee_delta' => $feeDelta,
+                    'new_end_at' => $newEndAt->toIso8601String(),
+                ],
+            ]);
+        });
+    }
+
+    /**
      * Process return inspection, enforce iCloud check, calculate penalty.
      */
     public function processReturn(Request $request, int $id): JsonResponse
@@ -474,11 +964,17 @@ class BookingController extends Controller
             'penalty_payment_method_id' => 'nullable|exists:payment_methods,id',
             'cash_received' => 'nullable|numeric|min:0',
             'staff_notes' => 'nullable|string',
+            'idempotency_key' => 'nullable|string|max:64',
         ]);
 
         $booking = Booking::with('items.asset.model')->findOrFail($id);
 
-        $inspection = $this->returnService->processReturn($booking, $request->all(), $request->user());
+        $data = $request->all();
+        if ($request->hasHeader('X-Idempotency-Key') && empty($data['idempotency_key'])) {
+            $data['idempotency_key'] = $request->header('X-Idempotency-Key');
+        }
+
+        $inspection = $this->returnService->processReturn($booking, $data, $request->user());
 
         return response()->json([
             'success' => true,

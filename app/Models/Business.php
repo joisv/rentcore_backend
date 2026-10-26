@@ -113,4 +113,9 @@ class Business extends Model
     {
         return $this->hasMany(AssetModel::class);
     }
+
+    public function resignationRequests(): HasMany
+    {
+        return $this->hasMany(StaffResignationRequest::class);
+    }
 }

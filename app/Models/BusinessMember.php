@@ -45,6 +45,11 @@ class BusinessMember extends Model
         return $this->hasMany(BranchMember::class);
     }
 
+    public function resignationRequests(): HasMany
+    {
+        return $this->hasMany(StaffResignationRequest::class);
+    }
+
     public function isOwner(): bool
     {
         return $this->role === 'owner';

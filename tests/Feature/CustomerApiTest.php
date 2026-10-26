@@ -22,6 +22,7 @@ class CustomerApiTest extends TestCase
     {
         parent::setUp();
         Storage::fake('public');
+        Storage::fake('local');
 
         $this->affiliate = Affiliate::create([
             'name' => 'Branch Mataram',
@@ -161,7 +162,7 @@ class CustomerApiTest extends TestCase
             ]);
 
         $this->assertNotNull($response->json('data.file_path'));
-        Storage::disk('public')->assertExists($response->json('data.file_path'));
+        Storage::disk('local')->assertExists($response->json('data.file_path'));
 
         $this->assertDatabaseHas('audit_logs', [
             'action' => 'customer_identity_uploaded',
