@@ -530,6 +530,11 @@ class CashierController extends Controller
             'refund' => ['label' => 'Pengembalian Dana / Titipan Jaminan (Refund)', 'count' => 0, 'total' => 0.00],
         ];
 
+        // Pre-cache tenant affiliates to avoid in-loop queries
+        $affiliatesMap = $businessId
+            ? \App\Models\Affiliate::where('business_id', $businessId)->get()->keyBy('id')
+            : collect();
+
         foreach ($txSummaryList as $tx) {
             // Exclude void transactions from revenue calculations
             if (($tx->status ?? 'completed') === 'void') {
@@ -580,7 +585,7 @@ class CashierController extends Controller
             $bId = $tx->branch_id ?? $tx->booking?->affiliate_id;
             if ($bId !== null) {
                 if (!isset($branchStats[$bId])) {
-                    $branchModel = \App\Models\Affiliate::find($bId);
+                    $branchModel = $affiliatesMap->get($bId) ?? \App\Models\Affiliate::find($bId);
                     $bName = $branchModel?->name ?? ($tx->booking?->affiliate?->name ?? ('Cabang #' . $bId));
                     $bCode = $branchModel?->code ?? ($tx->booking?->affiliate?->code ?? 'CBG');
                     $isCentral = (bool)($branchModel?->is_central ?? ($tx->booking?->affiliate?->is_central ?? false));

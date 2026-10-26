@@ -41,36 +41,41 @@ class CheckOverdueRentalsCommand extends Command
 
         $this->info("Scanning active bookings with return deadline earlier than {$cutoffTime->toDateTimeString()} (Grace period: {$graceMinutes}m)...");
 
-        // 1. Scan Overdue Rentals
-        $overdueBookings = Booking::withoutGlobalScopes()
+        // 1. Scan Overdue Rentals (Chunked to prevent memory exhaustion at SaaS scale)
+        $totalOverdueScanned = 0;
+        $overdueAlertCount = 0;
+
+        Booking::withoutGlobalScopes()
             ->with(['customer', 'affiliate'])
             ->where('status', 'rented')
             ->where('end_at', '<', $cutoffTime)
-            ->get();
+            ->chunkById(100, function ($overdueBookings) use (&$overdueAlertCount, &$totalOverdueScanned) {
+                foreach ($overdueBookings as $booking) {
+                    $totalOverdueScanned++;
+                    $overdueHours = max(1, (int) ceil(Carbon::now()->diffInMinutes($booking->end_at) / 60));
+                    $notifs = $this->notificationService->notifyRentalOverdue($booking, $overdueHours);
+                    if (!empty($notifs)) {
+                        $overdueAlertCount += count($notifs);
+                        $this->line(" [OVERDUE ALERT] Booking {$booking->booking_code} ({$booking->customer?->name}) overdue by {$overdueHours}h -> Notified.");
+                    }
+                }
+            });
 
-        $overdueAlertCount = 0;
+        $this->info("Overdue check complete. Sent {$overdueAlertCount} notification(s) across {$totalOverdueScanned} overdue rental(s).");
 
-        foreach ($overdueBookings as $booking) {
-            $overdueHours = max(1, (int) ceil(Carbon::now()->diffInMinutes($booking->end_at) / 60));
-            $notifs = $this->notificationService->notifyRentalOverdue($booking, $overdueHours);
-            if (!empty($notifs)) {
-                $overdueAlertCount += count($notifs);
-                $this->line(" [OVERDUE ALERT] Booking {$booking->booking_code} ({$booking->customer?->name}) overdue by {$overdueHours}h -> Notified.");
-            }
-        }
-
-        $this->info("Overdue check complete. Sent {$overdueAlertCount} notification(s) across {$overdueBookings->count()} overdue rental(s).");
-
-        // 2. Scan Low Inventory Fleet Alerts
+        // 2. Scan Low Inventory Fleet Alerts (Single grouped aggregation query)
         $this->info("Scanning branch fleet inventory for low stock alerts...");
         $branches = Affiliate::where('is_active', true)->get();
         $lowFleetAlertCount = 0;
 
+        $readyStockCounts = Asset::withoutGlobalScopes()
+            ->where('status', 'ready')
+            ->select('affiliate_id', \Illuminate\Support\Facades\DB::raw('count(*) as total'))
+            ->groupBy('affiliate_id')
+            ->pluck('total', 'affiliate_id');
+
         foreach ($branches as $branch) {
-            $readyCount = Asset::withoutGlobalScopes()
-                ->where('affiliate_id', $branch->id)
-                ->where('status', 'ready')
-                ->count();
+            $readyCount = (int) ($readyStockCounts[$branch->id] ?? 0);
 
             if ($readyCount <= 1) {
                 $notifs = $this->notificationService->notifyLowFleetStock($branch, $readyCount);

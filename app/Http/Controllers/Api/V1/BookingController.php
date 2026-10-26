@@ -781,9 +781,13 @@ class BookingController extends Controller
                     }
 
                     $datePrefix = Carbon::now()->format('ymd');
-                    $txNextId = ((int)PaymentTransaction::max('id')) + 1;
-                    $txCode = sprintf('TX-EXT-%s-%05d', $datePrefix, $txNextId);
-                    $receiptNumber = sprintf('REC-EXT-%s-%s-%05d', $booking->affiliate->code ?? 'PST', $datePrefix, $txNextId);
+                    $countToday = PaymentTransaction::withoutGlobalScopes()
+                        ->where('business_id', $booking->business_id ?? $user->business_id)
+                        ->whereDate('transacted_at', Carbon::today())
+                        ->count() + 1;
+                    $randomSuffix = strtoupper(\Illuminate\Support\Str::random(3));
+                    $txCode = sprintf('TX-EXT-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                    $receiptNumber = sprintf('REC-EXT-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(4)));
 
                     $paymentTx = PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? $user->business_id,
@@ -860,9 +864,13 @@ class BookingController extends Controller
 
                     // Record Outflow Refund PaymentTransaction
                     $datePrefix = Carbon::now()->format('ymd');
-                    $refNextId = ((int)PaymentTransaction::max('id')) + 1;
-                    $txCode = sprintf('TX-REF-%s-%05d', $datePrefix, $refNextId);
-                    $receiptNumber = sprintf('REC-REF-%s-%s-%05d', $booking->affiliate->code ?? 'PST', $datePrefix, $refNextId);
+                    $countToday = PaymentTransaction::withoutGlobalScopes()
+                        ->where('business_id', $booking->business_id ?? $user->business_id)
+                        ->whereDate('transacted_at', Carbon::today())
+                        ->count() + 1;
+                    $randomSuffix = strtoupper(\Illuminate\Support\Str::random(3));
+                    $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                    $receiptNumber = sprintf('REC-REF-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(4)));
                     $latestPaymentId = $booking->payments()->where('direction', 'inflow')->latest('id')->value('id');
 
                     $paymentMethodId = $request->payment_method_id ?? $booking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id') ?? 1;
