@@ -2,11 +2,13 @@
 
 namespace App\Services;
 
+use App\Models\Booking;
 use App\Models\Business;
 use App\Models\InventoryTransfer;
 use App\Models\StaffResignationRequest;
 use App\Models\TenantNotification;
 use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
 
 class NotificationService
@@ -386,5 +388,105 @@ class NotificationService
             ],
             "resignation.decided:{$resignation->id}:{$resignation->status}"
         );
+    }
+
+    /**
+     * Triggered when a rental booking exceeds its scheduled return time plus grace period.
+     */
+    public function notifyRentalOverdue(Booking $booking, int $overdueHours): array
+    {
+        $notifications = [];
+        $business = Business::find($booking->business_id);
+        if (!$business) {
+            return [];
+        }
+
+        $customerName = $booking->customer?->name ?? 'Pelanggan';
+        $customerPhone = $booking->customer?->phone ?? '-';
+        $todayDate = Carbon::today()->format('Y-m-d');
+        $dedupPrefix = "rental.overdue:{$booking->id}:{$todayDate}";
+
+        $title = "Unit Sewa Overdue ({$overdueHours} Jam)";
+        $body = "Booking {$booking->booking_code} oleh {$customerName} ({$customerPhone}) telah melewati jadwal kembali selama {$overdueHours} jam. Segera hubungi pelanggan untuk proses pengembalian atau perpanjangan sewa.";
+
+        $actionPayload = [
+            'booking_id' => $booking->id,
+            'booking_code' => $booking->booking_code,
+            'customer_name' => $customerName,
+            'customer_phone' => $customerPhone,
+            'overdue_hours' => $overdueHours,
+        ];
+
+        // 1. Notify Owner
+        if ($business->owner_id) {
+            $notifOwner = $this->notify(
+                $booking->business_id,
+                $booking->affiliate_id,
+                $business->owner_id,
+                'rental',
+                'rental.overdue',
+                $title,
+                $body,
+                '/bookings',
+                $actionPayload,
+                "{$dedupPrefix}:{$business->owner_id}"
+            );
+            if ($notifOwner) {
+                $notifications[] = $notifOwner;
+            }
+        }
+
+        // 2. Notify assigned branch staff / creator
+        if ($booking->created_by && $booking->created_by !== $business->owner_id) {
+            $notifCreator = $this->notify(
+                $booking->business_id,
+                $booking->affiliate_id,
+                $booking->created_by,
+                'rental',
+                'rental.overdue',
+                $title,
+                $body,
+                '/bookings',
+                $actionPayload,
+                "{$dedupPrefix}:{$booking->created_by}"
+            );
+            if ($notifCreator) {
+                $notifications[] = $notifCreator;
+            }
+        }
+
+        return $notifications;
+    }
+
+    /**
+     * Triggered when a branch's ready inventory drops to zero or critically low.
+     */
+    public function notifyLowFleetStock(\App\Models\Affiliate $branch, int $readyCount): array
+    {
+        $business = Business::find($branch->business_id);
+        if (!$business || !$business->owner_id) {
+            return [];
+        }
+
+        $todayDate = Carbon::today()->format('Y-m-d');
+        $dedupKey = "inventory.low_stock:{$branch->id}:{$todayDate}:{$business->owner_id}";
+
+        $title = "Stok Siap Sewa Menipis ({$branch->name})";
+        $body = "Cabang {$branch->name} ({$branch->code}) saat ini hanya memiliki {$readyCount} unit siap sewa. Pertimbangkan mutasi unit dari cabang lain untuk memenuhi permintaan sewa.";
+
+        $notif = $this->notify(
+            $branch->business_id,
+            $branch->id,
+            $business->owner_id,
+            'system',
+            'inventory.low_stock',
+            $title,
+            $body,
+            '/inventory',
+            ['branch_id' => $branch->id, 'ready_count' => $readyCount],
+            $dedupKey
+        );
+
+        return $notif ? [$notif] : [];
     }
 }
