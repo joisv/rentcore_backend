@@ -197,7 +197,7 @@ class ReturnService
                             'amount' => $amountToPay,
                             'cash_received' => $cashReceived,
                             'cash_change' => $cashChange,
-                            'notes' => 'Pembayaran denda keterlambatan/kerusakan unit',
+                            'notes' => !empty($data['staff_notes']) ? $data['staff_notes'] : 'Pembayaran denda keterlambatan/kerusakan unit',
                             'transacted_at' => Carbon::now(),
                         ]);
                     } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
@@ -280,7 +280,7 @@ class ReturnService
                 $booking->affiliate_id
             );
 
-            return $returnInspection->load('booking.items.asset.model', 'inspector');
+            return $returnInspection->load('booking.items.asset.model', 'booking.payments.paymentMethod', 'inspector');
         });
     }
 }
