@@ -15,6 +15,7 @@ use App\Services\BookingService;
 use App\Services\ExchangeService;
 use App\Services\PricingService;
 use App\Services\ReturnService;
+use App\Services\ShiftEnforcementService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -402,7 +403,24 @@ class BookingController extends Controller
 
             if ($request->filled('payment_method_id')) {
                 $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
-                $isCash = strtoupper($paymentMethod->code) === 'CASH';
+                $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
+
+                $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $request->user()->affiliate_id);
+
+                // Enforce business & branch payment method availability
+                $business = Business::find($booking->business_id);
+                if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                    throw ValidationException::withMessages([
+                        'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                    ]);
+                }
+
+                $activeShift = ShiftEnforcementService::requireActiveShift(
+                    $branchId,
+                    $request->user(),
+                    $isCash,
+                    'memproses pembayaran perpanjangan sewa di kasir'
+                );
 
                 if ($isCash) {
                     $cashReceived = (float)($request->cash_received ?? $additionalFee);
@@ -433,6 +451,7 @@ class BookingController extends Controller
                     $paymentTx = PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? $request->user()->business_id,
                         'branch_id' => $booking->affiliate_id,
+                        'shift_id' => $activeShift->id,
                         'status' => 'completed',
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
@@ -765,7 +784,24 @@ class BookingController extends Controller
                 // Additional Payment Needed (Price Increased)
                 if ($request->filled('payment_method_id')) {
                     $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
-                    $isCash = strtoupper($paymentMethod->code) === 'CASH';
+                    $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
+
+                    $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
+
+                    // Enforce business & branch payment method availability
+                    $business = Business::find($booking->business_id);
+                    if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                        throw ValidationException::withMessages([
+                            'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                        ]);
+                    }
+
+                    $activeShift = ShiftEnforcementService::requireActiveShift(
+                        $branchId,
+                        $user,
+                        $isCash,
+                        'memproses biaya penambahan durasi sewa di kasir'
+                    );
 
                     if ($isCash) {
                         $cashReceived = (float)($request->cash_received ?? $feeDelta);
@@ -792,6 +828,7 @@ class BookingController extends Controller
                     $paymentTx = PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? $user->business_id,
                         'branch_id' => $booking->affiliate_id,
+                        'shift_id' => $activeShift->id,
                         'status' => 'completed',
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
@@ -825,7 +862,23 @@ class BookingController extends Controller
                         ]);
                     }
 
-                    $branchId = $booking->affiliate_id;
+                    $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
+
+                    // Enforce business & branch payment method availability
+                    $business = Business::find($booking->business_id);
+                    if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                        throw ValidationException::withMessages([
+                            'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                        ]);
+                    }
+
+                    $activeShift = ShiftEnforcementService::requireActiveShift(
+                        $branchId,
+                        $user,
+                        true,
+                        'mengeluarkan pengembalian dana (refund) dari laci kasir'
+                    );
+
                     $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
 
                     if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
@@ -878,6 +931,7 @@ class BookingController extends Controller
                     $paymentTx = PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? $user->business_id,
                         'branch_id' => $booking->affiliate_id,
+                        'shift_id' => $activeShift->id,
                         'status' => 'completed',
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,

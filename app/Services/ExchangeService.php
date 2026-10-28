@@ -10,6 +10,7 @@ use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\RentalUnitExchange;
 use App\Models\User;
+use App\Services\ShiftEnforcementService;
 use Carbon\Carbon;
 use Exception;
 use Illuminate\Support\Facades\DB;
@@ -337,7 +338,24 @@ class ExchangeService
                 }
 
                 $paymentMethod = PaymentMethod::findOrFail($data['payment_method_id']);
-                $isCash = strtoupper($paymentMethod->code) === 'CASH';
+                $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
+
+                $branchId = (int)($booking->affiliate_id ?? $cashier->affiliate_id);
+
+                // Enforce business & branch payment method availability
+                $business = \App\Models\Business::find($booking->business_id);
+                if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                    throw ValidationException::withMessages([
+                        'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                    ]);
+                }
+
+                $activeShift = ShiftEnforcementService::requireActiveShift(
+                    $branchId,
+                    $cashier,
+                    $isCash,
+                    'memproses pembayaran selisih tukar unit di meja kasir'
+                );
 
                 if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $payableDifferential) {
                     throw ValidationException::withMessages([
@@ -361,6 +379,7 @@ class ExchangeService
                 $paymentTx = PaymentTransaction::create([
                     'business_id' => $booking->business_id,
                     'branch_id' => $booking->affiliate_id,
+                    'shift_id' => $activeShift->id,
                     'transaction_code' => $txCode,
                     'receipt_number' => $receiptNumber,
                     'booking_id' => $booking->id,

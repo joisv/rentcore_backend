@@ -4,11 +4,13 @@ namespace App\Services;
 
 use App\Models\Asset;
 use App\Models\Booking;
+use App\Models\CashDrawerShift;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\PricingTier;
 use App\Models\ReturnInspection;
 use App\Models\User;
+use App\Services\ShiftEnforcementService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -61,10 +63,20 @@ class ReturnService
             }
 
             $checklist = $data['checklist_results'] ?? [];
+            $isQuarantined = !empty($checklist['account_quarantined']) || ($checklist['account_status'] ?? '') === 'quarantined';
+
             if ($requiresFrp && empty($checklist['icloud_removed'])) {
-                throw ValidationException::withMessages([
-                    'checklist' => ['Akun iCloud / Apple ID / Google FRP wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses.'],
-                ]);
+                if (!$isQuarantined) {
+                    throw ValidationException::withMessages([
+                        'checklist' => ['Akun iCloud / Apple ID / Google FRP wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
+                    ]);
+                }
+
+                if (empty($data['staff_notes']) && empty($checklist['quarantine_notes'])) {
+                    throw ValidationException::withMessages([
+                        'staff_notes' => ['Catatan staf wajib diisi untuk mendokumentasikan alasan karantina akun dan rencana tindak lanjut.'],
+                    ]);
+                }
             }
 
             $returnedAt = !empty($data['returned_at']) ? Carbon::parse($data['returned_at']) : Carbon::now();
@@ -101,6 +113,51 @@ class ReturnService
             $totalPenalty = $lateFee + $damageFee;
             $depositRefunded = max(0, (float)$booking->deposit_fee - $totalPenalty);
 
+            // Pre-validate Cash Shift & Cash Tender if penalty is being paid immediately or refund is owed
+            $paymentMethod = null;
+            $isCash = false;
+            $activeShift = null;
+            $branchId = (int)($inspector->affiliate_id ?? $booking->affiliate_id ?? $booking->branch_id);
+
+            if ($depositRefunded > 0) {
+                $activeShift = ShiftEnforcementService::requireActiveShift(
+                    $branchId,
+                    $inspector,
+                    true,
+                    'mengeluarkan uang titipan jaminan sewa (deposit refund) dari laci kasir'
+                );
+            }
+
+            if ($totalPenalty > 0 && !empty($data['penalty_payment_method_id'])) {
+                $paymentMethod = PaymentMethod::findOrFail($data['penalty_payment_method_id']);
+                $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
+
+                // Enforce business & branch payment method availability
+                $business = \App\Models\Business::find($booking->business_id);
+                if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                    throw ValidationException::withMessages([
+                        'penalty_payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                    ]);
+                }
+
+                // Cash Shift Guard: Enforce active shift before accepting penalty payment
+                $activeShift = ShiftEnforcementService::requireActiveShift(
+                    $branchId,
+                    $inspector,
+                    $isCash,
+                    'menerima pembayaran denda pengembalian unit di kasir'
+                );
+
+                if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $totalPenalty) {
+                    throw ValidationException::withMessages([
+                        'cash_received' => [
+                            'Jumlah uang tunai yang diterima (Rp ' . number_format((float)$data['cash_received'], 0, ',', '.') . 
+                            ') kurang dari total tagihan denda (Rp ' . number_format($totalPenalty, 0, ',', '.') . ').'
+                        ],
+                    ]);
+                }
+            }
+
             // 3. Create ReturnInspection Record
             $conditionGrade = $data['condition_grade'] ?? 'A';
             $returnInspection = ReturnInspection::create([
@@ -130,9 +187,9 @@ class ReturnService
                 'payment_status' => $newPaymentStatus,
             ]);
 
-            // 5. Update Asset Status for active items only (ready if grade A/B without damage, maintenance if damaged)
+            // 5. Update Asset Status for active items only (ready if grade A/B without damage, maintenance if damaged or account quarantined)
             // Exchanged units in maintenance must remain in maintenance!
-            $newAssetStatus = ($damageFee > 0 || $conditionGrade === 'C') ? 'maintenance' : 'ready';
+            $newAssetStatus = ($damageFee > 0 || $conditionGrade === 'C' || $isQuarantined) ? 'maintenance' : 'ready';
             $itemsToReturn = $booking->items->filter(fn ($it) => $it->status === 'active' || $it->status === null);
             if ($itemsToReturn->isEmpty()) {
                 $itemsToReturn = $booking->items;
@@ -156,19 +213,7 @@ class ReturnService
                     ->first();
 
                 if (!$existingPenaltyTx) {
-                    $paymentMethod = PaymentMethod::findOrFail($data['penalty_payment_method_id']);
-                    $isCash = strtoupper($paymentMethod->code) === 'CASH';
                     $amountToPay = $totalPenalty;
-
-                    if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $amountToPay) {
-                        throw ValidationException::withMessages([
-                            'cash_received' => [
-                                'Jumlah uang tunai yang diterima (Rp ' . number_format((float)$data['cash_received'], 0, ',', '.') . 
-                                ') kurang dari total tagihan denda (Rp ' . number_format($amountToPay, 0, ',', '.') . ').'
-                            ],
-                        ]);
-                    }
-
                     $cashReceived = $isCash ? (float)($data['cash_received'] ?? $amountToPay) : $amountToPay;
                     $cashChange = $isCash ? max(0, $cashReceived - $amountToPay) : 0.00;
 
@@ -185,6 +230,7 @@ class ReturnService
                         PaymentTransaction::create([
                             'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
                             'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
+                            'shift_id' => $activeShift?->id,
                             'transaction_code' => $txCode,
                             'receipt_number' => $receiptNumber,
                             'idempotency_key' => $idempotencyKey,
@@ -240,6 +286,7 @@ class ReturnService
                     PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
                         'branch_id' => $inspector->affiliate_id ?? $booking->affiliate_id,
+                        'shift_id' => $activeShift?->id,
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
                         'booking_id' => $booking->id,

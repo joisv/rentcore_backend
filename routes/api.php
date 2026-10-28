@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\V1\CustomerController;
 use App\Http\Controllers\Api\V1\DashboardController;
 use App\Http\Controllers\Api\V1\ExpenseController;
 use App\Http\Controllers\Api\V1\NotificationController;
+use App\Http\Controllers\Api\V1\PaymentSettingsController;
 use App\Http\Controllers\Api\V1\ProductController;
 use App\Http\Controllers\Api\V1\ResignationController;
 use App\Http\Controllers\Api\V1\ShiftController;
@@ -110,6 +111,13 @@ Route::prefix('v1')->group(function () {
             Route::delete('/assets/{id}', [AssetController::class, 'destroy']);
             Route::get('/assets/{id}/availability', [AssetController::class, 'checkAvailability']);
 
+            // Mobile Device Catalog Aliases (Compatible with /iphones endpoints)
+            Route::get('/iphones', [AssetController::class, 'index']);
+            Route::get('/iphones/available', [AssetController::class, 'index']);
+            Route::post('/iphones', [AssetController::class, 'store']);
+            Route::put('/iphones/{id}', [AssetController::class, 'update']);
+            Route::delete('/iphones/{id}', [AssetController::class, 'destroy']);
+
             // Inter-Affiliate Stock Transfers
             Route::get('/transfers', [TransferController::class, 'index']);
             Route::post('/transfers', [TransferController::class, 'store']);
@@ -155,15 +163,26 @@ Route::prefix('v1')->group(function () {
             Route::post('/cashier/transactions/{id}/void', [CashierController::class, 'voidTransaction']);
             Route::get('/cashier/transactions/{id}/receipt', [CashierController::class, 'receipt']);
 
+            // Configurable Payment Methods & Static QRIS Settings
+            Route::get('/payment-settings', [PaymentSettingsController::class, 'getSettings']);
+            Route::put('/payment-settings', [PaymentSettingsController::class, 'updateSettings']);
+            Route::get('/payment-settings/qris-image', [PaymentSettingsController::class, 'getQrisImage']);
+
             // Branch Operating Expenses
             Route::get('/cashier/expenses', [ExpenseController::class, 'index']);
             Route::post('/cashier/expenses', [ExpenseController::class, 'store']);
             Route::get('/cashier/expenses/{id}/receipt-file', [ExpenseController::class, 'getReceiptFile']);
             Route::post('/cashier/expenses/{id}/approve', [ExpenseController::class, 'approve']);
             Route::post('/cashier/expenses/{id}/void', [ExpenseController::class, 'voidExpense']);
+            Route::get('/expenses', [ExpenseController::class, 'index']);
+            Route::post('/expenses', [ExpenseController::class, 'store']);
+            Route::delete('/expenses/{id}', [ExpenseController::class, 'voidExpense']);
 
             // Cash Drawer Shifts
             Route::get('/cashier/shift/current', [ShiftController::class, 'currentShift']);
+            Route::get('/cashier/shift/history', [ShiftController::class, 'history']);
+            Route::get('/cashier/shift/schedule', [ShiftController::class, 'getSchedule']);
+            Route::put('/cashier/shift/schedule', [ShiftController::class, 'updateSchedule']);
             Route::post('/cashier/shift/open', [ShiftController::class, 'openShift']);
             Route::post('/cashier/shift/close', [ShiftController::class, 'closeShift']);
         });

@@ -13,6 +13,7 @@ class PaymentTransaction extends Model
     protected $fillable = [
         'business_id',
         'branch_id',
+        'shift_id',
         'transaction_code',
         'receipt_number',
         'external_reference',
@@ -73,6 +74,11 @@ class PaymentTransaction extends Model
     public function branch(): BelongsTo
     {
         return $this->belongsTo(Affiliate::class, 'branch_id');
+    }
+
+    public function shift(): BelongsTo
+    {
+        return $this->belongsTo(CashDrawerShift::class, 'shift_id');
     }
 
     public function reversalOf(): BelongsTo

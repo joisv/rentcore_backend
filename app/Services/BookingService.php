@@ -15,6 +15,7 @@ use App\Models\PricingTier;
 use App\Models\User;
 use App\Models\Voucher;
 use App\Models\VoucherUsage;
+use App\Services\ShiftEnforcementService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Exception;
@@ -127,6 +128,26 @@ class BookingService
                             'affiliate_id' => ['Akses cabang ditolak. Anda tidak ditugaskan di cabang ini.'],
                         ]);
                     }
+                }
+            }
+
+            // Shift Enforcement Check: Ensure Cash Drawer Shift is OPEN before booking and receiving cash
+            $business = $affiliate->business ?? ($businessId ? \App\Models\Business::find($businessId) : null);
+            $shiftSchedule = $business?->getShiftSchedule((int)$affiliate->id);
+            $enforceShift = $shiftSchedule['shift_enforcement_enabled'] ?? true;
+
+            if ($enforceShift) {
+                $activeShift = \App\Models\CashDrawerShift::where('branch_id', $affiliate->id)
+                    ->where('status', 'open')
+                    ->first();
+
+                if (!$activeShift) {
+                    throw ValidationException::withMessages([
+                        'shift' => [
+                            'Shift kasir belum dibuka untuk cabang ini. ' .
+                            'Buka shift kasir terlebih dahulu sebelum melayani dan memproses transaksi sewa baru.'
+                        ],
+                    ]);
                 }
             }
 
@@ -508,7 +529,23 @@ class BookingService
 
             // 10. Record Single Source of Truth Payment Transaction
             $paymentMethod = PaymentMethod::findOrFail($data['payment_method_id']);
-            $isCash = strtoupper($paymentMethod->code) === 'CASH';
+            $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
+
+            // Enforce business & branch payment method availability
+            $business = Business::find($businessId);
+            if ($business && !$business->isPaymentMethodEnabled($paymentMethod, (int)$affiliateId)) {
+                throw ValidationException::withMessages([
+                    'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+                ]);
+            }
+
+            // Enforce Active Cash Shift before committing direct rental payment
+            $activeShift = ShiftEnforcementService::requireActiveShift(
+                (int)$affiliateId,
+                $cashier,
+                $isCash,
+                'memproses transaksi sewa langsung di meja kasir'
+            );
 
             if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $totalBill) {
                 throw ValidationException::withMessages([
@@ -532,6 +569,7 @@ class BookingService
             PaymentTransaction::create([
                 'business_id' => $businessId,
                 'branch_id' => $affiliateId,
+                'shift_id' => $activeShift->id,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'booking_id' => $booking->id,

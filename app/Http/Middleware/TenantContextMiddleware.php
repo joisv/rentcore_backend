@@ -27,6 +27,21 @@ class TenantContextMiddleware
             return $next($request);
         }
 
+        // Auto-resolve business ID if not explicitly specified
+        if (empty($businessId)) {
+            $candidateBranchId = $request->header('X-Branch-Id') 
+                ?? $request->get('branch_id') 
+                ?? ($request->isMethod('GET') ? $request->get('affiliate_id') : null)
+                ?? $user->affiliate_id;
+
+            if ($candidateBranchId) {
+                $branchRec = Affiliate::withoutGlobalScopes()->find($candidateBranchId);
+                if ($branchRec && $branchRec->business_id) {
+                    $businessId = $branchRec->business_id;
+                }
+            }
+        }
+
         // Auto-resolve if only 1 active business and no header specified
         if (empty($businessId)) {
             $userMemberships = BusinessMember::where('user_id', $user->id)

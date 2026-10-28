@@ -210,7 +210,7 @@ class ProductController extends Controller
 
         $slug = !empty($validated['slug']) 
             ? Str::slug($validated['slug']) 
-            : Str::slug($validated['brand'] . ' ' . $validated['name'] . ' ' . ($validated['storage_capacity'] ?? ''));
+            : Str::slug(trim($validated['brand'] . ' ' . $validated['name'] . (!empty($validated['storage_capacity']) ? ' ' . $validated['storage_capacity'] : '')));
 
         // Ensure unique slug fallback per business
         if (AssetModel::where('business_id', $businessId)->where('slug', $slug)->exists()) {

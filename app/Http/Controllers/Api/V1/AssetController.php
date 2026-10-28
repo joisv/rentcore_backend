@@ -101,6 +101,8 @@ class AssetController extends Controller
             $query->where(function ($q) use ($search) {
                 $q->where('asset_code', 'like', "%{$search}%")
                   ->orWhere('serial_number', 'like', "%{$search}%")
+                  ->orWhere('imei_1', 'like', "%{$search}%")
+                  ->orWhere('imei_2', 'like', "%{$search}%")
                   ->orWhereHas('model', function ($mq) use ($search) {
                       $mq->where('name', 'like', "%{$search}%");
                   });
@@ -232,6 +234,11 @@ class AssetController extends Controller
             }
         }
 
+        $model = AssetModel::withoutGlobalScopes()->find($request->model_id);
+        $serialRule = ($model && $model->has_serial_number === false)
+            ? 'nullable'
+            : 'required';
+
         $validated = $request->validate([
             'model_id' => [
                 'required',
@@ -252,7 +259,7 @@ class AssetController extends Controller
                 }),
             ],
             'serial_number' => [
-                'required',
+                $serialRule,
                 'string',
                 'max:100',
                 \Illuminate\Validation\Rule::unique('assets', 'serial_number')->where(function ($q) use ($businessId) {
@@ -273,12 +280,12 @@ class AssetController extends Controller
             'affiliate_id' => $affiliateId,
             'model_id' => $validated['model_id'],
             'asset_code' => strtoupper(trim($validated['asset_code'])),
-            'serial_number' => strtoupper(trim($validated['serial_number'])),
+            'serial_number' => !empty($validated['serial_number']) ? strtoupper(trim($validated['serial_number'])) : null,
             'imei_1' => $validated['imei_1'] ?? null,
             'imei_2' => $validated['imei_2'] ?? null,
             'status' => 'ready',
             'condition_grade' => $validated['condition_grade'] ?? 'A',
-            'battery_health' => $validated['battery_health'] ?? 100,
+            'battery_health' => (isset($validated['battery_health']) && $validated['battery_health'] !== '') ? (int)$validated['battery_health'] : null,
             'notes' => $validated['notes'] ?? null,
         ]);
 
@@ -425,7 +432,7 @@ class AssetController extends Controller
             $validated['asset_code'] = strtoupper(trim($validated['asset_code']));
         }
         if (isset($validated['serial_number'])) {
-            $validated['serial_number'] = strtoupper(trim($validated['serial_number']));
+            $validated['serial_number'] = !empty($validated['serial_number']) ? strtoupper(trim($validated['serial_number'])) : null;
         }
 
         return DB::transaction(function () use ($request, $asset, $validated) {

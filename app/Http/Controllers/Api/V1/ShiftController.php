@@ -64,7 +64,13 @@ class ShiftController extends Controller
         $now = Carbon::now();
 
         // Calculate real-time net cash within this shift
-        $cashPaymentQuery = PaymentTransaction::whereBetween('transacted_at', [$shiftStart, $now])
+        $cashPaymentQuery = PaymentTransaction::where(function ($sq) use ($activeShift, $shiftStart, $now) {
+                $sq->where('payment_transactions.shift_id', $activeShift->id)
+                   ->orWhere(function ($tsq) use ($shiftStart, $now) {
+                       $tsq->whereNull('payment_transactions.shift_id')
+                           ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
+                   });
+            })
             ->where('status', '!=', 'void')
             ->where(function ($q) use ($branchId) {
                 $q->where('payment_transactions.branch_id', $branchId)
@@ -176,10 +182,16 @@ class ShiftController extends Controller
         }
 
         $datePrefix = Carbon::now()->format('ymd');
-        $countToday = CashDrawerShift::withoutGlobalScopes()
-            ->whereDate('created_at', Carbon::today())
-            ->count() + 1;
-        $shiftNumber = sprintf('SHF-%s-%s-%04d', $branch->code ?? 'CBG', $datePrefix, $countToday);
+        $baseShiftNumber = sprintf('SHF-%s-%s', $branch->code ?? 'CBG', $datePrefix);
+        $latestShift = CashDrawerShift::withoutGlobalScopes()
+            ->where('shift_number', 'like', "{$baseShiftNumber}-%")
+            ->latest('id')
+            ->first();
+        $nextSeq = 1;
+        if ($latestShift && preg_match('/-(\d{4})$/', $latestShift->shift_number, $matches)) {
+            $nextSeq = (int)$matches[1] + 1;
+        }
+        $shiftNumber = sprintf('%s-%04d', $baseShiftNumber, $nextSeq);
 
         $shift = CashDrawerShift::create([
             'business_id' => $businessId ?? $branch->business_id,
@@ -210,9 +222,13 @@ class ShiftController extends Controller
                 'id' => $shift->id,
                 'shift_number' => $shift->shift_number,
                 'branch_id' => $shift->branch_id,
+                'branch_name' => $branch->name,
+                'opened_by' => $shift->opened_by,
+                'opened_by_name' => $user->name,
                 'opening_cash_float' => (float)$shift->opening_cash_float,
                 'opened_at' => $shift->opened_at->toIso8601String(),
                 'status' => $shift->status,
+                'closing_notes' => $shift->closing_notes,
             ],
         ], 201);
     }
@@ -256,7 +272,13 @@ class ShiftController extends Controller
         $branchId = $shift->branch_id;
 
         // Calculate cash inflow & refund during this shift
-        $cashPaymentQuery = PaymentTransaction::whereBetween('transacted_at', [$shiftStart, $now])
+        $cashPaymentQuery = PaymentTransaction::where(function ($sq) use ($shift, $shiftStart, $now) {
+                $sq->where('payment_transactions.shift_id', $shift->id)
+                   ->orWhere(function ($tsq) use ($shiftStart, $now) {
+                       $tsq->whereNull('payment_transactions.shift_id')
+                           ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
+                   });
+            })
             ->where('status', '!=', 'void')
             ->where(function ($q) use ($branchId) {
                 $q->where('payment_transactions.branch_id', $branchId)
@@ -344,5 +366,249 @@ class ShiftController extends Controller
                 'status' => $shift->status,
             ],
         ]);
+    }
+
+    /**
+     * Retrieve paginated history of closed and past cash drawer shifts.
+     */
+    public function history(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $branchId = $request->get('branch_id')
+            ?? $request->header('X-Branch-Id')
+            ?? $user?->affiliate_id;
+
+        $query = CashDrawerShift::with(['openedBy', 'closedBy', 'branch'])
+            ->orderBy('opened_at', 'desc');
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+
+        if ($branchId && !$request->boolean('all_branches')) {
+            $query->where('branch_id', $branchId);
+        }
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->get('status'));
+        }
+
+        $perPage = min(100, max(5, (int)$request->get('per_page', 20)));
+        $shifts = $query->paginate($perPage);
+
+        $formatted = $shifts->getCollection()->map(function ($s) {
+            return [
+                'id' => $s->id,
+                'shift_number' => $s->shift_number,
+                'branch_id' => $s->branch_id,
+                'branch_name' => $s->branch?->name,
+                'opened_by' => $s->opened_by,
+                'opened_by_name' => $s->openedBy?->name ?? 'Kasir',
+                'closed_by' => $s->closed_by,
+                'closed_by_name' => $s->closedBy?->name,
+                'opened_at' => $s->opened_at?->toIso8601String(),
+                'closed_at' => $s->closed_at?->toIso8601String(),
+                'opening_cash_float' => (float)$s->opening_cash_float,
+                'expected_cash_total' => $s->expected_cash_total !== null ? (float)$s->expected_cash_total : null,
+                'actual_cash_counted' => $s->actual_cash_counted !== null ? (float)$s->actual_cash_counted : null,
+                'cash_difference' => $s->cash_difference !== null ? (float)$s->cash_difference : null,
+                'difference_reason' => $s->difference_reason,
+                'status' => $s->status,
+                'closing_notes' => $s->closing_notes,
+                'created_at' => $s->created_at?->toIso8601String(),
+            ];
+        });
+
+        return response()->json([
+            'success' => true,
+            'data' => $formatted,
+            'meta' => [
+                'current_page' => $shifts->currentPage(),
+                'last_page' => $shifts->lastPage(),
+                'per_page' => $shifts->perPage(),
+                'total' => $shifts->total(),
+            ],
+        ]);
+    }
+
+    /**
+     * Retrieve the effective shift schedule and current operational status.
+     */
+    public function getSchedule(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $branchId = $request->get('branch_id')
+            ?? $request->header('X-Branch-Id')
+            ?? $user?->affiliate_id;
+
+        $business = \App\Models\Business::find($businessId);
+        if (!$business && $branchId) {
+            $branch = Affiliate::find($branchId);
+            $business = $branch?->business;
+        }
+
+        if (!$business) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Bisnis tidak ditemukan.',
+            ], 404);
+        }
+
+        $schedule = $business->getShiftSchedule($branchId ? (int)$branchId : null);
+        $timezone = $schedule['timezone'];
+        $now = Carbon::now($timezone);
+
+        $openingTime = $schedule['shift_opening_time'];
+        $closingTime = $schedule['shift_closing_time'];
+        $graceMinutes = $schedule['shift_grace_period_minutes'];
+        $isOvernight = $schedule['is_overnight'];
+
+        // Compute start and end datetime for today's operating cycle
+        if ($isOvernight) {
+            if ($now->format('H:i') < $closingTime) {
+                $shiftOpenDt = Carbon::parse($now->toDateString() . ' ' . $openingTime, $timezone)->subDay();
+                $shiftCloseDt = Carbon::parse($now->toDateString() . ' ' . $closingTime, $timezone);
+            } else {
+                $shiftOpenDt = Carbon::parse($now->toDateString() . ' ' . $openingTime, $timezone);
+                $shiftCloseDt = Carbon::parse($now->toDateString() . ' ' . $closingTime, $timezone)->addDay();
+            }
+        } else {
+            $shiftOpenDt = Carbon::parse($now->toDateString() . ' ' . $openingTime, $timezone);
+            $shiftCloseDt = Carbon::parse($now->toDateString() . ' ' . $closingTime, $timezone);
+        }
+
+        $overdueDt = $shiftCloseDt->copy()->addMinutes($graceMinutes);
+        $closingSoonDt = $shiftCloseDt->copy()->subMinutes(60);
+
+        // Check if there is an active open shift
+        $activeShift = CashDrawerShift::where('status', 'open')
+            ->when($branchId, fn($q) => $q->where('branch_id', $branchId))
+            ->latest('opened_at')
+            ->first();
+
+        $operationalState = 'not_opened';
+        $statusMessage = 'Shift belum dibuka untuk hari ini.';
+
+        if ($activeShift) {
+            if ($now->greaterThan($overdueDt)) {
+                $operationalState = 'closing_overdue';
+                $statusMessage = 'Shift kasir telah melewati batas jam tutup operasional (' . $closingTime . '). Segera lakukan tutup shift.';
+            } elseif ($now->greaterThanOrEqualTo($closingSoonDt)) {
+                $operationalState = 'closing_soon';
+                $statusMessage = 'Mendekati jam tutup operasional (' . $closingTime . '). Siapkan perhitungan kas fisik laci kasir.';
+            } else {
+                $operationalState = 'open';
+                $statusMessage = 'Shift kasir sedang aktif melayani transaksi.';
+            }
+        } else {
+            // Check if shift was closed today
+            $closedShiftToday = CashDrawerShift::where('status', 'closed')
+                ->when($branchId, fn($q) => $q->where('branch_id', $branchId))
+                ->whereBetween('closed_at', [$shiftOpenDt, $now])
+                ->latest('closed_at')
+                ->first();
+
+            if ($closedShiftToday && $now->greaterThanOrEqualTo($shiftCloseDt)) {
+                $operationalState = 'closed';
+                $statusMessage = 'Shift kasir untuk sesi ini telah ditutup.';
+            } elseif ($now->greaterThanOrEqualTo($shiftOpenDt)) {
+                $operationalState = 'opening_required';
+                $statusMessage = 'Jam operasional telah dimulai (' . $openingTime . '). Wajib membuka shift kasir sebelum memproses booking baru.';
+            } else {
+                $operationalState = 'not_opened';
+                $statusMessage = 'Belum memasuki jam operasional shift (' . $openingTime . ' - ' . $closingTime . ').';
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => array_merge($schedule, [
+                'current_time' => $now->toIso8601String(),
+                'scheduled_open_at' => $shiftOpenDt->toIso8601String(),
+                'scheduled_close_at' => $shiftCloseDt->toIso8601String(),
+                'overdue_threshold_at' => $overdueDt->toIso8601String(),
+                'operational_state' => $operationalState,
+                'status_message' => $statusMessage,
+                'has_active_shift' => $activeShift !== null,
+                'active_shift_id' => $activeShift?->id,
+            ]),
+        ]);
+    }
+
+    /**
+     * Update shift schedule configuration (Owner & Admin only).
+     */
+    public function updateSchedule(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+
+        if (!$isOwnerOrAdmin) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akses ditolak. Hanya Owner dan Admin yang dapat mengubah setelan jadwal shift.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'shift_enforcement_enabled' => 'nullable|boolean',
+            'shift_opening_time' => ['nullable', 'string', 'regex:/^(?:[01]\d|2[0-3]):[0-5]\d$/'],
+            'shift_closing_time' => ['nullable', 'string', 'regex:/^(?:[01]\d|2[0-3]):[0-5]\d$/'],
+            'shift_grace_period_minutes' => 'nullable|integer|min:0|max:240',
+            'branch_id' => 'nullable|integer|exists:affiliates,id',
+            'branch_opening_override' => ['nullable', 'string', 'regex:/^(?:[01]\d|2[0-3]):[0-5]\d$/'],
+            'branch_closing_override' => ['nullable', 'string', 'regex:/^(?:[01]\d|2[0-3]):[0-5]\d$/'],
+        ]);
+
+        $business = \App\Models\Business::findOrFail($businessId);
+
+        $updates = [];
+        if (isset($validated['shift_enforcement_enabled'])) {
+            $updates['shift_enforcement_enabled'] = (bool)$validated['shift_enforcement_enabled'];
+        }
+        if (!empty($validated['shift_opening_time'])) {
+            $updates['shift_opening_time'] = $validated['shift_opening_time'];
+        }
+        if (!empty($validated['shift_closing_time'])) {
+            $updates['shift_closing_time'] = $validated['shift_closing_time'];
+        }
+        if (isset($validated['shift_grace_period_minutes'])) {
+            $updates['shift_grace_period_minutes'] = (int)$validated['shift_grace_period_minutes'];
+        }
+
+        if (!empty($updates)) {
+            $business->update($updates);
+        }
+
+        if (!empty($validated['branch_id'])) {
+            $branch = Affiliate::where('id', $validated['branch_id'])
+                ->where('business_id', $businessId)
+                ->firstOrFail();
+
+            $branch->update([
+                'shift_opening_time_override' => $validated['branch_opening_override'] ?? null,
+                'shift_closing_time_override' => $validated['branch_closing_override'] ?? null,
+            ]);
+        }
+
+        AuditLogService::log(
+            $user,
+            'shift_schedule.updated',
+            'Business',
+            $business->slug,
+            $updates
+        );
+
+        return $this->getSchedule($request);
     }
 }

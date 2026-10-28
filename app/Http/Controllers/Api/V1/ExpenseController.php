@@ -8,6 +8,7 @@ use App\Models\BranchExpense;
 use App\Models\BusinessMember;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\ShiftEnforcementService;
 use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
@@ -154,7 +155,8 @@ class ExpenseController extends Controller
                     'total_expenses' => $totalExpenses,
                     'cash_drawer_expenses' => $cashDrawerExpenses,
                     'count' => $expenses->count(),
-                    'by_category' => $categoryBreakdown,
+                    'by_category' => empty($categoryBreakdown) ? (object)[] : $categoryBreakdown,
+                    'categories' => empty($categoryBreakdown) ? (object)[] : $categoryBreakdown,
                 ],
                 'expenses' => $expenses->map(function ($exp) {
                     return [
@@ -333,6 +335,12 @@ class ExpenseController extends Controller
 
         $disbursedAt = null;
         if ($status === 'approved' && $validated['payment_source'] === 'cash_drawer') {
+            ShiftEnforcementService::requireActiveShift(
+                (int)$branch->id,
+                $user,
+                true,
+                'mencairkan kas pengeluaran dari laci kasir'
+            );
             $status = 'disbursed';
             $disbursedAt = Carbon::now();
         }
@@ -398,6 +406,15 @@ class ExpenseController extends Controller
                 'success' => false,
                 'message' => 'Hanya Manager atau Owner yang berwenang menyetujui pengeluaran cabang.',
             ], 403);
+        }
+
+        if ($expense->payment_source === 'cash_drawer') {
+            ShiftEnforcementService::requireActiveShift(
+                (int)$expense->branch_id,
+                $user,
+                true,
+                'mencairkan kas pengeluaran dari laci kasir'
+            );
         }
 
         $newStatus = ($expense->payment_source === 'cash_drawer') ? 'disbursed' : 'approved';

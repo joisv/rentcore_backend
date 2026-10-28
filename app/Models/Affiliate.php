@@ -24,6 +24,9 @@ class Affiliate extends Model
         'cashier_discount_limit_percent',
         'cashier_discount_limit_nominal',
         'expense_pin_threshold_override',
+        'shift_opening_time_override',
+        'shift_closing_time_override',
+        'payment_methods_config_override',
         'is_active',
     ];
 
@@ -34,6 +37,7 @@ class Affiliate extends Model
         'cashier_discount_limit_percent' => 'decimal:2',
         'cashier_discount_limit_nominal' => 'decimal:2',
         'expense_pin_threshold_override' => 'decimal:2',
+        'payment_methods_config_override' => 'array',
     ];
 
     protected static function booted(): void

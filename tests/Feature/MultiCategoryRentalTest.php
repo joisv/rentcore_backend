@@ -22,17 +22,11 @@ class MultiCategoryRentalTest extends TestCase
     protected User $superAdmin;
     protected User $cashier;
     protected PaymentMethod $paymentMethod;
+    protected \App\Models\Business $business;
 
     protected function setUp(): void
     {
         parent::setUp();
-
-        $this->affiliate = Affiliate::create([
-            'code' => 'GNT',
-            'name' => 'Genteng Central Hub',
-            'slug' => 'genteng-central-hub',
-            'is_central' => true,
-        ]);
 
         $this->superAdmin = User::create([
             'name' => 'Super Administrator',
@@ -42,12 +36,42 @@ class MultiCategoryRentalTest extends TestCase
             'is_active' => true,
         ]);
 
+        $this->business = \App\Models\Business::create([
+            'name' => 'RentCore Central',
+            'slug' => 'rentcore-central',
+            'owner_id' => $this->superAdmin->id,
+            'is_active' => true,
+            'shift_enforcement_enabled' => false,
+        ]);
+
+        $this->affiliate = Affiliate::create([
+            'business_id' => $this->business->id,
+            'code' => 'GNT',
+            'name' => 'Genteng Central Hub',
+            'slug' => 'genteng-central-hub',
+            'is_central' => true,
+        ]);
+
         $this->cashier = User::create([
             'name' => 'Budi Santoso',
             'email' => 'kasir@rentcore.id',
             'password' => Hash::make('password'),
             'role' => 'staff',
             'affiliate_id' => $this->affiliate->id,
+            'is_active' => true,
+        ]);
+
+        \App\Models\BusinessMember::create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->cashier->id,
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+
+        \App\Models\BusinessMember::create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->superAdmin->id,
+            'role' => 'owner',
             'is_active' => true,
         ]);
 
@@ -145,8 +169,9 @@ class MultiCategoryRentalTest extends TestCase
     {
         $token = $this->cashier->createToken('Test')->plainTextToken;
 
-        $category = AssetCategory::create(['name' => 'Proyektor', 'slug' => 'proyektor']);
+        $category = AssetCategory::create(['business_id' => $this->business->id, 'name' => 'Proyektor', 'slug' => 'proyektor']);
         $model = AssetModel::create([
+            'business_id' => $this->business->id,
             'category_id' => $category->id,
             'brand' => 'Epson',
             'name' => 'Epson EB-E500 3300 Lumens',
@@ -252,8 +277,9 @@ class MultiCategoryRentalTest extends TestCase
     {
         $token = $this->cashier->createToken('Test')->plainTextToken;
 
-        $category = AssetCategory::create(['name' => 'Kamera', 'slug' => 'kamera']);
+        $category = AssetCategory::create(['business_id' => $this->business->id, 'name' => 'Kamera', 'slug' => 'kamera']);
         $model = AssetModel::create([
+            'business_id' => $this->business->id,
             'category_id' => $category->id,
             'brand' => 'Canon',
             'name' => 'Canon EOS R6 Mark II',
@@ -263,6 +289,7 @@ class MultiCategoryRentalTest extends TestCase
         ]);
 
         $asset = Asset::create([
+            'business_id' => $this->business->id,
             'affiliate_id' => $this->affiliate->id,
             'model_id' => $model->id,
             'asset_code' => 'AST-CAM-001',
@@ -271,11 +298,13 @@ class MultiCategoryRentalTest extends TestCase
         ]);
 
         $customer = \App\Models\Customer::create([
+            'business_id' => $this->business->id,
             'name' => 'Dwi Santika',
             'phone' => '081298765432',
         ]);
 
         $booking = $this->cashier->bookingsCreated()->create([
+            'business_id' => $this->business->id,
             'booking_code' => 'RC-CAM-001',
             'affiliate_id' => $this->affiliate->id,
             'customer_id' => $customer->id,
@@ -322,8 +351,9 @@ class MultiCategoryRentalTest extends TestCase
     {
         $token = $this->cashier->createToken('Test')->plainTextToken;
 
-        $category = AssetCategory::create(['name' => 'Laptop', 'slug' => 'laptop']);
+        $category = AssetCategory::create(['business_id' => $this->business->id, 'name' => 'Laptop', 'slug' => 'laptop']);
         $model = AssetModel::create([
+            'business_id' => $this->business->id,
             'category_id' => $category->id,
             'brand' => 'Asus',
             'name' => 'Asus ROG Zephyrus G14',
@@ -333,6 +363,7 @@ class MultiCategoryRentalTest extends TestCase
         ]);
 
         $asset = Asset::create([
+            'business_id' => $this->business->id,
             'affiliate_id' => $this->affiliate->id,
             'model_id' => $model->id,
             'asset_code' => 'AST-ROG-001',
@@ -348,5 +379,103 @@ class MultiCategoryRentalTest extends TestCase
 
         $response->assertStatus(200)
             ->assertJsonPath('data.is_available', true);
+    }
+
+    public function test_business_creation_with_business_categories(): void
+    {
+        $token = $this->superAdmin->createToken('Test')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/businesses', [
+                'name' => 'Kamera Bali Pro',
+                'city' => 'Denpasar',
+                'business_categories' => ['cameras_photography', 'tools_equipment'],
+                'initial_branch_name' => 'Kamera Bali Pusat',
+            ]);
+
+        $response->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.name', 'Kamera Bali Pro')
+            ->assertJsonPath('data.business_categories', ['cameras_photography', 'tools_equipment']);
+
+        $bizId = $response->json('data.id');
+        $this->assertDatabaseHas('businesses', [
+            'id' => $bizId,
+            'name' => 'Kamera Bali Pro',
+        ]);
+    }
+
+    public function test_can_register_unit_without_serial_number_when_model_has_no_serial(): void
+    {
+        $token = $this->superAdmin->createToken('Test')->plainTextToken;
+
+        $category = AssetCategory::create(['business_id' => $this->business->id, 'name' => 'Alat & Perlengkapan', 'slug' => 'alat-perlengkapan']);
+        $model = AssetModel::create([
+            'business_id' => $this->business->id,
+            'category_id' => $category->id,
+            'brand' => 'Krisbow',
+            'name' => 'Tangga Aluminium Teleskopik 3.8M',
+            'slug' => 'tangga-aluminium-38m',
+            'has_serial_number' => false,
+            'requires_frp_check' => false,
+            'is_active' => true,
+        ]);
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/assets', [
+                'model_id' => $model->id,
+                'affiliate_id' => $this->affiliate->id,
+                'asset_code' => 'AST-TGG-001',
+                'condition_grade' => 'A',
+                'notes' => 'Tangga kokoh tanpa serial pabrik',
+            ]);
+
+        $response->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.asset_code', 'AST-TGG-001')
+            ->assertJsonPath('data.serial_number', null)
+            ->assertJsonPath('data.battery_health', null);
+
+        $this->assertDatabaseHas('assets', [
+            'asset_code' => 'AST-TGG-001',
+            'serial_number' => null,
+            'battery_health' => null,
+        ]);
+    }
+
+    public function test_unit_registration_does_not_default_battery_health_to_100_for_non_battery_items(): void
+    {
+        $token = $this->superAdmin->createToken('Test')->plainTextToken;
+
+        $category = AssetCategory::create(['business_id' => $this->business->id, 'name' => 'Kamera', 'slug' => 'kamera-lensa']);
+        $model = AssetModel::create([
+            'business_id' => $this->business->id,
+            'category_id' => $category->id,
+            'brand' => 'Sigma',
+            'name' => 'Sigma 24-70mm f/2.8 DG DN Art',
+            'slug' => 'sigma-24-70-art',
+            'has_serial_number' => true,
+            'requires_frp_check' => false,
+            'is_active' => true,
+        ]);
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/assets', [
+                'model_id' => $model->id,
+                'affiliate_id' => $this->affiliate->id,
+                'asset_code' => 'AST-LENS-001',
+                'serial_number' => 'SN-SIGMA-99281',
+                'condition_grade' => 'A',
+                // Omit battery_health completely
+            ]);
+
+        $response->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.battery_health', null);
+
+        $this->assertDatabaseHas('assets', [
+            'asset_code' => 'AST-LENS-001',
+            'battery_health' => null,
+        ]);
     }
 }

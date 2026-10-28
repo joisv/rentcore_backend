@@ -8,6 +8,7 @@ use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\ShiftEnforcementService;
 use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
@@ -20,15 +21,53 @@ use Illuminate\Validation\ValidationException;
 class CashierController extends Controller
 {
     /**
-     * Get active payment methods.
+     * Get active payment methods filtered by business and branch configuration.
      */
-    public function paymentMethods(): JsonResponse
+    public function paymentMethods(Request $request): JsonResponse
     {
-        $methods = PaymentMethod::where('is_active', true)->get();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+        $user = $request->user();
+
+        $branchId = $request->get('branch_id')
+            ?? $request->header('X-Branch-Id')
+            ?? $user?->affiliate_id;
+
+        $business = $businessId ? \App\Models\Business::find($businessId) : null;
+        if (!$business && $branchId) {
+            $branch = \App\Models\Affiliate::find($branchId);
+            $business = $branch?->business;
+        }
+
+        $allMethods = PaymentMethod::where('is_active', true)->get();
+
+        if ($business) {
+            $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
+
+            $qrisImageUrl = null;
+            if (!empty($config['qris_image_path'])) {
+                $version = \Illuminate\Support\Facades\Storage::disk('local')->exists($config['qris_image_path'])
+                    ? \Illuminate\Support\Facades\Storage::disk('local')->lastModified($config['qris_image_path'])
+                    : time();
+                $qrisImageUrl = url("/api/v1/payment-settings/qris-image?business_id={$business->id}" . ($branchId ? "&branch_id={$branchId}" : "") . "&v={$version}");
+            }
+
+            $filteredMethods = $allMethods->filter(function ($m) use ($business, $branchId) {
+                return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);
+            })->map(function ($m) use ($qrisImageUrl) {
+                $item = $m->toArray();
+                if (strtoupper($m->code) === 'QRIS') {
+                    $item['qris_image_url'] = $qrisImageUrl;
+                }
+                return $item;
+            })->values();
+        } else {
+            $filteredMethods = $allMethods;
+        }
 
         return response()->json([
             'success' => true,
-            'data' => $methods,
+            'data' => $filteredMethods,
         ]);
     }
 
@@ -65,6 +104,14 @@ class CashierController extends Controller
         $type = $request->get('payment_type', 'settlement');
         $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
         $isCash = strtoupper($paymentMethod->code) === 'CASH';
+
+        // Enforce business & branch payment method availability
+        $business = \App\Models\Business::find($booking->business_id);
+        if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $booking->affiliate_id)) {
+            throw ValidationException::withMessages([
+                'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
+            ]);
+        }
 
         $idempotencyKey = $request->header('X-Idempotency-Key') ?? $request->input('idempotency_key');
         if ($idempotencyKey) {
@@ -166,11 +213,18 @@ class CashierController extends Controller
             $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
             $receiptNumber = sprintf('REC-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(6)));
 
-            $cashierBranchId = $request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id;
+            $cashierBranchId = (int)($request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id);
+            $activeShift = ShiftEnforcementService::requireActiveShift(
+                $cashierBranchId,
+                $user,
+                $isCash,
+                'memproses pembayaran kasir POS'
+            );
 
             $paymentTx = PaymentTransaction::create([
                 'business_id' => $booking->business_id ?? $user->business_id,
-                'branch_id' => $cashierBranchId ? (int)$cashierBranchId : null,
+                'branch_id' => $cashierBranchId ?: null,
+                'shift_id' => $activeShift->id,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'idempotency_key' => $idempotencyKey,
@@ -660,6 +714,7 @@ class CashierController extends Controller
         // Active shift & opening float if single branch
         $activeShiftData = null;
         $openingFloat = 0.00;
+        $shiftExpectedCash = null;
         if ($targetBranchId !== null) {
             $activeShift = \App\Models\CashDrawerShift::where('branch_id', $targetBranchId)
                 ->where('status', 'open')
@@ -668,12 +723,60 @@ class CashierController extends Controller
 
             if ($activeShift) {
                 $openingFloat = (float)$activeShift->opening_cash_float;
+                $sStart = $activeShift->opened_at;
+                $sNow = \Carbon\Carbon::now();
+
+                $sCashPaymentQuery = \App\Models\PaymentTransaction::where(function ($sq) use ($activeShift, $sStart, $sNow) {
+                        $sq->where('payment_transactions.shift_id', $activeShift->id)
+                           ->orWhere(function ($tsq) use ($sStart, $sNow) {
+                               $tsq->whereNull('payment_transactions.shift_id')
+                                   ->whereBetween('payment_transactions.transacted_at', [$sStart, $sNow]);
+                           });
+                    })
+                    ->where('status', '!=', 'void')
+                    ->where(function ($q) use ($targetBranchId) {
+                        $q->where('payment_transactions.branch_id', $targetBranchId)
+                          ->orWhere(function ($fb) use ($targetBranchId) {
+                              $fb->whereNull('payment_transactions.branch_id')
+                                 ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $targetBranchId));
+                          });
+                    })
+                    ->whereHas('paymentMethod', function ($mq) {
+                        $mq->whereRaw('LOWER(code) = ?', ['cash'])
+                           ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
+                    });
+
+                $sCashInflow = (float)(clone $sCashPaymentQuery)
+                    ->where('type', '!=', 'refund')
+                    ->where(function ($q) {
+                        $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
+                    })
+                    ->sum('amount');
+
+                $sCashRefund = (float)(clone $sCashPaymentQuery)
+                    ->where(function ($q) {
+                        $q->where('type', 'refund')->orWhere('direction', 'outflow');
+                    })
+                    ->sum('amount');
+
+                $sExpenses = (float)\App\Models\BranchExpense::whereBetween('disbursed_at', [$sStart, $sNow])
+                    ->where('branch_id', $targetBranchId)
+                    ->where('payment_source', 'cash_drawer')
+                    ->where('status', 'disbursed')
+                    ->sum('amount');
+
+                $shiftExpectedCash = max(0.00, $openingFloat + ($sCashInflow - $sCashRefund) - $sExpenses);
+
                 $activeShiftData = [
                     'id' => $activeShift->id,
                     'shift_number' => $activeShift->shift_number,
                     'opened_at' => $activeShift->opened_at->toIso8601String(),
                     'opening_cash_float' => $openingFloat,
                     'status' => $activeShift->status,
+                    'expected_cash_now' => $shiftExpectedCash,
+                    'current_cash_inflow' => $sCashInflow,
+                    'current_cash_refund' => $sCashRefund,
+                    'current_cash_expenses' => $sExpenses,
                 ];
             }
         }
@@ -685,7 +788,9 @@ class CashierController extends Controller
             }
         }
 
-        $expectedDrawerCash = max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
+        $expectedDrawerCash = $shiftExpectedCash !== null
+            ? $shiftExpectedCash
+            : max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
 
         $limit = max(10, min(500, (int)$request->get('limit', $request->get('per_page', 50))));
         $recentTransactions = (clone $baseQuery)

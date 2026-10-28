@@ -45,6 +45,7 @@ class BusinessController extends Controller
                 'address' => $biz->address,
                 'city' => $biz->city,
                 'currency' => $biz->currency,
+                'business_categories' => $biz->business_categories ?? [],
                 'role' => $membership->role,
                 'joined_at' => $membership->joined_at,
                 // Only branches this member is authorized for (central first). Prevents the
@@ -72,6 +73,8 @@ class BusinessController extends Controller
             'address' => 'nullable|string',
             'city' => 'nullable|string|max:100',
             'currency' => 'nullable|string|max:10',
+            'business_categories' => 'nullable|array',
+            'business_categories.*' => 'string|max:50',
             'initial_branch_name' => 'nullable|string|max:150',
             'initial_branch_code' => 'nullable|string|max:10',
         ]);
@@ -85,6 +88,7 @@ class BusinessController extends Controller
                 'email' => $validated['email'] ?? $user->email,
                 'address' => $validated['address'] ?? null,
                 'city' => $validated['city'] ?? null,
+                'business_categories' => $validated['business_categories'] ?? null,
                 'currency' => $validated['currency'] ?? 'IDR',
                 'owner_id' => $user->id,
                 'is_active' => true,
@@ -234,6 +238,8 @@ class BusinessController extends Controller
             'email' => 'nullable|email|max:150',
             'address' => 'nullable|string',
             'city' => 'nullable|string|max:100',
+            'business_categories' => 'nullable|array',
+            'business_categories.*' => 'string|max:50',
         ]);
 
         $business->update(array_filter($validated, fn($v) => $v !== null));
