@@ -6,6 +6,7 @@ use App\Models\Affiliate;
 use App\Models\Asset;
 use App\Models\Booking;
 use App\Models\BookingItem;
+use App\Models\Business;
 use App\Models\BusinessMember;
 use App\Models\Customer;
 use App\Models\CustomerIdentity;

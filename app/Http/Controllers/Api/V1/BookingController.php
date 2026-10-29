@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Models\Booking;
 use App\Models\BookingItem;
+use App\Models\Business;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Models\PricingTier;
