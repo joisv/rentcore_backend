@@ -86,9 +86,17 @@ class DatabaseSeeder extends Seeder
         ]);
 
         // 3. Payment Methods
-        $cashMethod = PaymentMethod::create(['code' => 'CASH', 'name' => 'Tunai di Meja Kasir', 'is_active' => true]);
-        $qrisMethod = PaymentMethod::create(['code' => 'QRIS', 'name' => 'QRIS Dinamis / Statis', 'is_active' => true]);
-        $bcaMethod  = PaymentMethod::create(['code' => 'BCA',  'name' => 'Transfer Bank BCA',     'is_active' => true]);
+        $cashMethod    = PaymentMethod::firstOrCreate(['code' => 'CASH'], ['name' => 'Tunai di Meja Kasir', 'is_active' => true]);
+        $qrisMethod    = PaymentMethod::firstOrCreate(['code' => 'QRIS'], ['name' => 'QRIS Dinamis / Statis', 'is_active' => true]);
+        $bcaMethod     = PaymentMethod::firstOrCreate(['code' => 'BCA'],  ['name' => 'Transfer Bank BCA', 'is_active' => true]);
+        $mandiriMethod = PaymentMethod::firstOrCreate(['code' => 'MANDIRI'], ['name' => 'Transfer Bank Mandiri', 'is_active' => true]);
+        $briMethod     = PaymentMethod::firstOrCreate(['code' => 'BRI'],  ['name' => 'Transfer Bank BRI', 'is_active' => true]);
+        $bniMethod     = PaymentMethod::firstOrCreate(['code' => 'BNI'],  ['name' => 'Transfer Bank BNI', 'is_active' => true]);
+        $shopeeMethod  = PaymentMethod::firstOrCreate(['code' => 'SHOPEEPAY'], ['name' => 'ShopeePay', 'is_active' => true]);
+        $danaMethod    = PaymentMethod::firstOrCreate(['code' => 'DANA'], ['name' => 'DANA', 'is_active' => true]);
+        $gopayMethod   = PaymentMethod::firstOrCreate(['code' => 'GOPAY'], ['name' => 'GoPay', 'is_active' => true]);
+        $ovoMethod     = PaymentMethod::firstOrCreate(['code' => 'OVO'], ['name' => 'OVO', 'is_active' => true]);
+        $linkajaMethod = PaymentMethod::firstOrCreate(['code' => 'LINKAJA'], ['name' => 'LinkAja', 'is_active' => true]);
 
         // 4. Asset Catalog (Categories & Models)
         $smartphoneCat = AssetCategory::create([

@@ -197,12 +197,17 @@ class PaymentSettingsController extends Controller
             $newConfig['qris_image_path'] = null;
         }
 
+        // Scoped folder for store / branch QRIS
+        $folder = $branch
+            ? sprintf('qris/biz_%d/branch_%d', $business->id, $branch->id)
+            : sprintf('qris/biz_%d', $business->id);
+
         // Handle QR image file upload
         if ($request->hasFile('qris_image')) {
             $file = $request->file('qris_image');
             $ext = strtolower($file->getClientOriginalExtension());
-            $filename = sprintf('qris_biz_%d_%d_%s.%s', $business->id, time(), Str::random(8), $ext);
-            $newPath = $file->storeAs('qris', $filename, 'local');
+            $filename = sprintf('qris_%d_%s.%s', time(), Str::random(8), $ext);
+            $newPath = $file->storeAs($folder, $filename, 'local');
 
             // Delete old file safely
             if (!empty($newConfig['qris_image_path']) && $newConfig['qris_image_path'] !== $newPath && Storage::disk('local')->exists($newConfig['qris_image_path'])) {
@@ -220,8 +225,8 @@ class PaymentSettingsController extends Controller
             }
             $decoded = base64_decode($photoData);
             if ($decoded !== false) {
-                $filename = sprintf('qris_biz_%d_%d_%s.%s', $business->id, time(), Str::random(8), $ext);
-                $newPath = 'qris/' . $filename;
+                $filename = sprintf('qris_%d_%s.%s', time(), Str::random(8), $ext);
+                $newPath = $folder . '/' . $filename;
                 Storage::disk('local')->put($newPath, $decoded);
 
                 if (!empty($newConfig['qris_image_path']) && $newConfig['qris_image_path'] !== $newPath && Storage::disk('local')->exists($newConfig['qris_image_path'])) {

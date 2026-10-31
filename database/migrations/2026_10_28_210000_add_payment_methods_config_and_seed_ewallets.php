@@ -24,12 +24,16 @@ return new class extends Migration
             }
         });
 
-        // Seed standard E-Wallet providers into payment_methods lookup table
+        // Seed standard E-Wallet and Bank Transfer providers into payment_methods lookup table
         $providers = [
             ['code' => 'SHOPEEPAY', 'name' => 'ShopeePay'],
             ['code' => 'DANA', 'name' => 'DANA'],
+            ['code' => 'GOPAY', 'name' => 'GoPay'],
             ['code' => 'LINKAJA', 'name' => 'LinkAja'],
             ['code' => 'OVO', 'name' => 'OVO'],
+            ['code' => 'MANDIRI', 'name' => 'Transfer Bank Mandiri'],
+            ['code' => 'BRI', 'name' => 'Transfer Bank BRI'],
+            ['code' => 'BNI', 'name' => 'Transfer Bank BNI'],
         ];
 
         foreach ($providers as $provider) {

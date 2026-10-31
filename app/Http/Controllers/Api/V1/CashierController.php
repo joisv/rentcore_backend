@@ -137,8 +137,16 @@ class CashierController extends Controller
             }
         }
 
+        $cashierBranchId = (int)($request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id);
+        $activeShift = ShiftEnforcementService::requireActiveShift(
+            $cashierBranchId,
+            $user,
+            $isCash,
+            'memproses transaksi'
+        );
+
         try {
-            return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey) {
+            return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey, $cashierBranchId, $activeShift) {
             // Re-fetch booking with row-level pessimistic lock
             $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->first();
 
@@ -213,18 +221,10 @@ class CashierController extends Controller
             $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
             $receiptNumber = sprintf('REC-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(6)));
 
-            $cashierBranchId = (int)($request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id);
-            $activeShift = ShiftEnforcementService::requireActiveShift(
-                $cashierBranchId,
-                $user,
-                $isCash,
-                'memproses pembayaran kasir POS'
-            );
-
             $paymentTx = PaymentTransaction::create([
                 'business_id' => $booking->business_id ?? $user->business_id,
                 'branch_id' => $cashierBranchId ?: null,
-                'shift_id' => $activeShift->id,
+                'shift_id' => $activeShift?->id,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'idempotency_key' => $idempotencyKey,

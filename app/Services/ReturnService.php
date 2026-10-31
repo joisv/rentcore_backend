@@ -79,33 +79,63 @@ class ReturnService
                 }
             }
 
-            $returnedAt = !empty($data['returned_at']) ? Carbon::parse($data['returned_at']) : Carbon::now();
-            $expectedEndAt = Carbon::parse($booking->end_at);
+            $business = \App\Models\Business::find($booking->business_id);
+            $businessTz = $business?->timezone ?: 'Asia/Jakarta';
+
+            if (!empty($data['returned_at'])) {
+                $rawReturnedAt = (string)$data['returned_at'];
+                if (preg_match('/(Z|[+-]\d{2}:?\d{2})$/i', $rawReturnedAt)) {
+                    $returnedAt = Carbon::parse($rawReturnedAt)->setTimezone('UTC');
+                } else {
+                    $returnedAt = Carbon::parse($rawReturnedAt, $businessTz)->setTimezone('UTC');
+                }
+            } else {
+                $returnedAt = Carbon::now('UTC');
+            }
+
+            $expectedEndAt = Carbon::parse($booking->end_at)->setTimezone('UTC');
 
             // 2. Late Minutes & Grace Period Penalty Formula
             // Formula: max(0, ceil((late_minutes - 60) / 60)) * hourly_rate
             $lateMinutes = 0;
             $lateFee = 0.00;
+            $hourlyRate = 15000.00;
+
+            // Fetch hourly rate from primary item rate snapshot first, then model pricing tier, or default to 15,000 IDR/hr
+            $firstItem = $booking->items->first();
+            if ($firstItem) {
+                $rateSnapshot = is_array($firstItem->rate_snapshot)
+                    ? $firstItem->rate_snapshot
+                    : json_decode($firstItem->rate_snapshot ?? '[]', true);
+
+                if (!empty($rateSnapshot['extension_hourly_rate']) && (float)$rateSnapshot['extension_hourly_rate'] > 0) {
+                    $hourlyRate = (float)$rateSnapshot['extension_hourly_rate'];
+                } elseif ($firstItem->asset) {
+                    $tier = PricingTier::where('model_id', $firstItem->asset->model_id)
+                        ->where('is_active', true)
+                        ->first();
+                    if ($tier && (float)$tier->extension_hourly_rate > 0) {
+                        $hourlyRate = (float)$tier->extension_hourly_rate;
+                    }
+                }
+            }
 
             if ($returnedAt->gt($expectedEndAt)) {
-                $lateMinutes = $expectedEndAt->diffInMinutes($returnedAt);
+                $lateMinutes = (int)floor($expectedEndAt->diffInMinutes($returnedAt));
 
                 if ($lateMinutes > 60) {
                     $billableHours = (int)ceil(($lateMinutes - 60) / 60);
-
-                    // Fetch hourly rate from model pricing tier or default to 15,000 IDR/hr
-                    $firstItem = $booking->items()->first();
-                    $hourlyRate = 15000.00;
-                    if ($firstItem && $firstItem->asset) {
-                        $tier = PricingTier::where('model_id', $firstItem->asset->model_id)
-                            ->where('is_active', true)
-                            ->first();
-                        if ($tier && (float)$tier->extension_hourly_rate > 0) {
-                            $hourlyRate = (float)$tier->extension_hourly_rate;
-                        }
-                    }
-
                     $lateFee = $billableHours * $hourlyRate;
+                }
+            }
+
+            // Client-inspected penalty sync & tender tolerance guard:
+            // If client submitted an inspected late_fee, sync if within 1 hour boundary tolerance
+            // (prevents race-condition shortfall errors when cashier tender takes seconds to complete)
+            if (isset($data['late_fee']) && is_numeric($data['late_fee'])) {
+                $clientLateFee = (float)$data['late_fee'];
+                if (abs($clientLateFee - $lateFee) <= $hourlyRate) {
+                    $lateFee = $clientLateFee;
                 }
             }
 

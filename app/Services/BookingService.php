@@ -132,25 +132,13 @@ class BookingService
                 }
             }
 
-            // Shift Enforcement Check: Ensure Cash Drawer Shift is OPEN before booking and receiving cash
-            $business = $affiliate->business ?? ($businessId ? \App\Models\Business::find($businessId) : null);
-            $shiftSchedule = $business?->getShiftSchedule((int)$affiliate->id);
-            $enforceShift = $shiftSchedule['shift_enforcement_enabled'] ?? true;
-
-            if ($enforceShift) {
-                $activeShift = \App\Models\CashDrawerShift::where('branch_id', $affiliate->id)
-                    ->where('status', 'open')
-                    ->first();
-
-                if (!$activeShift) {
-                    throw ValidationException::withMessages([
-                        'shift' => [
-                            'Shift kasir belum dibuka untuk cabang ini. ' .
-                            'Buka shift kasir terlebih dahulu sebelum melayani dan memproses transaksi sewa baru.'
-                        ],
-                    ]);
-                }
-            }
+            // Strict Pre-Checkout Shift Enforcement Check: Ensure Cash Drawer Shift is OPEN before anything is processed
+            $activeShift = ShiftEnforcementService::requireActiveShift(
+                (int)$affiliate->id,
+                $cashier,
+                false,
+                'memproses transaksi'
+            );
 
             // 1. Ensure or find Customer scoped to business
             $customerAttrs = ['phone' => $data['customer_phone']];
@@ -540,12 +528,12 @@ class BookingService
                 ]);
             }
 
-            // Enforce Active Cash Shift before committing direct rental payment
-            $activeShift = ShiftEnforcementService::requireActiveShift(
+            // Re-verify Active Shift before committing direct rental payment
+            $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
                 (int)$affiliateId,
                 $cashier,
                 $isCash,
-                'memproses transaksi sewa langsung di meja kasir'
+                'memproses transaksi'
             );
 
             if ($isCash && isset($data['cash_received']) && (float)$data['cash_received'] < $totalBill) {
@@ -570,7 +558,7 @@ class BookingService
             PaymentTransaction::create([
                 'business_id' => $businessId,
                 'branch_id' => $affiliateId,
-                'shift_id' => $activeShift->id,
+                'shift_id' => $activeShift?->id,
                 'transaction_code' => $txCode,
                 'receipt_number' => $receiptNumber,
                 'booking_id' => $booking->id,

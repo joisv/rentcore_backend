@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Business;
 use App\Models\CashDrawerShift;
 use App\Models\User;
 use App\Tenancy\TenantContext;
@@ -13,16 +14,21 @@ class ShiftEnforcementService
      * Require that an active, open cash drawer shift exists for the given branch.
      * Enforces strict backend validation, preventing orphaned payments or cash movements.
      *
-     * @throws ValidationException if no open shift exists
+     * @throws ValidationException if no open shift exists and enforcement is enabled
      */
     public static function requireActiveShift(
         int $branchId,
         ?User $user = null,
         bool $isCash = true,
-        string $actionDescription = ''
-    ): CashDrawerShift {
+        string $actionDescription = 'memproses transaksi'
+    ): ?CashDrawerShift {
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId() ?? $user?->current_business_id ?? $user?->business_id;
+
+        $business = $businessId ? Business::find($businessId) : null;
+        if ($business && $business->shift_enforcement_enabled === false) {
+            return self::getActiveShift($branchId, $user);
+        }
 
         $query = CashDrawerShift::where('branch_id', $branchId)
             ->where('status', 'open');
@@ -36,15 +42,13 @@ class ShiftEnforcementService
         if (!$shift) {
             $action = !empty($actionDescription)
                 ? $actionDescription
-                : ($isCash ? 'menerima atau mengeluarkan uang tunai' : 'memproses transaksi kasir POS');
+                : 'memproses transaksi';
+
+            $errorMessage = "Shift belum dibuka. Buka shift kasir terlebih dahulu sebelum {$action}.";
 
             throw ValidationException::withMessages([
-                'cash_shift' => [
-                    "Shift kasir belum dibuka untuk cabang ini. Buka shift kasir terlebih dahulu sebelum {$action}."
-                ],
-                'shift' => [
-                    "Shift kasir belum dibuka untuk cabang ini. Buka shift kasir terlebih dahulu sebelum {$action}."
-                ],
+                'shift' => [$errorMessage],
+                'cash_shift' => [$errorMessage],
             ])->status(422);
         }
 

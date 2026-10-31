@@ -9,6 +9,7 @@ use App\Models\AssetModel;
 use App\Models\Booking;
 use App\Models\Business;
 use App\Models\BusinessMember;
+use App\Models\CashDrawerShift;
 use App\Models\Customer;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
@@ -200,6 +201,32 @@ class LateReturnPenaltyRevenueTest extends TestCase
             'code' => 'QRIS',
             'name' => 'QRIS',
             'is_active' => true,
+        ]);
+
+        // 5. Open Active Cash Shifts for Test Staff
+        CashDrawerShift::create([
+            'business_id' => $this->businessA->id,
+            'branch_id' => $this->branchA1->id,
+            'shift_number' => 'SHF-TEST-A1',
+            'opened_by' => $this->staffA1->id,
+            'opened_at' => Carbon::now(),
+            'starting_cash' => 500000,
+        ]);
+        CashDrawerShift::create([
+            'business_id' => $this->businessA->id,
+            'branch_id' => $this->branchA2->id,
+            'shift_number' => 'SHF-TEST-A2',
+            'opened_by' => $this->staffA2->id,
+            'opened_at' => Carbon::now(),
+            'starting_cash' => 500000,
+        ]);
+        CashDrawerShift::create([
+            'business_id' => $this->businessB->id,
+            'branch_id' => $this->branchB1->id,
+            'shift_number' => 'SHF-TEST-B1',
+            'opened_by' => $this->staffB1->id,
+            'opened_at' => Carbon::now(),
+            'starting_cash' => 500000,
         ]);
     }
 
@@ -664,5 +691,78 @@ class LateReturnPenaltyRevenueTest extends TestCase
         $respB->assertOk()
             ->assertJsonPath('data.total_revenue', 0)
             ->assertJsonPath('data.breakdown_by_type.penalty.total', 0);
+    }
+
+    public function test_11_five_hour_overdue_penalty_calculation_with_timezone_and_cash_tender(): void
+    {
+        // Setup: Booking ended 6 hours ago in real time (e.g. 12:01 WIB / 05:01 UTC)
+        // Overdue by 6 hours - 1 hour grace period = 5 billable hours
+        // At 20,000 IDR/hr, penalty = 100,000 IDR.
+        $endAt = Carbon::now()->subHours(6);
+        $startAt = (clone $endAt)->subHours(24);
+
+        [$booking] = $this->createRentedBooking(
+            $this->branchA1,
+            $this->staffA1,
+            $startAt,
+            $endAt
+        );
+
+        // Case A: Client sends naive local datetime string from mobile device in Asia/Jakarta (e.g. 18:01 local without Z)
+        // Previously this caused a 7-hour timezone phantom offset inflating penalty from 100k to 240k (12 hours)
+        $naiveLocalTime = Carbon::now('Asia/Jakarta')->format('Y-m-d\TH:i:s.u');
+
+        $resp = $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson("/api/v1/bookings/{$booking->id}/return", [
+                'condition_grade' => 'A',
+                'checklist_results' => ['icloud_removed' => true],
+                'returned_at' => $naiveLocalTime,
+                'penalty_payment_method_id' => $this->cashMethod->id,
+                'cash_received' => 100000.00,
+            ]);
+
+        $resp->assertOk()
+            ->assertJsonPath('data.late_fee', '100000.00')
+            ->assertJsonPath('data.total_penalty', '100000.00');
+
+        $this->assertEquals(1, PaymentTransaction::where('booking_id', $booking->id)->where('type', 'penalty')->count());
+        $penaltyTx = PaymentTransaction::where('booking_id', $booking->id)->where('type', 'penalty')->first();
+        $this->assertEquals(100000.00, (float)$penaltyTx->amount);
+        $this->assertEquals(100000.00, (float)$penaltyTx->cash_received);
+        $this->assertEquals(0.00, (float)$penaltyTx->cash_change);
+    }
+
+    public function test_12_five_hour_overdue_penalty_calculation_with_utc_iso_string(): void
+    {
+        $endAt = Carbon::now()->subHours(6);
+        $startAt = (clone $endAt)->subHours(24);
+
+        [$booking] = $this->createRentedBooking(
+            $this->branchA1,
+            $this->staffA1,
+            $startAt,
+            $endAt
+        );
+
+        // Case B: Client sends UTC ISO string with 'Z'
+        $utcIsoTime = Carbon::now('UTC')->toISOString();
+
+        $resp = $this->actingAs($this->staffA1)
+            ->withHeader('X-Business-Id', (string)$this->businessA->id)
+            ->postJson("/api/v1/bookings/{$booking->id}/return", [
+                'condition_grade' => 'A',
+                'checklist_results' => ['icloud_removed' => true],
+                'returned_at' => $utcIsoTime,
+                'late_fee' => 100000.00,
+                'penalty_payment_method_id' => $this->cashMethod->id,
+                'cash_received' => 100000.00,
+            ]);
+
+        $resp->assertOk()
+            ->assertJsonPath('data.late_fee', '100000.00')
+            ->assertJsonPath('data.total_penalty', '100000.00');
+
+        $this->assertEquals(1, PaymentTransaction::where('booking_id', $booking->id)->where('type', 'penalty')->count());
     }
 }

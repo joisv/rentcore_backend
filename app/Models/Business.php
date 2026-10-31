@@ -61,6 +61,7 @@ class Business extends Model
             'ewallet_providers' => [
                 'shopeepay' => true,
                 'dana' => true,
+                'gopay' => true,
                 'linkaja' => true,
                 'ovo' => true,
             ],
@@ -107,7 +108,7 @@ class Business extends Model
             return (bool)($config['qris_statis_enabled'] ?? true);
         }
 
-        if ($code === 'BCA') {
+        if (in_array($code, ['BCA', 'MANDIRI', 'BRI', 'BNI', 'TRANSFER', 'BANK_TRANSFER'], true)) {
             return (bool)($config['bank_transfer_enabled'] ?? true);
         }
 
@@ -115,6 +116,7 @@ class Business extends Model
         $eWalletMap = [
             'SHOPEEPAY' => 'shopeepay',
             'DANA' => 'dana',
+            'GOPAY' => 'gopay',
             'LINKAJA' => 'linkaja',
             'OVO' => 'ovo',
         ];

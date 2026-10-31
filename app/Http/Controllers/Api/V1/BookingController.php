@@ -245,6 +245,15 @@ class BookingController extends Controller
             $payload['affiliate_id'] = $headerBranchId;
         }
 
+        // Strict pre-checkout active shift enforcement
+        $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
+        ShiftEnforcementService::requireActiveShift(
+            $targetBranchId,
+            $request->user(),
+            true,
+            'memproses transaksi'
+        );
+
         $booking = $this->bookingService->createCounterRental($payload, $request->user());
 
         return response()->json([
@@ -789,9 +798,13 @@ class BookingController extends Controller
 
                     $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
 
+                    // Resolve payment method for refund
+                    $paymentMethodId = $request->payment_method_id ?? $booking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id') ?? 1;
+                    $paymentMethod = PaymentMethod::find($paymentMethodId) ?? PaymentMethod::first();
+
                     // Enforce business & branch payment method availability
                     $business = Business::find($booking->business_id);
-                    if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                    if ($business && $paymentMethod && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
                         throw ValidationException::withMessages([
                             'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
                         ]);
@@ -865,9 +878,13 @@ class BookingController extends Controller
 
                     $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
 
+                    // Resolve payment method for refund
+                    $paymentMethodId = $request->payment_method_id ?? $booking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id') ?? 1;
+                    $paymentMethod = PaymentMethod::find($paymentMethodId) ?? PaymentMethod::first();
+
                     // Enforce business & branch payment method availability
                     $business = Business::find($booking->business_id);
-                    if ($business && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
+                    if ($business && $paymentMethod && !$business->isPaymentMethodEnabled($paymentMethod, $branchId)) {
                         throw ValidationException::withMessages([
                             'payment_method_id' => ["Metode pembayaran {$paymentMethod->name} sedang dinonaktifkan oleh pemilik usaha."],
                         ]);
@@ -1024,6 +1041,7 @@ class BookingController extends Controller
             'checklist_results.icloud_removed' => 'nullable|boolean',
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
+            'late_fee' => 'nullable|numeric|min:0',
             'penalty_payment_method_id' => 'nullable|exists:payment_methods,id',
             'cash_received' => 'nullable|numeric|min:0',
             'staff_notes' => 'nullable|string',
