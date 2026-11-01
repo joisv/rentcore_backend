@@ -83,6 +83,28 @@ class Business extends Model
         return $config;
     }
 
+    public function getQrisImageUrl(?int $affiliateId = null): ?string
+    {
+        $config = $this->getPaymentMethodsConfig($affiliateId);
+        $path = $config['qris_image_path'] ?? null;
+        if (!$path) {
+            return null;
+        }
+
+        $version = time();
+        if (\Illuminate\Support\Facades\Storage::disk('public')->exists($path)) {
+            $version = \Illuminate\Support\Facades\Storage::disk('public')->lastModified($path);
+            return asset('storage/' . $path) . "?v={$version}";
+        }
+
+        if (\Illuminate\Support\Facades\Storage::disk('local')->exists($path)) {
+            $version = \Illuminate\Support\Facades\Storage::disk('local')->lastModified($path);
+            return url("/api/v1/payment-settings/qris-image?business_id={$this->id}" . ($affiliateId ? "&branch_id={$affiliateId}" : "") . "&v={$version}");
+        }
+
+        return asset('storage/' . $path) . "?v={$version}";
+    }
+
     public function isPaymentMethodEnabled(PaymentMethod|int|string $method, ?int $affiliateId = null): bool
     {
         if (is_numeric($method)) {

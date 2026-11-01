@@ -203,6 +203,7 @@ class BookingController extends Controller
     public function store(Request $request): JsonResponse
     {
         $request->validate([
+            'customer_id' => 'nullable|integer|exists:customers,id',
             'affiliate_id' => 'nullable|integer|exists:affiliates,id',
             'customer_name' => 'required|string|max:150',
             'customer_phone' => 'required|string|max:30',
@@ -1039,6 +1040,11 @@ class BookingController extends Controller
             'battery_health_final' => 'nullable|integer|min:0|max:100',
             'checklist_results' => 'required|array',
             'checklist_results.icloud_removed' => 'nullable|boolean',
+            'checklist_results.account_quarantined' => 'nullable|boolean',
+            'checklist_results.account_status' => 'nullable|string',
+            'checklist_results.device_platform' => 'nullable|string',
+            'checklist_results.frp_removed' => 'nullable|boolean',
+            'checklist_results.google_account_removed' => 'nullable|boolean',
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',
@@ -1048,7 +1054,7 @@ class BookingController extends Controller
             'idempotency_key' => 'nullable|string|max:64',
         ]);
 
-        $booking = Booking::with('items.asset.model')->findOrFail($id);
+        $booking = Booking::with('items.asset.model.category')->findOrFail($id);
 
         $data = $request->all();
         if ($request->hasHeader('X-Idempotency-Key') && empty($data['idempotency_key'])) {

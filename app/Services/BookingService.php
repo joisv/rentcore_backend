@@ -141,22 +141,44 @@ class BookingService
             );
 
             // 1. Ensure or find Customer scoped to business
-            $customerAttrs = ['phone' => $data['customer_phone']];
-            if ($businessId) {
-                $customerAttrs['business_id'] = $businessId;
+            $customer = null;
+            if (!empty($data['customer_id'])) {
+                $customerQuery = Customer::query();
+                if ($businessId) {
+                    $customerQuery->where('business_id', $businessId);
+                }
+                $customer = $customerQuery->find($data['customer_id']);
             }
 
-            $customer = Customer::firstOrCreate(
-                $customerAttrs,
-                [
-                    'name' => $data['customer_name'],
-                    'email' => $data['customer_email'] ?? null,
-                    'address' => $data['customer_address'] ?? null,
-                ]
-            );
+            if (!$customer) {
+                $customerAttrs = ['phone' => $data['customer_phone']];
+                if ($businessId) {
+                    $customerAttrs['business_id'] = $businessId;
+                }
 
+                $customer = Customer::firstOrCreate(
+                    $customerAttrs,
+                    [
+                        'name' => $data['customer_name'],
+                        'email' => $data['customer_email'] ?? null,
+                        'address' => $data['customer_address'] ?? null,
+                    ]
+                );
+            }
+
+            // Sync updated contact/address info if cashier edited them
+            $updates = [];
+            if (!empty($data['customer_name']) && $customer->name !== $data['customer_name']) {
+                $updates['name'] = $data['customer_name'];
+            }
+            if (!empty($data['customer_phone']) && $customer->phone !== $data['customer_phone']) {
+                $updates['phone'] = $data['customer_phone'];
+            }
             if (!empty($data['customer_address']) && $customer->address !== $data['customer_address']) {
-                $customer->update(['address' => $data['customer_address']]);
+                $updates['address'] = $data['customer_address'];
+            }
+            if (!empty($updates)) {
+                $customer->update($updates);
             }
 
             if ($customer->is_blacklisted) {

@@ -44,13 +44,7 @@ class CashierController extends Controller
         if ($business) {
             $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
 
-            $qrisImageUrl = null;
-            if (!empty($config['qris_image_path'])) {
-                $version = \Illuminate\Support\Facades\Storage::disk('local')->exists($config['qris_image_path'])
-                    ? \Illuminate\Support\Facades\Storage::disk('local')->lastModified($config['qris_image_path'])
-                    : time();
-                $qrisImageUrl = url("/api/v1/payment-settings/qris-image?business_id={$business->id}" . ($branchId ? "&branch_id={$branchId}" : "") . "&v={$version}");
-            }
+            $qrisImageUrl = $business->getQrisImageUrl($branchId ? (int)$branchId : null);
 
             $filteredMethods = $allMethods->filter(function ($m) use ($business, $branchId) {
                 return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);

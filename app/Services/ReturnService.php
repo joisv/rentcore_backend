@@ -42,37 +42,132 @@ class ReturnService
                 ]);
             }
 
-            // 1. Mandatory Critical Security Guard: iCloud / Google FRP Cleared (only for devices requiring it)
-            $requiresFrp = true;
+            // 1. Mandatory Critical Security Guard: Category-Aware Device Validation
+            // Strictly scope validation by device ecosystem:
+            // - iPhone / Apple devices: ONLY check Apple ID / iCloud Activation Lock. Strictly bypass Google/FRP.
+            // - Android devices: Check Google FRP only if device is explicitly Android (operating_system == 'android' or category == 'android').
+            // - Non-phone units (PlayStation, drones, powerbanks, tents, cameras): Bypass both completely.
+            $requiresICloud = false;
+            $requiresAndroidFrp = false;
+
+            $checklist = $data['checklist_results'] ?? [];
+            $platformHint = strtolower((string)($checklist['device_platform'] ?? ''));
+
             if ($booking->items->isNotEmpty()) {
-                $requiresFrp = false;
                 foreach ($booking->items as $item) {
                     $model = $item->asset?->model;
-                    if ($model) {
-                        if ($item->item_type === 'addon' || $model->isAddon()) {
-                            continue;
-                        }
-                        $isFrpBrand = in_array(strtolower($model->brand ?? ''), ['apple', 'samsung', 'google', 'xiaomi', 'oppo', 'vivo']);
-                        $isFrpName = (bool)preg_match('/(iphone|ipad|galaxy|pixel)/i', $model->name ?? '');
-                        if ($model->requires_frp_check || $isFrpBrand || $isFrpName) {
-                            $requiresFrp = true;
-                            break;
-                        }
+                    if (!$model) {
+                        continue;
+                    }
+                    if ($item->item_type === 'addon' || $model->isAddon()) {
+                        continue;
+                    }
+
+                    $category = $model->category;
+                    $catSlug = strtolower((string)($category?->slug ?? ''));
+                    $catName = strtolower((string)($category?->name ?? ''));
+                    $brand = strtolower((string)($model->brand ?? ''));
+                    $modelName = strtolower((string)($model->name ?? ''));
+                    $assetCode = strtolower((string)($item->asset?->asset_code ?? ''));
+                    $os = strtolower((string)($model->specifications['operating_system'] ?? $model->specifications['os'] ?? ''));
+
+                    // A. Non-phone explicit exclusions (PlayStation, drones, powerbanks, outdoor gear/tents, cameras, audio, projectors)
+                    $isNonPhoneCategory = (
+                        str_contains($catSlug, 'konsol') || str_contains($catName, 'konsol') ||
+                        str_contains($catSlug, 'console') || str_contains($catName, 'console') ||
+                        str_contains($catSlug, 'game') || str_contains($catName, 'game') ||
+                        str_contains($catSlug, 'kamera') || str_contains($catName, 'kamera') ||
+                        str_contains($catSlug, 'camera') || str_contains($catName, 'camera') ||
+                        str_contains($catSlug, 'proyektor') || str_contains($catName, 'proyektor') ||
+                        str_contains($catSlug, 'projector') || str_contains($catName, 'projector') ||
+                        str_contains($catSlug, 'outdoor') || str_contains($catName, 'outdoor') ||
+                        str_contains($catSlug, 'tenda') || str_contains($catName, 'tenda') ||
+                        str_contains($catSlug, 'camp') || str_contains($catName, 'camp') ||
+                        str_contains($catSlug, 'drone') || str_contains($catName, 'drone') ||
+                        str_contains($catSlug, 'powerbank') || str_contains($catName, 'powerbank') ||
+                        str_contains($catSlug, 'audio') || str_contains($catName, 'audio') ||
+                        str_contains($catSlug, 'lensa') || str_contains($catName, 'lensa')
+                    );
+
+                    $isNonPhoneModel = (
+                        str_contains($modelName, 'playstation') || str_contains($modelName, 'ps4') || str_contains($modelName, 'ps5') ||
+                        str_contains($modelName, 'nintendo') || str_contains($modelName, 'xbox') ||
+                        str_contains($modelName, 'alpha') || str_contains($modelName, 'dslr') || str_contains($modelName, 'mirrorless') ||
+                        str_contains($modelName, 'lumens') || str_contains($modelName, 'projector') || str_contains($modelName, 'proyektor') ||
+                        str_contains($modelName, 'tenda') || str_contains($modelName, 'tent') || str_contains($modelName, 'carrier') ||
+                        str_contains($modelName, 'drone') || str_contains($modelName, 'mavic') ||
+                        str_contains($modelName, 'powerbank')
+                    );
+
+                    if ($isNonPhoneCategory || $isNonPhoneModel) {
+                        continue;
+                    }
+
+                    // B. Apple / iPhone device check
+                    // If device is Apple / iPhone / iOS hardware:
+                    $isAppleDevice = (
+                        $platformHint === 'ios' ||
+                        str_contains($brand, 'apple') ||
+                        str_contains($catSlug, 'apple') || str_contains($catName, 'apple') ||
+                        str_contains($catSlug, 'iphone') || str_contains($catName, 'iphone') ||
+                        str_contains($catSlug, 'ipad') || str_contains($catName, 'ipad') ||
+                        str_contains($catSlug, 'ios') || str_contains($catName, 'ios') ||
+                        str_contains($modelName, 'iphone') || str_contains($modelName, 'ipad') ||
+                        str_contains($modelName, 'macbook') ||
+                        str_starts_with($assetCode, 'iph') || str_starts_with($assetCode, 'app') ||
+                        $os === 'ios'
+                    );
+
+                    if ($isAppleDevice) {
+                        $requiresICloud = true;
+                        // An Apple device NEVER requires Android Google FRP!
+                        $requiresAndroidFrp = false;
+                        break;
+                    }
+
+                    // C. Android device check: Strictly triggers ONLY when operating_system == 'android' or category == 'android'
+                    // or explicitly recognized as Android smartphone brand/hardware (and never for Apple hardware)
+                    $isAndroidBrand = in_array($brand, ['samsung', 'google', 'xiaomi', 'oppo', 'vivo', 'realme', 'infinix', 'poco', 'asus']);
+                    $isAndroidPhone = $isAndroidBrand || (bool)preg_match('/(galaxy|pixel|redmi|poco|realme|infinix)/i', $modelName);
+                    $isAndroidCat = str_contains($catSlug, 'android') || str_contains($catName, 'android');
+                    $isAndroidOs = $os === 'android' || $platformHint === 'android';
+
+                    if (!$isAppleDevice && ($isAndroidCat || $isAndroidOs || ($isAndroidPhone && $model->requires_frp_check))) {
+                        $requiresAndroidFrp = true;
                     }
                 }
             }
 
-            $checklist = $data['checklist_results'] ?? [];
+            // CRITICAL INVARIANT: If this booking involves Apple/iPhone hardware, Google FRP is strictly bypassed!
+            if ($requiresICloud || $platformHint === 'ios') {
+                $requiresAndroidFrp = false;
+            }
+
             $isQuarantined = !empty($checklist['account_quarantined']) || ($checklist['account_status'] ?? '') === 'quarantined';
 
-            if ($requiresFrp && empty($checklist['icloud_removed'])) {
-                if (!$isQuarantined) {
+            if ($requiresICloud) {
+                // Strictly Apple ID / iCloud validation
+                if (empty($checklist['icloud_removed']) && !$isQuarantined) {
                     throw ValidationException::withMessages([
-                        'checklist' => ['Akun iCloud / Apple ID / Google FRP wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
+                        'checklist' => ['Akun iCloud / Apple ID wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
                     ]);
                 }
 
-                if (empty($data['staff_notes']) && empty($checklist['quarantine_notes'])) {
+                if ($isQuarantined && empty($data['staff_notes']) && empty($checklist['quarantine_notes'])) {
+                    throw ValidationException::withMessages([
+                        'staff_notes' => ['Catatan staf wajib diisi untuk mendokumentasikan alasan karantina akun dan rencana tindak lanjut.'],
+                    ]);
+                }
+            } elseif ($requiresAndroidFrp) {
+                // Strictly Android Google FRP validation
+                $isFrpRemoved = !empty($checklist['frp_removed']) || !empty($checklist['google_account_removed']);
+                if (!$isFrpRemoved && !$isQuarantined) {
+                    throw ValidationException::withMessages([
+                        'checklist' => ['Akun Google / FRP wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
+                    ]);
+                }
+
+                if ($isQuarantined && empty($data['staff_notes']) && empty($checklist['quarantine_notes'])) {
                     throw ValidationException::withMessages([
                         'staff_notes' => ['Catatan staf wajib diisi untuk mendokumentasikan alasan karantina akun dan rencana tindak lanjut.'],
                     ]);
@@ -348,7 +443,7 @@ class ReturnService
                     'late_fee' => $lateFee,
                     'damage_fee' => $damageFee,
                     'total_penalty' => $totalPenalty,
-                    'icloud_removed' => $requiresFrp ? true : null,
+                    'icloud_removed' => $requiresICloud ? true : ($requiresAndroidFrp ? true : null),
                 ],
                 [
                     'previous_status' => 'rented',

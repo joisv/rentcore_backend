@@ -37,6 +37,9 @@ Route::prefix('v1')->group(function () {
         Route::post('/auth/google-sign-in', [AuthController::class, 'googleSignIn']);
     });
 
+    // --- Public Assets / Static QRIS Streaming ---
+    Route::get('/payment-settings/qris-image', [PaymentSettingsController::class, 'getQrisImage']);
+
     // --- Protected Routes (Sanctum Authenticated) ---
     Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
 
@@ -165,7 +168,7 @@ Route::prefix('v1')->group(function () {
 
             // Configurable Payment Methods & Static QRIS Settings
             Route::get('/payment-settings', [PaymentSettingsController::class, 'getSettings']);
-            Route::put('/payment-settings', [PaymentSettingsController::class, 'updateSettings']);
+            Route::match(['put', 'post'], '/payment-settings', [PaymentSettingsController::class, 'updateSettings']);
             Route::get('/payment-settings/qris-image', [PaymentSettingsController::class, 'getQrisImage']);
 
             // Branch Operating Expenses
