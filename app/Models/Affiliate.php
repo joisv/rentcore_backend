@@ -27,6 +27,8 @@ class Affiliate extends Model
         'shift_opening_time_override',
         'shift_closing_time_override',
         'payment_methods_config_override',
+        'qris_raw_payload',
+        'is_dynamic_qris_enabled',
         'is_active',
     ];
 
@@ -38,6 +40,7 @@ class Affiliate extends Model
         'cashier_discount_limit_nominal' => 'decimal:2',
         'expense_pin_threshold_override' => 'decimal:2',
         'payment_methods_config_override' => 'array',
+        'is_dynamic_qris_enabled' => 'boolean',
     ];
 
     protected static function booted(): void

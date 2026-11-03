@@ -170,6 +170,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/payment-settings', [PaymentSettingsController::class, 'getSettings']);
             Route::match(['put', 'post'], '/payment-settings', [PaymentSettingsController::class, 'updateSettings']);
             Route::get('/payment-settings/qris-image', [PaymentSettingsController::class, 'getQrisImage']);
+            Route::post('/payment-settings/qris-image', [PaymentSettingsController::class, 'uploadQrisImage']);
 
             // Branch Operating Expenses
             Route::get('/cashier/expenses', [ExpenseController::class, 'index']);

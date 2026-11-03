@@ -3,16 +3,16 @@
 namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\PaymentSettingRequest;
 use App\Models\Affiliate;
 use App\Models\Business;
 use App\Models\PaymentMethod;
 use App\Services\AuditLogService;
+use App\Services\QrisService;
 use App\Tenancy\TenantContext;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
-use Illuminate\Support\Str;
-use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\Response;
 
 class PaymentSettingsController extends Controller
@@ -66,7 +66,6 @@ class PaymentSettingsController extends Controller
         }
 
         $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
-
         $qrisImageUrl = $business->getQrisImageUrl($branchId ? (int)$branchId : null);
 
         $isBranchOverride = false;
@@ -93,6 +92,8 @@ class PaymentSettingsController extends Controller
                         'ovo' => (bool)($config['ewallet_providers']['ovo'] ?? true),
                     ],
                     'qris_statis_enabled' => (bool)($config['qris_statis_enabled'] ?? true),
+                    'is_dynamic_qris_enabled' => (bool)($config['is_dynamic_qris_enabled'] ?? false),
+                    'qris_raw_payload' => $config['qris_raw_payload'] ?? null,
                     'qris_image_path' => $config['qris_image_path'] ?? null,
                     'qris_image_url' => $qrisImageUrl,
                     'cash_enabled' => (bool)($config['cash_enabled'] ?? true),
@@ -105,7 +106,7 @@ class PaymentSettingsController extends Controller
     /**
      * Update payment method configuration (Owner & Admin only).
      */
-    public function updateSettings(Request $request): JsonResponse
+    public function updateSettings(PaymentSettingRequest $request): JsonResponse
     {
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
@@ -119,77 +120,8 @@ class PaymentSettingsController extends Controller
             ], 403);
         }
 
-        $toBool = function ($val) {
-            if ($val === null) {
-                return null;
-            }
-            if (is_bool($val)) {
-                return $val;
-            }
-            if (is_numeric($val)) {
-                return (int)$val === 1;
-            }
-            $lower = strtolower(trim((string)$val));
-            if (in_array($lower, ['true', '1', 'yes', 'on'], true)) {
-                return true;
-            }
-            if (in_array($lower, ['false', '0', 'no', 'off'], true)) {
-                return false;
-            }
-            return $val;
-        };
-
-        $mergeData = [];
-
-        // Check for ewallet aliases (wallet_enable, wallet_enabled, e_wallet_enabled, is_wallet_enabled)
-        $rawEwallet = $request->input('ewallet_enabled')
-            ?? $request->input('wallet_enable')
-            ?? $request->input('wallet_enabled')
-            ?? $request->input('e_wallet_enabled')
-            ?? $request->input('is_wallet_enabled');
-
-        if ($rawEwallet !== null) {
-            $parsed = $toBool($rawEwallet);
-            $mergeData['ewallet_enabled'] = $parsed;
-            $mergeData['wallet_enable'] = $parsed;
-        }
-
-        foreach (['qris_statis_enabled', 'cash_enabled', 'bank_transfer_enabled', 'remove_qris_image'] as $boolKey) {
-            if ($request->has($boolKey)) {
-                $mergeData[$boolKey] = $toBool($request->input($boolKey));
-            }
-        }
-
-        if ($request->has('ewallet_providers') && is_array($request->input('ewallet_providers'))) {
-            $providers = $request->input('ewallet_providers');
-            foreach ($providers as $provKey => $provVal) {
-                $providers[$provKey] = $toBool($provVal);
-            }
-            $mergeData['ewallet_providers'] = $providers;
-        }
-
-        if (!empty($mergeData)) {
-            $request->merge($mergeData);
-        }
-
-        $validated = $request->validate([
-            'branch_id' => 'sometimes|nullable|integer|exists:affiliates,id',
-            'ewallet_enabled' => 'sometimes|nullable|boolean',
-            'wallet_enable' => 'sometimes|nullable|boolean',
-            'wallet_enabled' => 'sometimes|nullable|boolean',
-            'e_wallet_enabled' => 'sometimes|nullable|boolean',
-            'ewallet_providers' => 'sometimes|nullable|array',
-            'ewallet_providers.shopeepay' => 'sometimes|nullable|boolean',
-            'ewallet_providers.dana' => 'sometimes|nullable|boolean',
-            'ewallet_providers.linkaja' => 'sometimes|nullable|boolean',
-            'ewallet_providers.ovo' => 'sometimes|nullable|boolean',
-            'qris_statis_enabled' => 'sometimes|nullable|boolean',
-            'cash_enabled' => 'sometimes|nullable|boolean',
-            'bank_transfer_enabled' => 'sometimes|nullable|boolean',
-            'remove_qris_image' => 'sometimes|nullable|boolean',
-            'qris_image' => 'sometimes|nullable|file|mimes:jpeg,png,jpg|max:2048',
-            'qris_image_base64' => 'sometimes|nullable|string',
-        ]);
+        $validated = $request->validated();
+        $qrisService = app(QrisService::class);
 
         $branchId = !empty($validated['branch_id']) ? (int)$validated['branch_id'] : null;
         $branch = null;
@@ -209,6 +141,8 @@ class PaymentSettingsController extends Controller
                     'ovo' => true,
                 ],
                 'qris_statis_enabled' => true,
+                'is_dynamic_qris_enabled' => false,
+                'qris_raw_payload' => null,
                 'qris_image_path' => null,
                 'cash_enabled' => true,
                 'bank_transfer_enabled' => true,
@@ -255,6 +189,8 @@ class PaymentSettingsController extends Controller
                 }
             }
             $newConfig['qris_image_path'] = null;
+            $newConfig['qris_raw_payload'] = null;
+            $newConfig['is_dynamic_qris_enabled'] = false;
         }
 
         // Scoped folder for store / branch QRIS
@@ -268,6 +204,21 @@ class PaymentSettingsController extends Controller
                 ? sprintf('%d_qris_%d.%s', $branch->id, time(), $ext)
                 : sprintf('biz_%d_qris_%d.%s', $business->id, time(), $ext);
             $newPath = $file->storeAs($folder, $filename, 'public');
+            $absolutePath = Storage::disk('public')->path($newPath);
+
+            $rawPayload = $qrisService->decodeQrisImage($absolutePath);
+
+            if (!$rawPayload || !$qrisService->isValidQrisPayload($rawPayload)) {
+                // If decoding fails or is invalid EMVCo QRIS, delete uploaded file and reject
+                Storage::disk('public')->delete($newPath);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Gambar tidak valid atau barcode QRIS tidak terdeteksi.',
+                    'errors' => [
+                        'qris_image' => ['Gambar tidak valid atau barcode QRIS tidak terdeteksi.'],
+                    ],
+                ], 422);
+            }
 
             // Delete old file safely
             if (!empty($newConfig['qris_image_path']) && $newConfig['qris_image_path'] !== $newPath) {
@@ -280,6 +231,7 @@ class PaymentSettingsController extends Controller
             }
 
             $newConfig['qris_image_path'] = $newPath;
+            $newConfig['qris_raw_payload'] = $rawPayload;
         } elseif (!empty($validated['qris_image_base64'])) {
             // Handle base64 upload
             $photoData = $validated['qris_image_base64'];
@@ -295,6 +247,21 @@ class PaymentSettingsController extends Controller
                     : sprintf('biz_%d_qris_%d.%s', $business->id, time(), $ext);
                 $newPath = $folder . '/' . $filename;
                 Storage::disk('public')->put($newPath, $decoded);
+                $absolutePath = Storage::disk('public')->path($newPath);
+
+                $rawPayload = $qrisService->decodeQrisImage($absolutePath);
+
+                if (!$rawPayload || !$qrisService->isValidQrisPayload($rawPayload)) {
+                    // If decoding fails or is invalid EMVCo QRIS, delete uploaded file and reject
+                    Storage::disk('public')->delete($newPath);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Gambar tidak valid atau barcode QRIS tidak terdeteksi.',
+                        'errors' => [
+                            'qris_image' => ['Gambar tidak valid atau barcode QRIS tidak terdeteksi.'],
+                        ],
+                    ], 422);
+                }
 
                 if (!empty($newConfig['qris_image_path']) && $newConfig['qris_image_path'] !== $newPath) {
                     if (Storage::disk('public')->exists($newConfig['qris_image_path'])) {
@@ -306,14 +273,42 @@ class PaymentSettingsController extends Controller
                 }
 
                 $newConfig['qris_image_path'] = $newPath;
+                $newConfig['qris_raw_payload'] = $rawPayload;
+            }
+        } elseif (!empty($validated['qris_raw_payload'])) {
+            if ($qrisService->isValidQrisPayload($validated['qris_raw_payload'])) {
+                $newConfig['qris_raw_payload'] = $validated['qris_raw_payload'];
             }
         }
 
-        // Persist
+        // Handle is_dynamic_qris_enabled toggle guard
+        if (isset($validated['is_dynamic_qris_enabled'])) {
+            $isDyn = (bool)$validated['is_dynamic_qris_enabled'];
+            if ($isDyn && empty($newConfig['qris_raw_payload'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unggah gambar QRIS statis terlebih dahulu untuk mengaktifkan QRIS Dinamis.',
+                    'errors' => [
+                        'is_dynamic_qris_enabled' => ['Unggah gambar QRIS statis terlebih dahulu untuk mengaktifkan QRIS Dinamis.'],
+                    ],
+                ], 422);
+            }
+            $newConfig['is_dynamic_qris_enabled'] = $isDyn;
+        }
+
+        // Persist to database
         if ($branch) {
-            $branch->update(['payment_methods_config_override' => $newConfig]);
+            $branch->update([
+                'payment_methods_config_override' => $newConfig,
+                'qris_raw_payload' => $newConfig['qris_raw_payload'] ?? null,
+                'is_dynamic_qris_enabled' => $newConfig['is_dynamic_qris_enabled'] ?? false,
+            ]);
         } else {
-            $business->update(['payment_methods_config' => $newConfig]);
+            $business->update([
+                'payment_methods_config' => $newConfig,
+                'qris_raw_payload' => $newConfig['qris_raw_payload'] ?? null,
+                'is_dynamic_qris_enabled' => $newConfig['is_dynamic_qris_enabled'] ?? false,
+            ]);
         }
 
         AuditLogService::log(
@@ -325,11 +320,22 @@ class PaymentSettingsController extends Controller
                 'branch_id' => $branchId,
                 'ewallet_enabled' => $newConfig['ewallet_enabled'] ?? null,
                 'qris_statis_enabled' => $newConfig['qris_statis_enabled'] ?? null,
+                'is_dynamic_qris_enabled' => $newConfig['is_dynamic_qris_enabled'] ?? null,
                 'has_qris_image' => !empty($newConfig['qris_image_path']),
+                'has_qris_payload' => !empty($newConfig['qris_raw_payload']),
             ]
         );
 
         return $this->getSettings($request);
+    }
+
+    /**
+     * Dedicated endpoint for QRIS image upload.
+     */
+    public function uploadQrisImage(Request $request): JsonResponse
+    {
+        $appRequest = app(PaymentSettingRequest::class);
+        return $this->updateSettings($appRequest);
     }
 
     /**
@@ -340,14 +346,11 @@ class PaymentSettingsController extends Controller
         $businessId = $request->query('business_id');
         $branchId = $request->query('branch_id');
 
-        if (!$businessId && !$branchId) {
-            return response()->json(['message' => 'Parameter tidak lengkap.'], 400);
-        }
-
-        $business = Business::find($businessId);
-        if (!$business && $branchId) {
+        if (!$businessId && $branchId) {
             $branch = Affiliate::find($branchId);
             $business = $branch?->business;
+        } else {
+            $business = Business::find($businessId);
         }
 
         if (!$business) {
@@ -357,16 +360,20 @@ class PaymentSettingsController extends Controller
         $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
         $path = $config['qris_image_path'] ?? null;
 
-        if ($path && Storage::disk('public')->exists($path)) {
-            return Storage::disk('public')->response($path, null, [
-                'Cache-Control' => 'public, max-age=86400',
-            ]);
-        }
+        if ($path) {
+            if (Storage::disk('public')->exists($path)) {
+                return response()->file(Storage::disk('public')->path($path), [
+                    'Cache-Control' => 'no-cache, private, must-revalidate',
+                    'Content-Disposition' => 'inline',
+                ]);
+            }
 
-        if ($path && Storage::disk('local')->exists($path)) {
-            return Storage::disk('local')->response($path, null, [
-                'Cache-Control' => 'public, max-age=86400',
-            ]);
+            if (Storage::disk('local')->exists($path)) {
+                return response()->file(Storage::disk('local')->path($path), [
+                    'Cache-Control' => 'no-cache, private, must-revalidate',
+                    'Content-Disposition' => 'inline',
+                ]);
+            }
         }
 
         return response()->json(['message' => 'Gambar QRIS tidak ditemukan.'], 404);

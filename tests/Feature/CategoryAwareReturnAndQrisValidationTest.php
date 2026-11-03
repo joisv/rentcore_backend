@@ -296,12 +296,20 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $this->assertEquals('returned', $androidBooking->fresh()->status);
     }
 
-    public function test_static_qris_image_upload_and_public_url_accessor(): void
+    protected function getValidQrisUploadedFile(string $filename = 'qris_sample.png'): UploadedFile
+    {
+        $fixturePath = base_path('tests/Fixtures/sample_qris.png');
+        $tempPath = tempnam(sys_get_temp_dir(), 'qris_') . '.png';
+        copy($fixturePath, $tempPath);
+        return new UploadedFile($tempPath, $filename, 'image/png', null, true);
+    }
+
+    public function test_invalid_qris_image_upload_is_rejected_with_specific_error(): void
     {
         $ownerToken = $this->owner->createToken('Owner')->plainTextToken;
 
-        // 1. Upload static QRIS image
-        $file = UploadedFile::fake()->image('qris_sample.png', 400, 400);
+        // Blank image without QR barcode
+        $file = UploadedFile::fake()->image('invalid_blank.png', 400, 400);
 
         $uploadResp = $this->withHeader('Authorization', "Bearer {$ownerToken}")
             ->withHeader('X-Branch-Id', (string)$this->branch->id)
@@ -310,12 +318,50 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
                 'qris_image' => $file,
             ]);
 
+        $uploadResp->assertStatus(422);
+        $this->assertStringContainsString('Gambar tidak valid atau barcode QRIS tidak terdeteksi.', $uploadResp->json('message'));
+    }
+
+    public function test_dynamic_qris_toggle_guard_rejects_activation_without_raw_payload(): void
+    {
+        $ownerToken = $this->owner->createToken('Owner')->plainTextToken;
+
+        // Attempt to enable dynamic QRIS when no QRIS payload has ever been uploaded
+        $resp = $this->withHeader('Authorization', "Bearer {$ownerToken}")
+            ->withHeader('X-Branch-Id', (string)$this->branch->id)
+            ->post('/api/v1/payment-settings', [
+                'branch_id' => $this->branch->id,
+                'is_dynamic_qris_enabled' => true,
+            ]);
+
+        $resp->assertStatus(422);
+        $this->assertStringContainsString('Unggah gambar QRIS statis terlebih dahulu untuk mengaktifkan QRIS Dinamis.', $resp->json('message'));
+    }
+
+    public function test_static_qris_image_upload_decodes_payload_and_enables_dynamic_toggle(): void
+    {
+        $ownerToken = $this->owner->createToken('Owner')->plainTextToken;
+
+        // 1. Upload valid static QRIS image
+        $file = $this->getValidQrisUploadedFile('qris_sample.png');
+
+        $uploadResp = $this->withHeader('Authorization', "Bearer {$ownerToken}")
+            ->withHeader('X-Branch-Id', (string)$this->branch->id)
+            ->post('/api/v1/payment-settings', [
+                'branch_id' => $this->branch->id,
+                'qris_image' => $file,
+                'is_dynamic_qris_enabled' => true,
+            ]);
+
         $uploadResp->assertStatus(200);
         $config = $uploadResp->json('data.config');
         $this->assertNotEmpty($config['qris_image_url']);
+        $this->assertNotEmpty($config['qris_raw_payload']);
+        $this->assertStringStartsWith('000201', $config['qris_raw_payload']);
+        $this->assertTrue($config['is_dynamic_qris_enabled']);
         $this->assertStringContainsString('storage/qris/', $config['qris_image_url']);
 
-        // 2. Cashier paymentMethods returns active branch qris_image_url
+        // 2. Cashier paymentMethods returns active branch qris_image_url and qris_raw_payload
         $staffToken = $this->staff->createToken('Staff')->plainTextToken;
         $methodsResp = $this->withHeader('Authorization', "Bearer {$staffToken}")
             ->withHeader('X-Branch-Id', (string)$this->branch->id)
@@ -326,6 +372,8 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $qrisMethod = collect($methods)->firstWhere('code', 'QRIS');
         $this->assertNotNull($qrisMethod);
         $this->assertNotEmpty($qrisMethod['qris_image_url']);
+        $this->assertEquals($config['qris_raw_payload'], $qrisMethod['qris_raw_payload']);
+        $this->assertTrue($qrisMethod['is_dynamic_qris_enabled']);
         $this->assertStringContainsString('storage/qris/', $qrisMethod['qris_image_url']);
 
         // 3. Public static image endpoint can be streamed without token
@@ -338,7 +386,7 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $ownerToken = $this->owner->createToken('Owner')->plainTextToken;
 
         // Upload static QRIS image while disabling ewallets using both boolean false and string 'false' / wallet_enable
-        $file = UploadedFile::fake()->image('qris_disabled_wallets.png', 400, 400);
+        $file = $this->getValidQrisUploadedFile('qris_disabled_wallets.png');
 
         $uploadResp = $this->withHeader('Authorization', "Bearer {$ownerToken}")
             ->withHeader('X-Branch-Id', (string)$this->branch->id)
@@ -362,6 +410,7 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $this->assertTrue($config['qris_statis_enabled']);
         $this->assertFalse($config['bank_transfer_enabled']);
         $this->assertNotEmpty($config['qris_image_url']);
+        $this->assertNotEmpty($config['qris_raw_payload']);
         $this->assertStringContainsString('storage/qris/', $config['qris_image_url']);
     }
 
@@ -369,7 +418,7 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
     {
         $ownerToken = $this->owner->createToken('Owner')->plainTextToken;
 
-        $file = UploadedFile::fake()->image('qris_partial.png', 400, 400);
+        $file = $this->getValidQrisUploadedFile('qris_partial.png');
 
         // Submitting only QRIS image (e-wallets completely omitted from payload)
         $uploadResp = $this->withHeader('Authorization', "Bearer {$ownerToken}")
@@ -382,6 +431,7 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $uploadResp->assertStatus(200);
         $config = $uploadResp->json('data.config');
         $this->assertNotEmpty($config['qris_image_url']);
+        $this->assertNotEmpty($config['qris_raw_payload']);
         $this->assertNotNull($config['ewallet_enabled']);
     }
 }

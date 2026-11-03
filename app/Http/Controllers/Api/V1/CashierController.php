@@ -48,10 +48,12 @@ class CashierController extends Controller
 
             $filteredMethods = $allMethods->filter(function ($m) use ($business, $branchId) {
                 return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);
-            })->map(function ($m) use ($qrisImageUrl) {
+            })->map(function ($m) use ($qrisImageUrl, $config) {
                 $item = $m->toArray();
                 if (strtoupper($m->code) === 'QRIS') {
                     $item['qris_image_url'] = $qrisImageUrl;
+                    $item['qris_raw_payload'] = $config['qris_raw_payload'] ?? null;
+                    $item['is_dynamic_qris_enabled'] = (bool)($config['is_dynamic_qris_enabled'] ?? false);
                 }
                 return $item;
             })->values();

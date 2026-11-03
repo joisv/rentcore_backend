@@ -38,6 +38,8 @@ class Business extends Model
         'shift_closing_time',
         'shift_grace_period_minutes',
         'payment_methods_config',
+        'qris_raw_payload',
+        'is_dynamic_qris_enabled',
     ];
 
     protected $casts = [
@@ -52,6 +54,7 @@ class Business extends Model
         'shift_enforcement_enabled' => 'boolean',
         'shift_grace_period_minutes' => 'integer',
         'payment_methods_config' => 'array',
+        'is_dynamic_qris_enabled' => 'boolean',
     ];
 
     public function getPaymentMethodsConfig(?int $affiliateId = null): array
@@ -66,6 +69,8 @@ class Business extends Model
                 'ovo' => true,
             ],
             'qris_statis_enabled' => true,
+            'is_dynamic_qris_enabled' => (bool)($this->is_dynamic_qris_enabled ?? false),
+            'qris_raw_payload' => $this->qris_raw_payload,
             'qris_image_path' => null,
             'cash_enabled' => true,
             'bank_transfer_enabled' => true,
@@ -75,8 +80,16 @@ class Business extends Model
 
         if ($affiliateId) {
             $branch = $this->branches()->find($affiliateId);
-            if ($branch && !empty($branch->payment_methods_config_override)) {
-                $config = array_replace_recursive($config, $branch->payment_methods_config_override);
+            if ($branch) {
+                if (!empty($branch->payment_methods_config_override)) {
+                    $config = array_replace_recursive($config, $branch->payment_methods_config_override);
+                }
+                if ($branch->qris_raw_payload !== null) {
+                    $config['qris_raw_payload'] = $branch->qris_raw_payload;
+                }
+                if ($branch->is_dynamic_qris_enabled !== null) {
+                    $config['is_dynamic_qris_enabled'] = (bool)$branch->is_dynamic_qris_enabled;
+                }
             }
         }
 
