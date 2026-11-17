@@ -45,7 +45,12 @@ class BusinessController extends Controller
                 'address' => $biz->address,
                 'city' => $biz->city,
                 'currency' => $biz->currency,
+                'payment_methods_config' => $biz->payment_methods_config,
+                'qris_raw_payload' => $biz->qris_raw_payload,
+                'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
                 'business_categories' => $biz->business_categories ?? [],
+                'branch_structure' => $biz->branch_structure ?? 'single_location',
+                'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
                 'role' => $membership->role,
                 'joined_at' => $membership->joined_at,
                 // Only branches this member is authorized for (central first). Prevents the
@@ -75,11 +80,50 @@ class BusinessController extends Controller
             'currency' => 'nullable|string|max:10',
             'business_categories' => 'nullable|array',
             'business_categories.*' => 'string|max:50',
+            'branch_structure' => 'nullable|string|in:single_location,multi_branch,single_scalable',
             'initial_branch_name' => 'nullable|string|max:150',
             'initial_branch_code' => 'nullable|string|max:10',
+            'pending_business_id' => 'nullable|integer|exists:businesses,id',
         ]);
 
         $user = $request->user();
+
+        // Idempotency check: Reuse and update existing pending business owned by user
+        $existingBusiness = null;
+        if (!empty($validated['pending_business_id'])) {
+            $existingBusiness = Business::where('id', $validated['pending_business_id'])
+                ->where('owner_id', $user->id)
+                ->first();
+        }
+        if (!$existingBusiness) {
+            $existingBusiness = Business::where('owner_id', $user->id)
+                ->where('has_completed_onboarding', false)
+                ->first();
+        }
+        if (!$existingBusiness) {
+            $existingBusiness = Business::where('owner_id', $user->id)
+                ->where('name', trim($validated['name']))
+                ->first();
+        }
+
+        if ($existingBusiness) {
+            $existingBusiness->update(array_filter([
+                'name' => $validated['name'],
+                'phone' => $validated['phone'] ?? $existingBusiness->phone,
+                'email' => $validated['email'] ?? $existingBusiness->email,
+                'address' => $validated['address'] ?? $existingBusiness->address,
+                'city' => $validated['city'] ?? $existingBusiness->city,
+                'business_categories' => $validated['business_categories'] ?? $existingBusiness->business_categories,
+                'branch_structure' => $validated['branch_structure'] ?? $existingBusiness->branch_structure ?? 'single_location',
+                'has_completed_onboarding' => true,
+            ], fn($v) => $v !== null));
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Bisnis rental berhasil diperbarui.',
+                'data' => $existingBusiness->load('branches'),
+            ], 200);
+        }
 
         $business = DB::transaction(function () use ($validated, $user, $request) {
             $business = Business::create([
@@ -89,6 +133,8 @@ class BusinessController extends Controller
                 'address' => $validated['address'] ?? null,
                 'city' => $validated['city'] ?? null,
                 'business_categories' => $validated['business_categories'] ?? null,
+                'branch_structure' => $validated['branch_structure'] ?? 'single_location',
+                'has_completed_onboarding' => true,
                 'currency' => $validated['currency'] ?? 'IDR',
                 'owner_id' => $user->id,
                 'is_active' => true,
@@ -240,6 +286,8 @@ class BusinessController extends Controller
             'city' => 'nullable|string|max:100',
             'business_categories' => 'nullable|array',
             'business_categories.*' => 'string|max:50',
+            'branch_structure' => 'nullable|string|in:single_location,multi_branch,single_scalable',
+            'has_completed_onboarding' => 'nullable|boolean',
         ]);
 
         $business->update(array_filter($validated, fn($v) => $v !== null));

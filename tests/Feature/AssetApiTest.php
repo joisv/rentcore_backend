@@ -142,4 +142,64 @@ class AssetApiTest extends TestCase
             'user_id' => $this->staff->id,
         ]);
     }
+
+    public function test_index_returns_unique_physical_units_and_filters_by_branch(): void
+    {
+        $otherBranch = Affiliate::create([
+            'name' => 'Branch Cakranegara',
+            'slug' => 'branch-cakranegara',
+            'code' => 'CKR',
+            'is_active' => true,
+        ]);
+
+        $unit1 = Asset::create([
+            'affiliate_id' => $this->affiliate->id,
+            'model_id' => $this->model->id,
+            'asset_code' => 'IP15P-MTR-101',
+            'serial_number' => 'SN101',
+            'status' => 'ready',
+            'condition_grade' => 'A',
+            'battery_health' => 99,
+        ]);
+
+        $unit2 = Asset::create([
+            'affiliate_id' => $this->affiliate->id,
+            'model_id' => $this->model->id,
+            'asset_code' => 'IP15P-MTR-102',
+            'serial_number' => 'SN102',
+            'status' => 'rented',
+            'condition_grade' => 'A',
+            'battery_health' => 95,
+        ]);
+
+        // Unit at other branch
+        Asset::create([
+            'affiliate_id' => $otherBranch->id,
+            'model_id' => $this->model->id,
+            'asset_code' => 'IP15P-CKR-103',
+            'serial_number' => 'SN103',
+            'status' => 'ready',
+            'condition_grade' => 'A',
+            'battery_health' => 100,
+        ]);
+
+        $response = $this->actingAs($this->staff, 'sanctum')
+            ->getJson("/api/v1/assets?branch_id={$this->affiliate->id}");
+
+        $response->assertStatus(200);
+
+        $responseData = $response->json('data.data');
+        $this->assertIsArray($responseData);
+
+        $unitIds = array_column($responseData, 'id');
+        $this->assertCount(count($unitIds), array_unique($unitIds), 'Physical unit IDs must be strictly unique');
+        $this->assertContains($unit1->id, $unitIds);
+        $this->assertContains($unit2->id, $unitIds);
+
+        foreach ($responseData as $unit) {
+            $this->assertEquals($this->affiliate->id, $unit['affiliate_id'], 'Query must only return units for target branch');
+            $this->assertArrayHasKey('asset_model', $unit);
+            $this->assertArrayHasKey('branch', $unit);
+        }
+    }
 }

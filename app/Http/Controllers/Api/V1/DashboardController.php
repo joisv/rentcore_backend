@@ -120,6 +120,7 @@ class DashboardController extends Controller
             ->count();
 
         $todayRentalsCreated = (clone $bookingQuery)->whereBetween('created_at', [$todayStart, $todayEnd])->count();
+        $pendingPickupCount = (clone $bookingQuery)->where('status', 'confirmed')->count();
         $activeRentals = $unitsRented;
 
         $overdueBookings = (clone $bookingQuery)->with(['customer', 'items.asset.model'])
@@ -150,6 +151,7 @@ class DashboardController extends Controller
                 'customer_name' => $booking->customer?->name ?? 'Pelanggan Umum',
                 'customer_phone' => $booking->customer?->phone ?? '-',
                 'unit_name' => $unitName,
+                'unit_image_url' => $firstItem?->asset?->model?->image_url,
                 'late_duration_text' => sprintf('%02d jam %02d mnt', $hours, $mins),
                 'late_minutes' => $lateMinutes,
                 'running_penalty' => $runningFee,
@@ -176,6 +178,7 @@ class DashboardController extends Controller
                     'customer_name' => $booking->customer?->name ?? 'Pelanggan Umum',
                     'customer_phone' => $booking->customer?->phone ?? '-',
                     'unit_name' => $unitName,
+                    'unit_image_url' => $firstItem?->asset?->model?->image_url,
                     'expected_return_at' => $expectedReturn,
                     'collateral_storage_slot' => $booking->collateral_storage_slot,
                 ];
@@ -225,6 +228,10 @@ class DashboardController extends Controller
                 'kpi' => [
                     // Inventory overview
                     'units_total' => $unitsTotal,
+                    'total_units' => $unitsTotal,
+                    'total_units_count' => $unitsTotal,
+                    'total_assets' => $unitsTotal,
+                    'has_physical_units' => $unitsTotal > 0,
                     'units_ready' => $unitsReady,
                     'units_rented' => $unitsRented,
                     'units_maintenance' => $unitsMaintenance,
@@ -232,8 +239,11 @@ class DashboardController extends Controller
                     'utilization_rate' => $utilizationRate,
                     // Operational metrics
                     'active_rentals' => $activeRentals,
+                    'pending_pickup_count' => $pendingPickupCount,
                     'due_today' => $dueToday,
+                    'due_today_count' => $dueToday,
                     'overdue' => $overdueCount,
+                    'overdue_count' => $overdueCount,
                     'today_rentals_created' => $todayRentalsCreated,
                     // Financial summary
                     'today_revenue' => $todayRevenue,

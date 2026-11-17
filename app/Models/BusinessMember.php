@@ -112,6 +112,9 @@ class BusinessMember extends Model
             'name' => $b->name,
             'city' => $b->city,
             'is_central' => (bool) $b->is_central,
+            'payment_methods_config_override' => $b->payment_methods_config_override,
+            'qris_raw_payload' => $b->qris_raw_payload,
+            'is_dynamic_qris_enabled' => (bool) ($b->is_dynamic_qris_enabled ?? false),
         ])->values()->all();
     }
 }

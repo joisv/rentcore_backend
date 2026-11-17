@@ -48,6 +48,7 @@ Route::prefix('v1')->group(function () {
         Route::put('/auth/profile', [AuthController::class, 'updateProfile']);
         Route::put('/auth/password', [AuthController::class, 'updatePassword']);
         Route::post('/auth/logout', [AuthController::class, 'logout']);
+        Route::post('/auth/walkthrough-completed', [AuthController::class, 'completeWalkthrough']);
 
         // Business Onboarding & Organization Management (Non-tenant scoped)
         Route::get('/businesses', [BusinessController::class, 'index']);

@@ -248,7 +248,14 @@ class BookingController extends Controller
 
         // Strict pre-checkout active shift enforcement
         $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
-        ShiftEnforcementService::requireActiveShift(
+        $activeShift = null;
+        if (!empty($payload['shift_id'])) {
+            $activeShift = \App\Models\CashDrawerShift::where('id', $payload['shift_id'])
+                ->where('branch_id', $targetBranchId)
+                ->where('status', 'open')
+                ->first();
+        }
+        $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
             $targetBranchId,
             $request->user(),
             true,
@@ -1038,6 +1045,8 @@ class BookingController extends Controller
             'returned_at' => 'nullable|date',
             'condition_grade' => 'required|in:A,B,C',
             'battery_health_final' => 'nullable|integer|min:0|max:100',
+            'frp_cleared' => 'nullable|boolean',
+            'account_removed' => 'nullable|boolean',
             'checklist_results' => 'required|array',
             'checklist_results.icloud_removed' => 'nullable|boolean',
             'checklist_results.account_quarantined' => 'nullable|boolean',
@@ -1045,6 +1054,8 @@ class BookingController extends Controller
             'checklist_results.device_platform' => 'nullable|string',
             'checklist_results.frp_removed' => 'nullable|boolean',
             'checklist_results.google_account_removed' => 'nullable|boolean',
+            'checklist_results.frp_cleared' => 'nullable|boolean',
+            'checklist_results.account_removed' => 'nullable|boolean',
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',

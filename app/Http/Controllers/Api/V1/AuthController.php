@@ -49,10 +49,23 @@ class AuthController extends Controller
             ->get();
 
         $businesses = $memberships->map(function ($m) {
+            $biz = $m->business;
             return [
-                'id' => $m->business->id,
-                'uuid' => $m->business->uuid,
-                'name' => $m->business->name,
+                'id' => $biz->id,
+                'uuid' => $biz->uuid,
+                'name' => $biz->name,
+                'slogan' => $biz->slogan,
+                'slug' => $biz->slug,
+                'phone' => $biz->phone,
+                'address' => $biz->address,
+                'city' => $biz->city,
+                'currency' => $biz->currency,
+                'payment_methods_config' => $biz->payment_methods_config,
+                'qris_raw_payload' => $biz->qris_raw_payload,
+                'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
+                'business_categories' => $biz->business_categories ?? [],
+                'branch_structure' => $biz->branch_structure ?? 'single_location',
+                'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
                 'role' => $m->role,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
@@ -70,6 +83,7 @@ class AuthController extends Controller
                     'phone' => $user->phone,
                     'role' => $user->role,
                     'has_password' => !empty($user->password),
+                    'has_completed_walkthrough_v1' => (bool) ($user->has_completed_walkthrough_v1 ?? false),
                     'affiliate' => $user->affiliate ? [
                         'id' => $user->affiliate->id,
                         'code' => $user->affiliate->code,
@@ -221,10 +235,23 @@ class AuthController extends Controller
             ->get();
 
         $businesses = $memberships->map(function ($m) {
+            $biz = $m->business;
             return [
-                'id' => $m->business->id,
-                'uuid' => $m->business->uuid,
-                'name' => $m->business->name,
+                'id' => $biz->id,
+                'uuid' => $biz->uuid,
+                'name' => $biz->name,
+                'slogan' => $biz->slogan,
+                'slug' => $biz->slug,
+                'phone' => $biz->phone,
+                'address' => $biz->address,
+                'city' => $biz->city,
+                'currency' => $biz->currency,
+                'payment_methods_config' => $biz->payment_methods_config,
+                'qris_raw_payload' => $biz->qris_raw_payload,
+                'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
+                'business_categories' => $biz->business_categories ?? [],
+                'branch_structure' => $biz->branch_structure ?? 'single_location',
+                'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
                 'role' => $m->role,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
@@ -244,6 +271,7 @@ class AuthController extends Controller
                     'role' => $user->role,
                     'is_platform_admin' => (bool) $user->is_platform_admin,
                     'has_password' => !empty($user->password),
+                    'has_completed_walkthrough_v1' => (bool) ($user->has_completed_walkthrough_v1 ?? false),
                 ],
                 'businesses' => $businesses,
             ],
@@ -263,10 +291,23 @@ class AuthController extends Controller
             ->get();
 
         $businesses = $memberships->map(function ($m) {
+            $biz = $m->business;
             return [
-                'id' => $m->business->id,
-                'uuid' => $m->business->uuid,
-                'name' => $m->business->name,
+                'id' => $biz->id,
+                'uuid' => $biz->uuid,
+                'name' => $biz->name,
+                'slogan' => $biz->slogan,
+                'slug' => $biz->slug,
+                'phone' => $biz->phone,
+                'address' => $biz->address,
+                'city' => $biz->city,
+                'currency' => $biz->currency,
+                'payment_methods_config' => $biz->payment_methods_config,
+                'qris_raw_payload' => $biz->qris_raw_payload,
+                'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
+                'business_categories' => $biz->business_categories ?? [],
+                'branch_structure' => $biz->branch_structure ?? 'single_location',
+                'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
                 'role' => $m->role,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
@@ -291,6 +332,23 @@ class AuthController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Sesi berhasil diakhiri.',
+        ]);
+    }
+
+    /**
+     * Mark feature walkthrough as completed for the authenticated user.
+     */
+    public function completeWalkthrough(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $user->update(['has_completed_walkthrough_v1' => true]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Walkthrough berhasil diselesaikan.',
+            'data' => [
+                'has_completed_walkthrough_v1' => true,
+            ],
         ]);
     }
 

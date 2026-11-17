@@ -34,7 +34,17 @@ class AssetController extends Controller
             'search' => $request->get('search'),
         ]);
 
-        $query = Asset::with(['model.category', 'model.pricingTiers', 'affiliate']);
+        $query = Asset::query()
+            ->select('assets.*')
+            ->distinct()
+            ->with([
+                'model.category',
+                'model.pricingTiers',
+                'affiliate',
+                'assetModel.category',
+                'branch',
+                'currentActiveRental.booking',
+            ]);
 
         $branchId = $request->get('branch_id') 
             ?? $request->get('affiliate_id') 
@@ -79,15 +89,15 @@ class AssetController extends Controller
                 }
             }
 
-            $query->where('affiliate_id', $branchId);
+            $query->where('assets.affiliate_id', $branchId);
         }
 
         if ($request->has('status')) {
-            $query->where('status', $request->status);
+            $query->where('assets.status', $request->status);
         }
 
         if ($request->has('model_id')) {
-            $query->where('model_id', $request->model_id);
+            $query->where('assets.model_id', $request->model_id);
         }
 
         if ($request->has('category_id')) {
@@ -99,18 +109,21 @@ class AssetController extends Controller
         if ($request->has('search')) {
             $search = $request->search;
             $query->where(function ($q) use ($search) {
-                $q->where('asset_code', 'like', "%{$search}%")
-                  ->orWhere('serial_number', 'like', "%{$search}%")
-                  ->orWhere('imei_1', 'like', "%{$search}%")
-                  ->orWhere('imei_2', 'like', "%{$search}%")
+                $q->where('assets.asset_code', 'like', "%{$search}%")
+                  ->orWhere('assets.serial_number', 'like', "%{$search}%")
+                  ->orWhere('assets.imei_1', 'like', "%{$search}%")
+                  ->orWhere('assets.imei_2', 'like', "%{$search}%")
                   ->orWhereHas('model', function ($mq) use ($search) {
                       $mq->where('name', 'like', "%{$search}%");
                   });
             });
         }
 
+        $query->orderBy('assets.created_at', 'desc')
+              ->orderBy('assets.id', 'desc');
+
         if ($request->boolean('all', false)) {
-            $assets = $query->get();
+            $assets = $query->get()->unique('id')->values();
             return response()->json([
                 'success' => true,
                 'data' => $assets,
@@ -124,6 +137,9 @@ class AssetController extends Controller
             $assets = $query->paginate($perPage, ['*'], 'page', $assets->lastPage());
         }
 
+        // Verify and ensure collection strictly contains unique unit IDs
+        $assets->setCollection($assets->getCollection()->unique('id')->values());
+
         return response()->json([
             'success' => true,
             'data' => $assets,
@@ -135,7 +151,14 @@ class AssetController extends Controller
      */
     public function show(int $id): JsonResponse
     {
-        $asset = Asset::with(['model.category', 'model.pricingTiers', 'affiliate'])->findOrFail($id);
+        $asset = Asset::with([
+            'model.category',
+            'model.pricingTiers',
+            'affiliate',
+            'assetModel.category',
+            'branch',
+            'currentActiveRental.booking',
+        ])->findOrFail($id);
 
         return response()->json([
             'success' => true,

@@ -26,6 +26,7 @@ class User extends Authenticatable
         'manager_override_pin',
         'is_active',
         'is_platform_admin',
+        'has_completed_walkthrough_v1',
         'last_login_at',
     ];
 
@@ -49,6 +50,7 @@ class User extends Authenticatable
         'last_login_at' => 'datetime',
         'is_active' => 'boolean',
         'is_platform_admin' => 'boolean',
+        'has_completed_walkthrough_v1' => 'boolean',
         'password' => 'hashed',
     ];
 

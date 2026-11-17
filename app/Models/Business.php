@@ -22,6 +22,8 @@ class Business extends Model
         'address',
         'city',
         'business_categories',
+        'branch_structure',
+        'has_completed_onboarding',
         'currency',
         'timezone',
         'logo_path',
@@ -45,6 +47,7 @@ class Business extends Model
     protected $casts = [
         'is_active' => 'boolean',
         'business_categories' => 'array',
+        'has_completed_onboarding' => 'boolean',
         'id_document_limit_enabled' => 'boolean',
         'addons_enabled' => 'boolean',
         'require_expense_pin' => 'boolean',

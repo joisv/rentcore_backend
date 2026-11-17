@@ -14,6 +14,7 @@ use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
@@ -29,37 +30,48 @@ class CashierController extends Controller
         $businessId = $tenantContext->getBusinessId();
         $user = $request->user();
 
-        $branchId = $request->get('branch_id')
-            ?? $request->header('X-Branch-Id')
-            ?? $user?->affiliate_id;
-
-        $business = $businessId ? \App\Models\Business::find($businessId) : null;
-        if (!$business && $branchId) {
-            $branch = \App\Models\Affiliate::find($branchId);
-            $business = $branch?->business;
+        $branchId = null;
+        if ($request->has('branch_id')) {
+            $rawBranch = $request->get('branch_id');
+            if ($rawBranch !== null && $rawBranch !== '' && $rawBranch !== 'null' && $rawBranch !== 'all') {
+                $branchId = (int)$rawBranch;
+            }
+        } elseif ($request->header('X-Branch-Id')) {
+            $branchId = (int)$request->header('X-Branch-Id');
+        } elseif ($user?->affiliate_id) {
+            $branchId = (int)$user->affiliate_id;
         }
 
-        $allMethods = PaymentMethod::where('is_active', true)->get();
+        $cacheKey = $branchId ? "branch_{$branchId}_payment_methods" : "business_{$businessId}_payment_methods";
 
-        if ($business) {
-            $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
+        $filteredMethods = Cache::remember($cacheKey, 3600, function () use ($businessId, $branchId) {
+            $business = $businessId ? \App\Models\Business::find($businessId) : null;
+            if (!$business && $branchId) {
+                $branch = \App\Models\Affiliate::find($branchId);
+                $business = $branch?->business;
+            }
 
-            $qrisImageUrl = $business->getQrisImageUrl($branchId ? (int)$branchId : null);
+            $allMethods = PaymentMethod::where('is_active', true)->get();
 
-            $filteredMethods = $allMethods->filter(function ($m) use ($business, $branchId) {
-                return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);
-            })->map(function ($m) use ($qrisImageUrl, $config) {
-                $item = $m->toArray();
-                if (strtoupper($m->code) === 'QRIS') {
-                    $item['qris_image_url'] = $qrisImageUrl;
-                    $item['qris_raw_payload'] = $config['qris_raw_payload'] ?? null;
-                    $item['is_dynamic_qris_enabled'] = (bool)($config['is_dynamic_qris_enabled'] ?? false);
-                }
-                return $item;
-            })->values();
-        } else {
-            $filteredMethods = $allMethods;
-        }
+            if ($business) {
+                $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
+                $qrisImageUrl = $business->getQrisImageUrl($branchId ? (int)$branchId : null);
+
+                return $allMethods->filter(function ($m) use ($business, $branchId) {
+                    return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);
+                })->map(function ($m) use ($qrisImageUrl, $config) {
+                    $item = $m->toArray();
+                    if (strtoupper($m->code) === 'QRIS') {
+                        $item['qris_image_url'] = $qrisImageUrl;
+                        $item['qris_raw_payload'] = $config['qris_raw_payload'] ?? null;
+                        $item['is_dynamic_qris_enabled'] = (bool)($config['is_dynamic_qris_enabled'] ?? false);
+                    }
+                    return $item;
+                })->values()->all();
+            }
+
+            return $allMethods->toArray();
+        });
 
         return response()->json([
             'success' => true,
@@ -82,6 +94,8 @@ class CashierController extends Controller
             'amount' => 'nullable|numeric|min:0',
             'cash_received' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string|max:255',
+            'frp_cleared' => 'nullable|boolean',
+            'account_removed' => 'nullable|boolean',
         ]);
 
         $user = $request->user();
@@ -134,7 +148,14 @@ class CashierController extends Controller
         }
 
         $cashierBranchId = (int)($request->header('X-Branch-Id') ?? $user->affiliate_id ?? $booking->affiliate_id);
-        $activeShift = ShiftEnforcementService::requireActiveShift(
+        $activeShift = null;
+        if ($request->filled('shift_id')) {
+            $activeShift = \App\Models\CashDrawerShift::where('id', $request->shift_id)
+                ->where('branch_id', $cashierBranchId)
+                ->where('status', 'open')
+                ->first();
+        }
+        $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
             $cashierBranchId,
             $user,
             $isCash,

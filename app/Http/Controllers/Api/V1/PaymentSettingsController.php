@@ -12,6 +12,7 @@ use App\Services\QrisService;
 use App\Tenancy\TenantContext;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -40,6 +41,70 @@ class PaymentSettingsController extends Controller
     }
 
     /**
+     * Purge all payment setting & method caches for a business and optional branch.
+     */
+    public static function purgeCache(?int $businessId, ?int $branchId = null): void
+    {
+        if ($branchId) {
+            Cache::forget("branch_{$branchId}_payment_settings");
+            Cache::forget("branch_{$branchId}_payment_methods");
+        }
+        if ($businessId) {
+            Cache::forget("business_{$businessId}_payment_settings");
+            Cache::forget("business_{$businessId}_payment_methods");
+
+            $business = Business::find($businessId);
+            if ($business) {
+                foreach ($business->branches()->pluck('id') as $bId) {
+                    Cache::forget("branch_{$bId}_payment_settings");
+                    Cache::forget("branch_{$bId}_payment_methods");
+                }
+            }
+        }
+        Cache::forget("branch_null_payment_settings");
+        Cache::forget("branch_null_payment_methods");
+    }
+
+    /**
+     * Format payment configuration payload cleanly.
+     */
+    protected function formatSettingsData(Business $business, ?int $branchId, bool $isOwnerOrAdmin): array
+    {
+        $config = $business->getPaymentMethodsConfig($branchId);
+        $qrisImageUrl = $business->getQrisImageUrl($branchId);
+
+        $isBranchOverride = false;
+        if ($branchId) {
+            $branch = $business->branches()->find($branchId);
+            $isBranchOverride = $branch && !empty($branch->payment_methods_config_override);
+        }
+
+        return [
+            'business_id' => $business->id,
+            'branch_id' => $branchId ? (int)$branchId : null,
+            'is_branch_override' => $isBranchOverride,
+            'is_owner_or_admin' => $isOwnerOrAdmin,
+            'config' => [
+                'ewallet_enabled' => (bool)($config['ewallet_enabled'] ?? true),
+                'ewallet_providers' => [
+                    'shopeepay' => (bool)($config['ewallet_providers']['shopeepay'] ?? true),
+                    'dana' => (bool)($config['ewallet_providers']['dana'] ?? true),
+                    'gopay' => (bool)($config['ewallet_providers']['gopay'] ?? true),
+                    'linkaja' => (bool)($config['ewallet_providers']['linkaja'] ?? true),
+                    'ovo' => (bool)($config['ewallet_providers']['ovo'] ?? true),
+                ],
+                'qris_statis_enabled' => (bool)($config['qris_statis_enabled'] ?? true),
+                'is_dynamic_qris_enabled' => (bool)($config['is_dynamic_qris_enabled'] ?? false),
+                'qris_raw_payload' => $config['qris_raw_payload'] ?? null,
+                'qris_image_path' => $config['qris_image_path'] ?? null,
+                'qris_image_url' => $qrisImageUrl,
+                'cash_enabled' => (bool)($config['cash_enabled'] ?? true),
+                'bank_transfer_enabled' => (bool)($config['bank_transfer_enabled'] ?? true),
+            ],
+        ];
+    }
+
+    /**
      * Get effective payment method configuration for business/branch.
      */
     public function getSettings(Request $request): JsonResponse
@@ -48,9 +113,17 @@ class PaymentSettingsController extends Controller
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
 
-        $branchId = $request->get('branch_id')
-            ?? $request->header('X-Branch-Id')
-            ?? $user?->affiliate_id;
+        $branchId = null;
+        if ($request->has('branch_id')) {
+            $rawBranch = $request->get('branch_id');
+            if ($rawBranch !== null && $rawBranch !== '' && $rawBranch !== 'null' && $rawBranch !== 'all') {
+                $branchId = (int)$rawBranch;
+            }
+        } elseif ($request->header('X-Branch-Id')) {
+            $branchId = (int)$request->header('X-Branch-Id');
+        } elseif ($user?->affiliate_id) {
+            $branchId = (int)$user->affiliate_id;
+        }
 
         $business = Business::find($businessId);
         if (!$business && $branchId) {
@@ -65,41 +138,16 @@ class PaymentSettingsController extends Controller
             ], 404);
         }
 
-        $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
-        $qrisImageUrl = $business->getQrisImageUrl($branchId ? (int)$branchId : null);
-
-        $isBranchOverride = false;
-        if ($branchId) {
-            $branch = $business->branches()->find($branchId);
-            $isBranchOverride = $branch && !empty($branch->payment_methods_config_override);
-        }
-
         $isOwnerOrAdmin = $this->checkIsOwnerOrAdmin($request, $business);
+
+        $cacheKey = $branchId ? "branch_{$branchId}_payment_settings" : "business_{$businessId}_payment_settings";
+        $data = Cache::remember($cacheKey, 3600, function () use ($business, $branchId, $isOwnerOrAdmin) {
+            return $this->formatSettingsData($business, $branchId, $isOwnerOrAdmin);
+        });
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'business_id' => $business->id,
-                'branch_id' => $branchId ? (int)$branchId : null,
-                'is_branch_override' => $isBranchOverride,
-                'is_owner_or_admin' => $isOwnerOrAdmin,
-                'config' => [
-                    'ewallet_enabled' => (bool)($config['ewallet_enabled'] ?? true),
-                    'ewallet_providers' => [
-                        'shopeepay' => (bool)($config['ewallet_providers']['shopeepay'] ?? true),
-                        'dana' => (bool)($config['ewallet_providers']['dana'] ?? true),
-                        'linkaja' => (bool)($config['ewallet_providers']['linkaja'] ?? true),
-                        'ovo' => (bool)($config['ewallet_providers']['ovo'] ?? true),
-                    ],
-                    'qris_statis_enabled' => (bool)($config['qris_statis_enabled'] ?? true),
-                    'is_dynamic_qris_enabled' => (bool)($config['is_dynamic_qris_enabled'] ?? false),
-                    'qris_raw_payload' => $config['qris_raw_payload'] ?? null,
-                    'qris_image_path' => $config['qris_image_path'] ?? null,
-                    'qris_image_url' => $qrisImageUrl,
-                    'cash_enabled' => (bool)($config['cash_enabled'] ?? true),
-                    'bank_transfer_enabled' => (bool)($config['bank_transfer_enabled'] ?? true),
-                ],
-            ],
+            'data' => $data,
         ]);
     }
 
@@ -123,7 +171,19 @@ class PaymentSettingsController extends Controller
         $validated = $request->validated();
         $qrisService = app(QrisService::class);
 
-        $branchId = !empty($validated['branch_id']) ? (int)$validated['branch_id'] : null;
+        $branchId = null;
+        if (array_key_exists('branch_id', $validated)) {
+            $rawBranch = $validated['branch_id'];
+            if ($rawBranch !== null && $rawBranch !== '' && $rawBranch !== 'null' && $rawBranch !== 'all') {
+                $branchId = (int)$rawBranch;
+            }
+        } elseif ($request->has('branch_id')) {
+            $rawBranch = $request->input('branch_id');
+            if ($rawBranch !== null && $rawBranch !== '' && $rawBranch !== 'null' && $rawBranch !== 'all') {
+                $branchId = (int)$rawBranch;
+            }
+        }
+
         $branch = null;
         if ($branchId) {
             $branch = $business->branches()->findOrFail($branchId);
@@ -137,6 +197,7 @@ class PaymentSettingsController extends Controller
                 'ewallet_providers' => [
                     'shopeepay' => true,
                     'dana' => true,
+                    'gopay' => true,
                     'linkaja' => true,
                     'ovo' => true,
                 ],
@@ -150,36 +211,51 @@ class PaymentSettingsController extends Controller
 
         $newConfig = $currentConfig;
 
-        $ewalletVal = $validated['ewallet_enabled']
-            ?? $validated['wallet_enable']
-            ?? $validated['wallet_enabled']
-            ?? $validated['e_wallet_enabled']
-            ?? null;
-        if ($ewalletVal !== null) {
-            $newConfig['ewallet_enabled'] = (bool)$ewalletVal;
+        // Normalization helper for booleans across JSON and multipart/form-data
+        $toBool = function ($val, $default = false): bool {
+            if ($val === null) return $default;
+            return filter_var($val, FILTER_VALIDATE_BOOLEAN);
+        };
+
+        if ($request->hasAny(['ewallet_enabled', 'wallet_enable', 'wallet_enabled', 'e_wallet_enabled', 'is_wallet_enabled'])) {
+            $rawVal = $request->input('ewallet_enabled')
+                ?? $request->input('wallet_enable')
+                ?? $request->input('wallet_enabled')
+                ?? $request->input('e_wallet_enabled')
+                ?? $request->input('is_wallet_enabled');
+            $newConfig['ewallet_enabled'] = $toBool($rawVal, true);
         }
 
-        if (isset($validated['ewallet_providers']) && is_array($validated['ewallet_providers'])) {
-            $newConfig['ewallet_providers'] = array_merge(
-                $newConfig['ewallet_providers'] ?? [],
-                $validated['ewallet_providers']
-            );
+        if ($request->has('ewallet_providers') && is_array($request->input('ewallet_providers'))) {
+            $providers = $request->input('ewallet_providers');
+            $normalizedProviders = $newConfig['ewallet_providers'] ?? [];
+            foreach ($providers as $provKey => $provVal) {
+                $normalizedProviders[$provKey] = $toBool($provVal, true);
+            }
+            $newConfig['ewallet_providers'] = $normalizedProviders;
         }
 
-        if (isset($validated['qris_statis_enabled'])) {
-            $newConfig['qris_statis_enabled'] = (bool)$validated['qris_statis_enabled'];
+        if ($request->hasAny(['qris_statis_enabled', 'is_qris_enabled', 'qris_enabled'])) {
+            $rawVal = $request->input('qris_statis_enabled')
+                ?? $request->input('is_qris_enabled')
+                ?? $request->input('qris_enabled');
+            $newConfig['qris_statis_enabled'] = $toBool($rawVal, true);
         }
 
-        if (isset($validated['cash_enabled'])) {
-            $newConfig['cash_enabled'] = (bool)$validated['cash_enabled'];
+        if ($request->hasAny(['cash_enabled', 'is_cash_enabled'])) {
+            $rawVal = $request->input('cash_enabled') ?? $request->input('is_cash_enabled');
+            $newConfig['cash_enabled'] = $toBool($rawVal, true);
         }
 
-        if (isset($validated['bank_transfer_enabled'])) {
-            $newConfig['bank_transfer_enabled'] = (bool)$validated['bank_transfer_enabled'];
+        if ($request->hasAny(['bank_transfer_enabled', 'is_bank_transfer_enabled', 'transfer_enabled'])) {
+            $rawVal = $request->input('bank_transfer_enabled')
+                ?? $request->input('is_bank_transfer_enabled')
+                ?? $request->input('transfer_enabled');
+            $newConfig['bank_transfer_enabled'] = $toBool($rawVal, true);
         }
 
         // Handle QR image removal
-        if (!empty($validated['remove_qris_image'])) {
+        if (!empty($validated['remove_qris_image']) || $toBool($request->input('remove_qris_image'), false)) {
             if (!empty($newConfig['qris_image_path'])) {
                 if (Storage::disk('public')->exists($newConfig['qris_image_path'])) {
                     Storage::disk('public')->delete($newConfig['qris_image_path']);
@@ -311,6 +387,9 @@ class PaymentSettingsController extends Controller
             ]);
         }
 
+        // Cache Eviction: Purge cached records strictly before returning
+        self::purgeCache($business->id, $branchId);
+
         AuditLogService::log(
             $request->user(),
             'payment_settings.updated',
@@ -326,7 +405,17 @@ class PaymentSettingsController extends Controller
             ]
         );
 
-        return $this->getSettings($request);
+        $freshBusiness = $business->fresh();
+        $freshData = $this->formatSettingsData(
+            $freshBusiness,
+            $branchId,
+            $this->checkIsOwnerOrAdmin($request, $freshBusiness)
+        );
+
+        return response()->json([
+            'success' => true,
+            'data' => $freshData,
+        ]);
     }
 
     /**

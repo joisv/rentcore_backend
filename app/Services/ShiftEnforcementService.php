@@ -49,6 +49,7 @@ class ShiftEnforcementService
             throw ValidationException::withMessages([
                 'shift' => [$errorMessage],
                 'cash_shift' => [$errorMessage],
+                'code' => ['SHIFT_NOT_ACTIVE'],
             ])->status(422);
         }
 

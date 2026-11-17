@@ -47,20 +47,17 @@ class PaymentSettingRequest extends FormRequest
             if (is_bool($val)) {
                 return $val;
             }
-            if (is_numeric($val)) {
-                return (int)$val === 1;
-            }
-            $lower = strtolower(trim((string)$val));
-            if (in_array($lower, ['true', '1', 'yes', 'on'], true)) {
-                return true;
-            }
-            if (in_array($lower, ['false', '0', 'no', 'off'], true)) {
-                return false;
-            }
-            return $val;
+            return filter_var($val, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
         };
 
         $mergeData = [];
+
+        if ($this->has('branch_id')) {
+            $rawBranch = $this->input('branch_id');
+            if ($rawBranch === 'all' || $rawBranch === 'null' || $rawBranch === '') {
+                $mergeData['branch_id'] = null;
+            }
+        }
 
         $rawEwallet = $this->input('ewallet_enabled')
             ?? $this->input('wallet_enable')
@@ -74,10 +71,39 @@ class PaymentSettingRequest extends FormRequest
             $mergeData['wallet_enable'] = $parsed;
         }
 
-        foreach (['qris_statis_enabled', 'is_dynamic_qris_enabled', 'cash_enabled', 'bank_transfer_enabled', 'remove_qris_image'] as $boolKey) {
-            if ($this->has($boolKey)) {
-                $mergeData[$boolKey] = $toBool($this->input($boolKey));
-            }
+        $rawQris = $this->input('qris_statis_enabled')
+            ?? $this->input('is_qris_enabled')
+            ?? $this->input('qris_enabled');
+        if ($rawQris !== null) {
+            $parsed = $toBool($rawQris);
+            $mergeData['qris_statis_enabled'] = $parsed;
+            $mergeData['is_qris_enabled'] = $parsed;
+        }
+
+        $rawDynQris = $this->input('is_dynamic_qris_enabled')
+            ?? $this->input('dynamic_qris_enabled');
+        if ($rawDynQris !== null) {
+            $parsed = $toBool($rawDynQris);
+            $mergeData['is_dynamic_qris_enabled'] = $parsed;
+        }
+
+        $rawCash = $this->input('cash_enabled')
+            ?? $this->input('is_cash_enabled');
+        if ($rawCash !== null) {
+            $parsed = $toBool($rawCash);
+            $mergeData['cash_enabled'] = $parsed;
+        }
+
+        $rawTransfer = $this->input('bank_transfer_enabled')
+            ?? $this->input('is_bank_transfer_enabled')
+            ?? $this->input('transfer_enabled');
+        if ($rawTransfer !== null) {
+            $parsed = $toBool($rawTransfer);
+            $mergeData['bank_transfer_enabled'] = $parsed;
+        }
+
+        if ($this->has('remove_qris_image')) {
+            $mergeData['remove_qris_image'] = $toBool($this->input('remove_qris_image'));
         }
 
         if ($this->has('ewallet_providers') && is_array($this->input('ewallet_providers'))) {
@@ -104,15 +130,23 @@ class PaymentSettingRequest extends FormRequest
             'wallet_enable' => 'sometimes|nullable|boolean',
             'wallet_enabled' => 'sometimes|nullable|boolean',
             'e_wallet_enabled' => 'sometimes|nullable|boolean',
+            'is_wallet_enabled' => 'sometimes|nullable|boolean',
             'ewallet_providers' => 'sometimes|nullable|array',
             'ewallet_providers.shopeepay' => 'sometimes|nullable|boolean',
             'ewallet_providers.dana' => 'sometimes|nullable|boolean',
+            'ewallet_providers.gopay' => 'sometimes|nullable|boolean',
             'ewallet_providers.linkaja' => 'sometimes|nullable|boolean',
             'ewallet_providers.ovo' => 'sometimes|nullable|boolean',
             'qris_statis_enabled' => 'sometimes|nullable|boolean',
+            'is_qris_enabled' => 'sometimes|nullable|boolean',
+            'qris_enabled' => 'sometimes|nullable|boolean',
             'is_dynamic_qris_enabled' => 'sometimes|nullable|boolean',
+            'dynamic_qris_enabled' => 'sometimes|nullable|boolean',
             'cash_enabled' => 'sometimes|nullable|boolean',
+            'is_cash_enabled' => 'sometimes|nullable|boolean',
             'bank_transfer_enabled' => 'sometimes|nullable|boolean',
+            'is_bank_transfer_enabled' => 'sometimes|nullable|boolean',
+            'transfer_enabled' => 'sometimes|nullable|boolean',
             'remove_qris_image' => 'sometimes|nullable|boolean',
             'qris_image' => 'sometimes|nullable|file|mimes:jpeg,png,jpg|max:2048',
             'qris_image_base64' => 'sometimes|nullable|string',

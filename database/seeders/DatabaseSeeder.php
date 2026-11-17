@@ -87,7 +87,7 @@ class DatabaseSeeder extends Seeder
 
         // 3. Payment Methods
         $cashMethod    = PaymentMethod::firstOrCreate(['code' => 'CASH'], ['name' => 'Tunai di Meja Kasir', 'is_active' => true]);
-        $qrisMethod    = PaymentMethod::firstOrCreate(['code' => 'QRIS'], ['name' => 'QRIS Dinamis / Statis', 'is_active' => true]);
+        $qrisMethod    = PaymentMethod::firstOrCreate(['code' => 'QRIS'], ['name' => 'QRIS Dinamis', 'is_active' => true]);
         $bcaMethod     = PaymentMethod::firstOrCreate(['code' => 'BCA'],  ['name' => 'Transfer Bank BCA', 'is_active' => true]);
         $mandiriMethod = PaymentMethod::firstOrCreate(['code' => 'MANDIRI'], ['name' => 'Transfer Bank Mandiri', 'is_active' => true]);
         $briMethod     = PaymentMethod::firstOrCreate(['code' => 'BRI'],  ['name' => 'Transfer Bank BRI', 'is_active' => true]);

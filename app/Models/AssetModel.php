@@ -17,6 +17,7 @@ class AssetModel extends Model
         'brand',
         'name',
         'slug',
+        'image_path',
         'description',
         'storage_capacity',
         'color',
@@ -27,6 +28,21 @@ class AssetModel extends Model
         'is_addon',
         'is_active',
     ];
+
+    protected $appends = [
+        'image_url',
+    ];
+
+    public function getImageUrlAttribute(): ?string
+    {
+        if (empty($this->image_path)) {
+            return null;
+        }
+        if (str_starts_with($this->image_path, 'http://') || str_starts_with($this->image_path, 'https://')) {
+            return $this->image_path;
+        }
+        return url('/storage/' . ltrim($this->image_path, '/'));
+    }
 
     protected $casts = [
         'standard_accessories' => 'array',

@@ -117,6 +117,7 @@ class CashierShiftPreCheckoutEnforcementTest extends TestCase
 
         $response->assertStatus(422);
         $response->assertJsonValidationErrors(['shift']);
+        $this->assertEquals('SHIFT_NOT_ACTIVE', $response->json('code'));
         $this->assertStringContainsString(
             'Shift belum dibuka. Buka shift kasir terlebih dahulu sebelum memproses transaksi.',
             $response->json('message')
@@ -225,6 +226,99 @@ class CashierShiftPreCheckoutEnforcementTest extends TestCase
         $this->assertDatabaseHas('payment_transactions', [
             'shift_id' => $shift->id,
             'payment_method_id' => $this->mandiriMethod->id,
+        ]);
+    }
+
+    public function test_cashier_pay_fails_with_shift_not_active_code_when_no_active_shift(): void
+    {
+        $customer = \App\Models\Customer::create([
+            'business_id' => $this->business->id,
+            'name' => 'Budi POS',
+            'phone' => '081234567888',
+        ]);
+
+        $booking = \App\Models\Booking::create([
+            'business_id' => $this->business->id,
+            'affiliate_id' => $this->branch->id,
+            'customer_id' => $customer->id,
+            'created_by' => $this->cashier->id,
+            'booking_code' => 'BK-TEST-001',
+            'start_at' => Carbon::now(),
+            'end_at' => Carbon::now()->addDay(),
+            'duration_hours' => 24,
+            'total_bill' => 100000,
+            'payment_status' => 'unpaid',
+            'status' => 'confirmed',
+        ]);
+
+        $token = $this->cashier->createToken('Test')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->withHeader('X-Branch-Id', (string)$this->branch->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $booking->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'payment_type' => 'settlement',
+                'amount' => 100000,
+                'cash_received' => 100000,
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonValidationErrors(['shift']);
+        $this->assertEquals('SHIFT_NOT_ACTIVE', $response->json('code'));
+    }
+
+    public function test_cashier_pay_succeeds_with_active_shift_and_binds_shift_id(): void
+    {
+        $shift = CashDrawerShift::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_number' => 'SHIFT-002',
+            'opened_by' => $this->cashier->id,
+            'opened_at' => Carbon::now(),
+            'opening_cash_float' => 300000,
+            'status' => 'open',
+        ]);
+
+        $customer = \App\Models\Customer::create([
+            'business_id' => $this->business->id,
+            'name' => 'Budi POS 2',
+            'phone' => '081234567889',
+        ]);
+
+        $booking = \App\Models\Booking::create([
+            'business_id' => $this->business->id,
+            'affiliate_id' => $this->branch->id,
+            'customer_id' => $customer->id,
+            'created_by' => $this->cashier->id,
+            'booking_code' => 'BK-TEST-002',
+            'start_at' => Carbon::now(),
+            'end_at' => Carbon::now()->addDay(),
+            'duration_hours' => 24,
+            'total_bill' => 100000,
+            'payment_status' => 'unpaid',
+            'status' => 'confirmed',
+        ]);
+
+        $token = $this->cashier->createToken('Test')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->withHeader('X-Branch-Id', (string)$this->branch->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $booking->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'payment_type' => 'settlement',
+                'amount' => 100000,
+                'cash_received' => 100000,
+                'shift_id' => $shift->id,
+            ]);
+
+        $response->assertStatus(201);
+        $this->assertDatabaseHas('payment_transactions', [
+            'booking_id' => $booking->id,
+            'shift_id' => $shift->id,
+            'amount' => 100000,
+            'status' => 'completed',
         ]);
     }
 }

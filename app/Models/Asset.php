@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Asset extends Model
 {
@@ -46,7 +47,17 @@ class Asset extends Model
         return $this->belongsTo(Affiliate::class);
     }
 
+    public function branch(): BelongsTo
+    {
+        return $this->belongsTo(Affiliate::class, 'affiliate_id');
+    }
+
     public function model(): BelongsTo
+    {
+        return $this->belongsTo(AssetModel::class, 'model_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
+    }
+
+    public function assetModel(): BelongsTo
     {
         return $this->belongsTo(AssetModel::class, 'model_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
     }
@@ -54,6 +65,13 @@ class Asset extends Model
     public function bookingItems(): HasMany
     {
         return $this->hasMany(BookingItem::class);
+    }
+
+    public function currentActiveRental(): HasOne
+    {
+        return $this->hasOne(BookingItem::class, 'asset_id')
+            ->where('status', 'active')
+            ->latestOfMany('id');
     }
 
     public function exchangesAsOld(): HasMany

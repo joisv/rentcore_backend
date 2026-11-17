@@ -21,6 +21,24 @@ return Application::configure(basePath: dirname(__DIR__))
             return $request->is('api/*') || $request->expectsJson();
         });
 
+        $exceptions->render(function (\Illuminate\Validation\ValidationException $e, \Illuminate\Http\Request $request) {
+            $errors = $e->errors();
+            $isShiftError = (isset($errors['code']) && in_array('SHIFT_NOT_ACTIVE', (array)$errors['code']))
+                || isset($errors['shift'])
+                || isset($errors['cash_shift']);
+
+            if ($isShiftError) {
+                $message = $errors['shift'][0] ?? $errors['cash_shift'][0] ?? 'Shift kasir belum dibuka.';
+                return response()->json([
+                    'message' => $message,
+                    'success' => false,
+                    'code' => 'SHIFT_NOT_ACTIVE',
+                    'errors' => $errors,
+                ], 422);
+            }
+            return null;
+        });
+
         $exceptions->render(function (\Illuminate\Auth\AuthenticationException $e, \Illuminate\Http\Request $request) {
             return response()->json([
                 'success' => false,

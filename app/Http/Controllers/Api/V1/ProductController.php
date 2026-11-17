@@ -11,6 +11,7 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
 class ProductController extends Controller
@@ -201,6 +202,7 @@ class ProductController extends Controller
             'specifications' => 'nullable|array',
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
+            'image' => 'nullable|image|max:5120',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
             'rates.*.duration_value' => 'required_with:rates|integer|min:1',
@@ -217,12 +219,15 @@ class ProductController extends Controller
             $slug .= '-' . Str::random(5);
         }
 
+        $imagePath = $this->handleModelImageUpload($request);
+
         $product = AssetModel::create([
             'business_id' => $businessId,
             'category_id' => $validated['category_id'],
             'brand' => $validated['brand'],
             'name' => $validated['name'],
             'slug' => $slug,
+            'image_path' => $imagePath,
             'description' => $validated['description'] ?? null,
             'storage_capacity' => $validated['storage_capacity'] ?? null,
             'color' => $validated['color'] ?? null,
@@ -320,6 +325,8 @@ class ProductController extends Controller
             'specifications' => 'nullable|array',
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
+            'image' => 'nullable|image|max:5120',
+            'remove_image' => 'nullable|boolean',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
             'rates.*.duration_value' => 'required_with:rates|integer|min:1',
@@ -329,8 +336,16 @@ class ProductController extends Controller
         ]);
 
         return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
-            $productFields = collect($validated)->except(['rates'])->filter(fn($v) => $v !== null)->toArray();
-            if (!empty($productFields)) {
+            $productFields = collect($validated)->except(['rates', 'image', 'remove_image'])->filter(fn($v) => $v !== null)->toArray();
+
+            if ($request->hasFile('image')) {
+                $productFields['image_path'] = $this->handleModelImageUpload($request, $product->image_path);
+            } elseif ($request->boolean('remove_image')) {
+                $this->deleteStoredModelImage($product->image_path);
+                $productFields['image_path'] = null;
+            }
+
+            if (!empty($productFields) || array_key_exists('image_path', $productFields)) {
                 $product->update($productFields);
             }
 
@@ -465,5 +480,29 @@ class ProductController extends Controller
                 'rate_snapshot' => $result['rate_snapshot'],
             ],
         ]);
+    }
+
+    /**
+     * Store uploaded model image on public disk and delete previous image if replacing.
+     */
+    protected function handleModelImageUpload(Request $request, ?string $previousPath = null): ?string
+    {
+        if (!$request->hasFile('image')) {
+            return $previousPath;
+        }
+
+        $this->deleteStoredModelImage($previousPath);
+
+        return $request->file('image')->store('asset_models', 'public');
+    }
+
+    /**
+     * Remove an existing model image from public storage if present.
+     */
+    protected function deleteStoredModelImage(?string $path): void
+    {
+        if (!empty($path) && Storage::disk('public')->exists($path)) {
+            Storage::disk('public')->delete($path);
+        }
     }
 }

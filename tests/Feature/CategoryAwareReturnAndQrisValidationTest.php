@@ -434,4 +434,73 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $this->assertNotEmpty($config['qris_raw_payload']);
         $this->assertNotNull($config['ewallet_enabled']);
     }
+
+    public function test_smartphone_category_rc_261030_0003_mya_enforces_neutral_message_and_settles_with_frp_cleared(): void
+    {
+        $token = $this->staff->createToken('Test')->plainTextToken;
+
+        [$smartphoneBooking, $smartphoneAsset] = $this->createBookingWithItem('Handphone', 'handphone', 'Vivo', 'V30 Pro', false);
+        $smartphoneBooking->update([
+            'booking_code' => 'RC-261030-0003-MYA',
+            'total_bill' => 250000,
+            'paid_amount' => 100000,
+            'payment_status' => 'dp_paid',
+        ]);
+
+        // Ensure Tunai payment method exists for settlement
+        $cashMethod = PaymentMethod::firstOrCreate(
+            ['code' => 'CASH'],
+            ['name' => 'Tunai', 'type' => 'cash', 'is_active' => true]
+        );
+
+        // 1. Fails with neutral account clearance message when unchecked
+        $failResp = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson("/api/v1/bookings/{$smartphoneBooking->id}/return", [
+                'condition_grade' => 'A',
+                'checklist_results' => [
+                    'device_platform' => 'android',
+                    'screen_ok' => true,
+                ],
+            ]);
+
+        $failResp->assertStatus(422)->assertJsonValidationErrors(['checklist']);
+        $this->assertEquals(
+            'Pastikan akun perangkat (iCloud / Google / FRP) telah dikeluarkan sebelum menyelesaikan pengembalian.',
+            $failResp->json('errors.checklist.0')
+        );
+
+        // 2. Succeeds when frp_cleared & account_removed flags are passed
+        $okResp = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson("/api/v1/bookings/{$smartphoneBooking->id}/return", [
+                'condition_grade' => 'A',
+                'frp_cleared' => true,
+                'account_removed' => true,
+                'checklist_results' => [
+                    'frp_cleared' => true,
+                    'account_removed' => true,
+                    'frp_removed' => true,
+                    'google_account_removed' => true,
+                    'account_status' => 'cleared',
+                    'device_platform' => 'android',
+                    'screen_ok' => true,
+                ],
+            ]);
+
+        $okResp->assertStatus(200)->assertJsonPath('success', true);
+        $this->assertEquals('returned', $smartphoneBooking->fresh()->status);
+
+        // 3. Subsequent payment settlement via cashier endpoint also succeeds with frp_cleared & account_removed
+        $payResp = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $smartphoneBooking->id,
+                'payment_method_id' => $cashMethod->id,
+                'payment_type' => 'settlement',
+                'amount' => 150000,
+                'cash_received' => 150000,
+                'frp_cleared' => true,
+                'account_removed' => true,
+            ]);
+
+        $payResp->assertStatus(201)->assertJsonPath('success', true);
+    }
 }

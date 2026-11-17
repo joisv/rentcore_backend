@@ -64,8 +64,8 @@ class ReturnService
                     }
 
                     $category = $model->category;
-                    $catSlug = strtolower((string)($category?->slug ?? ''));
-                    $catName = strtolower((string)($category?->name ?? ''));
+                    $catSlug = trim(strtolower((string)($category?->slug ?? '')));
+                    $catName = trim(strtolower((string)($category?->name ?? '')));
                     $brand = strtolower((string)($model->brand ?? ''));
                     $modelName = strtolower((string)($model->name ?? ''));
                     $assetCode = strtolower((string)($item->asset?->asset_code ?? ''));
@@ -86,7 +86,9 @@ class ReturnService
                         str_contains($catSlug, 'drone') || str_contains($catName, 'drone') ||
                         str_contains($catSlug, 'powerbank') || str_contains($catName, 'powerbank') ||
                         str_contains($catSlug, 'audio') || str_contains($catName, 'audio') ||
-                        str_contains($catSlug, 'lensa') || str_contains($catName, 'lensa')
+                        str_contains($catSlug, 'lensa') || str_contains($catName, 'lensa') ||
+                        str_contains($catSlug, 'kendaraan') || str_contains($catName, 'kendaraan') ||
+                        str_contains($catSlug, 'vehicle') || str_contains($catName, 'vehicle')
                     );
 
                     $isNonPhoneModel = (
@@ -125,14 +127,15 @@ class ReturnService
                         break;
                     }
 
-                    // C. Android device check: Strictly triggers ONLY when operating_system == 'android' or category == 'android'
-                    // or explicitly recognized as Android smartphone brand/hardware (and never for Apple hardware)
+                    // C. Android / non-Apple smartphone check: Strictly triggers ONLY for smartphone categories / Android OS / FRP-flagged phones (never for Apple or non-phone hardware)
+                    $isSmartphoneCategory = (bool)preg_match('/\b(smartphone|smartphones|handphone|handphones|hp|phone|phones|mobile|mobiles)\b/i', $catSlug)
+                        || (bool)preg_match('/\b(smartphone|smartphones|handphone|handphones|hp|phone|phones|mobile|mobiles)\b/i', $catName);
                     $isAndroidBrand = in_array($brand, ['samsung', 'google', 'xiaomi', 'oppo', 'vivo', 'realme', 'infinix', 'poco', 'asus']);
                     $isAndroidPhone = $isAndroidBrand || (bool)preg_match('/(galaxy|pixel|redmi|poco|realme|infinix)/i', $modelName);
                     $isAndroidCat = str_contains($catSlug, 'android') || str_contains($catName, 'android');
                     $isAndroidOs = $os === 'android' || $platformHint === 'android';
 
-                    if (!$isAppleDevice && ($isAndroidCat || $isAndroidOs || ($isAndroidPhone && $model->requires_frp_check))) {
+                    if (!$isAppleDevice && ($isSmartphoneCategory || $isAndroidCat || $isAndroidOs || ($isAndroidPhone && $model->requires_frp_check))) {
                         $requiresAndroidFrp = true;
                     }
                 }
@@ -144,10 +147,14 @@ class ReturnService
             }
 
             $isQuarantined = !empty($checklist['account_quarantined']) || ($checklist['account_status'] ?? '') === 'quarantined';
+            $isAccountClearedFlag = !empty($checklist['frp_cleared'])
+                || !empty($checklist['account_removed'])
+                || !empty($data['frp_cleared'])
+                || !empty($data['account_removed']);
 
             if ($requiresICloud) {
                 // Strictly Apple ID / iCloud validation
-                if (empty($checklist['icloud_removed']) && !$isQuarantined) {
+                if (empty($checklist['icloud_removed']) && !$isAccountClearedFlag && !$isQuarantined) {
                     throw ValidationException::withMessages([
                         'checklist' => ['Akun iCloud / Apple ID wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
                     ]);
@@ -159,11 +166,13 @@ class ReturnService
                     ]);
                 }
             } elseif ($requiresAndroidFrp) {
-                // Strictly Android Google FRP validation
-                $isFrpRemoved = !empty($checklist['frp_removed']) || !empty($checklist['google_account_removed']);
+                // Strictly Smartphone Google / FRP account validation
+                $isFrpRemoved = !empty($checklist['frp_removed'])
+                    || !empty($checklist['google_account_removed'])
+                    || $isAccountClearedFlag;
                 if (!$isFrpRemoved && !$isQuarantined) {
                     throw ValidationException::withMessages([
-                        'checklist' => ['Akun Google / FRP wajib dipastikan telah dikeluarkan (Sign Out) sebelum pengembalian dapat diproses, atau tandai sebagai Karantina Akun jika memerlukan tindak lanjut khusus.'],
+                        'checklist' => ['Pastikan akun perangkat (iCloud / Google / FRP) telah dikeluarkan sebelum menyelesaikan pengembalian.'],
                     ]);
                 }
 
@@ -443,7 +452,8 @@ class ReturnService
                     'late_fee' => $lateFee,
                     'damage_fee' => $damageFee,
                     'total_penalty' => $totalPenalty,
-                    'icloud_removed' => $requiresICloud ? true : ($requiresAndroidFrp ? true : null),
+                    'icloud_removed' => $requiresICloud ? !$isQuarantined : ($requiresAndroidFrp ? !$isQuarantined : null),
+                    'frp_cleared' => ($requiresICloud || $requiresAndroidFrp) ? !$isQuarantined : null,
                 ],
                 [
                     'previous_status' => 'rented',

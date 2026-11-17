@@ -551,6 +551,12 @@ class BookingService
             }
 
             // Re-verify Active Shift before committing direct rental payment
+            if (!empty($data['shift_id'])) {
+                $activeShift = \App\Models\CashDrawerShift::where('id', $data['shift_id'])
+                    ->where('branch_id', (int)$affiliateId)
+                    ->where('status', 'open')
+                    ->first();
+            }
             $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
                 (int)$affiliateId,
                 $cashier,
