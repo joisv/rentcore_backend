@@ -92,7 +92,11 @@ class AssetController extends Controller
             $query->where('assets.affiliate_id', $branchId);
         }
 
-        if ($request->has('status')) {
+        $hasScheduleWindow = $request->filled('start_at') && $request->filled('end_at');
+
+        if ($hasScheduleWindow) {
+            $query->whereIn('assets.status', \App\Services\BookingAvailabilityService::RENTABLE_ASSET_STATUSES);
+        } elseif ($request->has('status')) {
             $query->where('assets.status', $request->status);
         }
 
@@ -121,6 +125,23 @@ class AssetController extends Controller
 
         $query->orderBy('assets.created_at', 'desc')
               ->orderBy('assets.id', 'desc');
+
+        if ($hasScheduleWindow) {
+            $startAt = \Carbon\Carbon::parse($request->start_at);
+            $endAt = \Carbon\Carbon::parse($request->end_at);
+            $pricingService = app(\App\Services\PricingService::class);
+            $collection = $query->get()->unique('id')->values()->map(function (Asset $asset) use ($pricingService, $startAt, $endAt) {
+                $asset->setAttribute('is_available_for_schedule', $pricingService->isAssetAvailable($asset, $startAt, $endAt));
+                return $asset;
+            });
+            if ($request->boolean('available_only', false)) {
+                $collection = $collection->filter(fn (Asset $a) => (bool) $a->getAttribute('is_available_for_schedule'))->values();
+            }
+            return response()->json([
+                'success' => true,
+                'data' => $collection,
+            ]);
+        }
 
         if ($request->boolean('all', false)) {
             $assets = $query->get()->unique('id')->values();
@@ -167,10 +188,14 @@ class AssetController extends Controller
     }
 
     /**
-     * List catalog models with active pricing packages.
+     * List catalog models with active pricing packages and optional availability counts for [start_at, end_at].
      */
     public function models(Request $request): JsonResponse
     {
+        if ($request->filled('start_at') && $request->filled('end_at')) {
+            return $this->modelAvailability($request);
+        }
+
         $query = AssetModel::with(['category', 'pricingTiers' => function ($q) {
             $q->where('is_active', true);
         }])
@@ -193,6 +218,67 @@ class AssetController extends Controller
         return response()->json([
             'success' => true,
             'data' => $models,
+        ]);
+    }
+
+    /**
+     * Return per-model available slot counts for a given [start_at, end_at] window at the active branch.
+     */
+    public function modelAvailability(Request $request): JsonResponse
+    {
+        $request->validate([
+            'start_at' => 'required|date',
+            'end_at' => 'required|date|after:start_at',
+            'branch_id' => 'nullable|integer|exists:affiliates,id',
+            'affiliate_id' => 'nullable|integer|exists:affiliates,id',
+            'category_id' => 'nullable|integer|exists:asset_categories,id',
+            'search' => 'nullable|string|max:100',
+        ]);
+
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $branchId = $request->get('branch_id')
+            ?? $request->get('affiliate_id')
+            ?? $request->header('X-Branch-Id')
+            ?? $tenantContext->getBranchId();
+
+        if (!$branchId && $businessId) {
+            $defaultBranch = \App\Models\Affiliate::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->orderBy('is_central', 'desc')
+                ->first();
+            $branchId = $defaultBranch?->id;
+        }
+
+        if (!$branchId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cabang aktif belum ditentukan.',
+            ], 422);
+        }
+
+        $startAt = \Carbon\Carbon::parse($request->start_at)->utc();
+        $endAt = \Carbon\Carbon::parse($request->end_at)->utc();
+        $availabilityService = app(\App\Services\BookingAvailabilityService::class);
+
+        $models = $availabilityService->getAvailableModelsForBranch(
+            (int) $branchId,
+            $startAt,
+            $endAt,
+            $businessId ? (int) $businessId : null,
+            $request->filled('category_id') ? (int) $request->category_id : null,
+            $request->get('search')
+        );
+
+        return response()->json([
+            'success' => true,
+            'data' => $models,
+            'meta' => [
+                'branch_id' => (int) $branchId,
+                'start_at' => $startAt->toIso8601String(),
+                'end_at' => $endAt->toIso8601String(),
+            ],
         ]);
     }
 
@@ -518,8 +604,8 @@ class AssetController extends Controller
             'end_at' => 'required|date|after:start_at',
         ]);
 
-        $startAt = \Carbon\Carbon::parse($request->start_at);
-        $endAt = \Carbon\Carbon::parse($request->end_at);
+        $startAt = \Carbon\Carbon::parse($request->start_at)->utc();
+        $endAt = \Carbon\Carbon::parse($request->end_at)->utc();
         $pricingService = app(\App\Services\PricingService::class);
 
         $results = [];

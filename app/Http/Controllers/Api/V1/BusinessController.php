@@ -1010,4 +1010,99 @@ class BusinessController extends Controller
             'message' => 'PIN Manager untuk ' . $targetUser->name . ' berhasil dicabut.',
         ]);
     }
+
+    /**
+     * Get booking rules (grace period, auto no-show, floating unit mode) for a branch.
+     */
+    public function getBranchBookingRules(Request $request, int $branchId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $context->getBusinessId();
+        $user = $request->user();
+
+        $branch = Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+            ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+            ->findOrFail($branchId);
+
+        $isMember = BusinessMember::where('business_id', $branch->business_id)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->exists();
+
+        if (!$isMember && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akses ditolak. Anda bukan anggota aktif dari bisnis ini.',
+            ], 403);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $branch->getBookingRules(),
+        ]);
+    }
+
+    /**
+     * Update booking rules (grace period, auto no-show, floating unit mode) for a branch.
+     */
+    public function updateBranchBookingRules(Request $request, int $branchId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $context->getBusinessId();
+        $user = $request->user();
+
+        $branch = Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+            ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+            ->findOrFail($branchId);
+
+        $member = BusinessMember::where('business_id', $branch->business_id)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$member || !$member->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mengubah aturan booking cabang.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'booking_grace_period_minutes' => 'nullable|integer|min:5|max:1440',
+            'booking_auto_noshow' => 'nullable|boolean',
+            'allow_floating_unit_booking' => 'nullable|boolean',
+        ]);
+
+        $updates = [];
+        if (array_key_exists('booking_grace_period_minutes', $validated) && $validated['booking_grace_period_minutes'] !== null) {
+            $updates['booking_grace_period_minutes'] = (int) $validated['booking_grace_period_minutes'];
+        }
+        if (array_key_exists('booking_auto_noshow', $validated) && $validated['booking_auto_noshow'] !== null) {
+            $updates['booking_auto_noshow'] = (bool) $validated['booking_auto_noshow'];
+        }
+        if (array_key_exists('allow_floating_unit_booking', $validated) && $validated['allow_floating_unit_booking'] !== null) {
+            $updates['allow_floating_unit_booking'] = (bool) $validated['allow_floating_unit_booking'];
+        }
+
+        if (!empty($updates)) {
+            $branch->update($updates);
+        }
+
+        AuditLogService::log(
+            $user,
+            'branch.booking_rules_updated',
+            'Affiliate',
+            $branch->id,
+            $branch->getBookingRules(),
+            null,
+            $request->ip(),
+            $branch->id
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Aturan booking cabang berhasil diperbarui.',
+            'data' => $branch->getBookingRules(),
+        ]);
+    }
 }

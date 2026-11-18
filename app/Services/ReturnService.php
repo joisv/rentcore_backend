@@ -42,6 +42,38 @@ class ReturnService
                 ]);
             }
 
+            $booking->loadMissing(['items.asset.model.category', 'items.assetModel', 'addonItems']);
+
+            // Enforce add-on return completeness when booking includes attached add-ons
+            $activeAddonItems = $booking->items->filter(function ($item) {
+                $isActive = $item->status === 'active' || $item->status === null;
+                $isAddon = $item->item_type === 'addon'
+                    || (bool) ($item->asset?->model?->is_addon ?? $item->assetModel?->is_addon ?? false);
+                return $isActive && $isAddon;
+            })->values();
+
+            if ($activeAddonItems->isNotEmpty()) {
+                $hasExplicitFlag = array_key_exists('addons_returned', $data);
+                $addonsReturnedFlag = filter_var($data['addons_returned'] ?? false, FILTER_VALIDATE_BOOLEAN);
+                $returnedAddonIds = array_values(array_unique(array_map(
+                    'intval',
+                    (array) ($data['returned_addon_ids'] ?? [])
+                )));
+                $requiredAddonIds = $activeAddonItems->pluck('id')->map(fn ($id) => (int) $id)->all();
+                $allIdsConfirmed = !empty($returnedAddonIds)
+                    && empty(array_diff($requiredAddonIds, $returnedAddonIds));
+
+                $validAddonsConfirmation = !empty($returnedAddonIds)
+                    ? ($allIdsConfirmed && (!$hasExplicitFlag || $addonsReturnedFlag))
+                    : $addonsReturnedFlag;
+
+                if (!$validAddonsConfirmation) {
+                    throw ValidationException::withMessages([
+                        'addons_returned' => ['Pastikan seluruh add-on yang disewa telah dikembalikan dengan lengkap.'],
+                    ]);
+                }
+            }
+
             // 1. Mandatory Critical Security Guard: Category-Aware Device Validation
             // Strictly scope validation by device ecosystem:
             // - iPhone / Apple devices: ONLY check Apple ID / iCloud Activation Lock. Strictly bypass Google/FRP.
@@ -337,7 +369,11 @@ class ReturnService
                         'battery_health' => $data['battery_health_final'] ?? $item->asset->battery_health,
                     ]);
                 }
-                $item->update(['status' => 'returned']);
+                $item->update([
+                    'status' => 'returned',
+                    'is_returned' => true,
+                    'returned_at' => $returnedAt,
+                ]);
             }
 
             // 6. Record Penalty Payment if applicable
@@ -454,6 +490,7 @@ class ReturnService
                     'total_penalty' => $totalPenalty,
                     'icloud_removed' => $requiresICloud ? !$isQuarantined : ($requiresAndroidFrp ? !$isQuarantined : null),
                     'frp_cleared' => ($requiresICloud || $requiresAndroidFrp) ? !$isQuarantined : null,
+                    'addons_returned' => $activeAddonItems->isNotEmpty() ? true : null,
                 ],
                 [
                     'previous_status' => 'rented',

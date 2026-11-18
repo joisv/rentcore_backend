@@ -9,4 +9,5 @@ Artisan::command('inspire', function () {
 })->purpose('Display an inspiring quote');
 
 Schedule::command('rentcore:check-overdue-rentals --grace-minutes=60')->everyFifteenMinutes();
+Schedule::command('bookings:process-no-show')->everyFiveMinutes();
 

@@ -17,10 +17,17 @@ class Booking extends Model
         'business_id',
         'booking_code',
         'affiliate_id',
+        'asset_model_id',
+        'asset_unit_id',
         'customer_id',
         'created_by',
         'start_at',
         'end_at',
+        'grace_expires_at',
+        'no_show_at',
+        'picked_up_at',
+        'forfeited_dp_amount',
+        'is_overdue_pickup',
         'duration_hours',
         'duration_unit',
         'duration_value',
@@ -35,6 +42,7 @@ class Booking extends Model
         'manual_discount_reason',
         'discount_approved_by',
         'total_bill',
+        'remaining_balance',
         'payment_status',
         'collateral_type',
         'collateral_secured',
@@ -43,8 +51,15 @@ class Booking extends Model
     ];
 
     protected $casts = [
+        'asset_model_id' => 'integer',
+        'asset_unit_id' => 'integer',
         'start_at' => 'datetime',
         'end_at' => 'datetime',
+        'grace_expires_at' => 'datetime',
+        'no_show_at' => 'datetime',
+        'picked_up_at' => 'datetime',
+        'forfeited_dp_amount' => 'decimal:2',
+        'is_overdue_pickup' => 'boolean',
         'duration_hours' => 'integer',
         'duration_value' => 'integer',
         'subtotal_amount' => 'decimal:2',
@@ -53,6 +68,7 @@ class Booking extends Model
         'deposit_fee' => 'decimal:2',
         'discount_amount' => 'decimal:2',
         'total_bill' => 'decimal:2',
+        'remaining_balance' => 'decimal:2',
         'collateral_secured' => 'boolean',
     ];
 
@@ -62,6 +78,10 @@ class Booking extends Model
         'primary_item',
         'primary_asset',
         'addon_items',
+        'addons',
+        'device_model_id',
+        'is_floating_unit',
+        'paid_amount',
     ];
 
     public function getActiveItemAttribute(): ?BookingItem
@@ -93,7 +113,46 @@ class Booking extends Model
 
     public function getActiveAssetAttribute(): ?Asset
     {
-        return $this->active_item?->asset;
+        if ($this->active_item?->asset) {
+            return $this->active_item->asset;
+        }
+        if ($this->asset_unit_id && $this->relationLoaded('assetUnit')) {
+            return $this->assetUnit;
+        }
+        return null;
+    }
+
+    public function getDeviceModelIdAttribute(): ?int
+    {
+        if ($this->asset_model_id !== null) {
+            return (int) $this->asset_model_id;
+        }
+        return $this->active_asset?->model_id ? (int) $this->active_asset->model_id : null;
+    }
+
+    public function getIsFloatingUnitAttribute(): bool
+    {
+        return in_array($this->status, ['booked', 'reserved', 'confirmed'], true)
+            && $this->asset_unit_id === null;
+    }
+
+    public function getPaidAmountAttribute(): float
+    {
+        $payments = $this->relationLoaded('payments')
+            ? $this->payments
+            : $this->payments()->get();
+
+        $inflow = (float) $payments
+            ->filter(fn ($p) => in_array($p->type, ['dp', 'settlement', 'extension', 'exchange'], true)
+                && ($p->status === null || $p->status !== 'void'))
+            ->sum('amount');
+
+        $outflow = (float) $payments
+            ->filter(fn ($p) => $p->type === 'refund'
+                && ($p->status === null || $p->status !== 'void'))
+            ->sum('amount');
+
+        return max(0.0, $inflow - $outflow);
     }
 
     public function getPrimaryItemAttribute(): ?BookingItem
@@ -117,6 +176,43 @@ class Booking extends Model
         return $this->addonItems()->with('asset.model.category')->get()->all();
     }
 
+    public function getAddonsAttribute(): array
+    {
+        $items = $this->relationLoaded('items')
+            ? $this->items
+            : $this->addonItems()->with(['asset.model', 'assetModel'])->get();
+
+        $grouped = [];
+        foreach ($items as $item) {
+            $isAddon = $item->item_type === 'addon'
+                || (bool) ($item->asset?->model?->is_addon ?? $item->assetModel?->is_addon ?? false);
+            if (!$isAddon) {
+                continue;
+            }
+            $model = $item->asset?->model ?? $item->assetModel;
+            $name = $model?->name ?? $item->asset?->asset_code ?? 'Add-on';
+            $key = $model?->id ? 'model_' . $model->id : 'name_' . strtolower($name);
+            if (!isset($grouped[$key])) {
+                $grouped[$key] = [
+                    'id' => $item->id,
+                    'model_id' => $model?->id ?? $item->asset_model_id,
+                    'name' => $name,
+                    'quantity' => 0,
+                    'item_ids' => [],
+                    'is_returned' => (bool) ($item->is_returned ?? false),
+                    'returned_at' => $item->returned_at?->toIso8601String(),
+                ];
+            }
+            $grouped[$key]['quantity']++;
+            $grouped[$key]['item_ids'][] = $item->id;
+            if (!($item->is_returned ?? false)) {
+                $grouped[$key]['is_returned'] = false;
+            }
+        }
+
+        return array_values($grouped);
+    }
+
     protected static function booted(): void
     {
         static::addGlobalScope(new \App\Scopes\TenantScope);
@@ -130,6 +226,16 @@ class Booking extends Model
     public function affiliate(): BelongsTo
     {
         return $this->belongsTo(Affiliate::class);
+    }
+
+    public function assetModel(): BelongsTo
+    {
+        return $this->belongsTo(AssetModel::class, 'asset_model_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
+    }
+
+    public function assetUnit(): BelongsTo
+    {
+        return $this->belongsTo(Asset::class, 'asset_unit_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
     }
 
     public function customer(): BelongsTo

@@ -63,6 +63,8 @@ Route::prefix('v1')->group(function () {
             Route::get('/businesses/{id}/rental-rules', [BusinessController::class, 'getRentalRules']);
             Route::put('/businesses/{id}/rental-rules', [BusinessController::class, 'updateRentalRules']);
             Route::get('/businesses/{id}/branches', [BusinessController::class, 'branches']);
+            Route::get('/branches/{branchId}/booking-rules', [BusinessController::class, 'getBranchBookingRules']);
+            Route::put('/branches/{branchId}/booking-rules', [BusinessController::class, 'updateBranchBookingRules']);
             Route::get('/businesses/{id}/members', [BusinessController::class, 'members']);
             Route::post('/businesses/{id}/members', [BusinessController::class, 'addMember']);
             Route::put('/businesses/{id}/members/{memberId}', [BusinessController::class, 'updateMemberRole']);
@@ -110,6 +112,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/assets', [AssetController::class, 'index']);
             Route::post('/assets', [AssetController::class, 'store']);
             Route::get('/assets/models', [AssetController::class, 'models']);
+            Route::get('/assets/models/availability', [AssetController::class, 'modelAvailability']);
             Route::get('/assets/{id}', [AssetController::class, 'show']);
             Route::put('/assets/{id}', [AssetController::class, 'update']);
             Route::delete('/assets/{id}', [AssetController::class, 'destroy']);
@@ -145,7 +148,14 @@ Route::prefix('v1')->group(function () {
             // Bookings & Direct Counter Rentals
             Route::get('/bookings', [BookingController::class, 'index']);
             Route::post('/bookings', [BookingController::class, 'store']);
+            Route::get('/bookings/availability', [AssetController::class, 'modelAvailability']);
             Route::get('/bookings/{id}', [BookingController::class, 'show']);
+            Route::get('/bookings/{id}/available-units', [BookingController::class, 'availableUnits'])->whereNumber('id');
+            Route::post('/bookings/{id}/check-in', [BookingController::class, 'checkIn'])->whereNumber('id');
+            Route::post('/bookings/{id}/handover', [BookingController::class, 'checkIn'])->whereNumber('id');
+            Route::post('/bookings/{id}/no-show', [BookingController::class, 'markNoShow'])->whereNumber('id');
+            Route::post('/bookings/{id}/extend-grace', [BookingController::class, 'extendGrace'])->whereNumber('id');
+            Route::patch('/bookings/{id}/reschedule', [BookingController::class, 'reschedule'])->whereNumber('id');
             Route::post('/bookings/{id}/extend', [BookingController::class, 'extend']);
             Route::post('/bookings/{id}/adjust-duration', [BookingController::class, 'adjustDuration']);
             Route::post('/bookings/{id}/return', [BookingController::class, 'processReturn']);

@@ -13,19 +13,25 @@ class BookingItem extends Model
     protected $fillable = [
         'booking_id',
         'asset_id',
+        'asset_model_id',
         'item_type',
         'unit_price',
         'duration_unit',
         'duration_value',
         'rate_snapshot',
         'status',
+        'is_returned',
+        'returned_at',
         'exchanged_at',
     ];
 
     protected $casts = [
+        'asset_model_id' => 'integer',
         'unit_price' => 'decimal:2',
         'duration_value' => 'integer',
         'rate_snapshot' => 'array',
+        'is_returned' => 'boolean',
+        'returned_at' => 'datetime',
         'exchanged_at' => 'datetime',
     ];
 
@@ -54,5 +60,10 @@ class BookingItem extends Model
     public function asset(): BelongsTo
     {
         return $this->belongsTo(Asset::class)->withoutGlobalScope(\App\Scopes\TenantScope::class);
+    }
+
+    public function assetModel(): BelongsTo
+    {
+        return $this->belongsTo(AssetModel::class, 'asset_model_id')->withoutGlobalScope(\App\Scopes\TenantScope::class);
     }
 }

@@ -598,12 +598,34 @@ class RentalAddonAndPolicyTest extends TestCase
         $this->assertEquals('rented', $iphone->fresh()->status);
         $this->assertEquals('rented', $pb->fresh()->status);
 
-        // Process return
+        // Process return without confirming add-on completeness is blocked
+        try {
+            $returnService->processReturn($booking, [
+                'checklist_results' => ['icloud_removed' => true],
+                'condition_grade' => 'A',
+                'accessories_returned' => ['power_bank' => true, 'cable' => true],
+            ], $this->owner);
+            $this->fail('Expected ValidationException when addons_returned is omitted.');
+        } catch (ValidationException $e) {
+            $this->assertStringContainsString(
+                'Pastikan seluruh add-on yang disewa telah dikembalikan dengan lengkap.',
+                $e->getMessage()
+            );
+        }
+
+        // Process return with add-on verification succeeds & marks booking item returned
         $returnService->processReturn($booking, [
             'checklist_results' => ['icloud_removed' => true],
             'condition_grade' => 'A',
+            'addons_returned' => true,
             'accessories_returned' => ['power_bank' => true, 'cable' => true],
         ], $this->owner);
+
+        $addonBookingItem = BookingItem::where('booking_id', $booking->id)
+            ->where('item_type', 'addon')
+            ->first();
+        $this->assertTrue((bool) $addonBookingItem->is_returned);
+        $this->assertNotNull($addonBookingItem->returned_at);
 
         $this->assertEquals('returned', $booking->fresh()->status);
         $this->assertEquals('ready', $iphone->fresh()->status);

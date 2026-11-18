@@ -489,4 +489,137 @@ class NotificationService
 
         return $notif ? [$notif] : [];
     }
+
+    /**
+     * Collect branch staff, booking creator, and business owner IDs for branch-scoped booking alerts.
+     */
+    protected function getBookingNotificationRecipientIds(Booking $booking, Business $business): array
+    {
+        $recipientIds = [];
+
+        if ($business->owner_id) {
+            $recipientIds[] = $business->owner_id;
+        }
+        if ($booking->created_by) {
+            $recipientIds[] = $booking->created_by;
+        }
+
+        if ($booking->affiliate_id) {
+            $branchUserIds = User::where('affiliate_id', $booking->affiliate_id)
+                ->where('is_active', true)
+                ->pluck('id')
+                ->all();
+            $recipientIds = array_merge($recipientIds, $branchUserIds);
+
+            $memberUserIds = \App\Models\BusinessMember::where('business_id', $booking->business_id)
+                ->where('is_active', true)
+                ->whereHas('branchMembers', fn ($q) => $q->where('affiliate_id', $booking->affiliate_id))
+                ->pluck('user_id')
+                ->all();
+            $recipientIds = array_merge($recipientIds, $memberUserIds);
+        }
+
+        return array_values(array_unique(array_filter($recipientIds)));
+    }
+
+    /**
+     * Phase 4.1: Grace Period Warning (15 mins before grace_expires_at).
+     */
+    public function notifyBookingGraceWarning(Booking $booking): array
+    {
+        $business = Business::find($booking->business_id);
+        if (!$business) {
+            return [];
+        }
+
+        $recipientIds = $this->getBookingNotificationRecipientIds($booking, $business);
+        if (empty($recipientIds)) {
+            return [];
+        }
+
+        $customerName = $booking->customer?->name ?? 'Pelanggan';
+        $modelName = $booking->assetModel?->name
+            ?? $booking->active_asset?->model?->name
+            ?? 'Unit Sewa';
+        $graceAt = $booking->grace_expires_at ? Carbon::parse($booking->grace_expires_at) : Carbon::now();
+        $minsLeft = max(1, (int) Carbon::now()->diffInMinutes($graceAt, false));
+        $graceTimeLabel = $graceAt->format('H:i');
+
+        $title = "Batas Ambil Segera Habis ({$booking->booking_code})";
+        $body = "Booking {$booking->booking_code} oleh {$customerName} ({$modelName}) belum diambil. Masa tenggang berakhir dalam {$minsLeft} menit ({$graceTimeLabel}).";
+
+        $payload = [
+            'booking_id' => $booking->id,
+            'booking_code' => $booking->booking_code,
+            'customer_name' => $customerName,
+            'grace_expires_at' => $graceAt->toIso8601String(),
+            'minutes_remaining' => $minsLeft,
+        ];
+
+        $dedupPrefix = "booking.grace_warning:{$booking->id}:{$graceAt->timestamp}";
+
+        return $this->notifyUsers(
+            $booking->business_id,
+            $booking->affiliate_id,
+            $recipientIds,
+            'rental',
+            'booking.grace_warning',
+            $title,
+            $body,
+            '/bookings',
+            $payload,
+            $dedupPrefix
+        );
+    }
+
+    /**
+     * Phase 4.2: Auto No-Show Executed notification.
+     */
+    public function notifyBookingAutoNoShow(Booking $booking): array
+    {
+        $business = Business::find($booking->business_id);
+        if (!$business) {
+            return [];
+        }
+
+        $recipientIds = $this->getBookingNotificationRecipientIds($booking, $business);
+        if (empty($recipientIds)) {
+            return [];
+        }
+
+        $customerName = $booking->customer?->name ?? 'Pelanggan';
+        $modelName = $booking->assetModel?->name
+            ?? $booking->active_asset?->model?->name
+            ?? 'Unit Sewa';
+        $forfeited = (float) ($booking->forfeited_dp_amount ?? 0);
+        $forfeitedNote = $forfeited > 0
+            ? ' DP hangus: Rp ' . number_format($forfeited, 0, ',', '.') . '.'
+            : '';
+
+        $title = "Booking Otomatis No-Show ({$booking->booking_code})";
+        $body = "Booking {$booking->booking_code} oleh {$customerName} ({$modelName}) melewati masa tenggang ambil dan otomatis ditandai No-Show. Slot unit telah dilepas kembali ke inventaris.{$forfeitedNote}";
+
+        $payload = [
+            'booking_id' => $booking->id,
+            'booking_code' => $booking->booking_code,
+            'customer_name' => $customerName,
+            'no_show_at' => $booking->no_show_at?->toIso8601String(),
+            'forfeited_dp_amount' => $forfeited,
+        ];
+
+        $dedupPrefix = "booking.auto_noshow:{$booking->id}";
+
+        return $this->notifyUsers(
+            $booking->business_id,
+            $booking->affiliate_id,
+            $recipientIds,
+            'rental',
+            'booking.auto_noshow',
+            $title,
+            $body,
+            '/bookings',
+            $payload,
+            $dedupPrefix
+        );
+    }
 }

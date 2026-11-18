@@ -120,7 +120,7 @@ class DashboardController extends Controller
             ->count();
 
         $todayRentalsCreated = (clone $bookingQuery)->whereBetween('created_at', [$todayStart, $todayEnd])->count();
-        $pendingPickupCount = (clone $bookingQuery)->where('status', 'confirmed')->count();
+        $pendingPickupCount = (clone $bookingQuery)->whereIn('status', ['booked', 'reserved', 'confirmed'])->count();
         $activeRentals = $unitsRented;
 
         $overdueBookings = (clone $bookingQuery)->with(['customer', 'items.asset.model'])

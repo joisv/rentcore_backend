@@ -29,6 +29,9 @@ class Affiliate extends Model
         'payment_methods_config_override',
         'qris_raw_payload',
         'is_dynamic_qris_enabled',
+        'booking_grace_period_minutes',
+        'booking_auto_noshow',
+        'allow_floating_unit_booking',
         'is_active',
     ];
 
@@ -41,7 +44,20 @@ class Affiliate extends Model
         'expense_pin_threshold_override' => 'decimal:2',
         'payment_methods_config_override' => 'array',
         'is_dynamic_qris_enabled' => 'boolean',
+        'booking_grace_period_minutes' => 'integer',
+        'booking_auto_noshow' => 'boolean',
+        'allow_floating_unit_booking' => 'boolean',
     ];
+
+    public function getBookingRules(): array
+    {
+        return [
+            'branch_id' => $this->id,
+            'booking_grace_period_minutes' => (int) ($this->booking_grace_period_minutes ?? 60),
+            'booking_auto_noshow' => $this->booking_auto_noshow !== null ? (bool) $this->booking_auto_noshow : true,
+            'allow_floating_unit_booking' => $this->allow_floating_unit_booking !== null ? (bool) $this->allow_floating_unit_booking : true,
+        ];
+    }
 
     protected static function booted(): void
     {

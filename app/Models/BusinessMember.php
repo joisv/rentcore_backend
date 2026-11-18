@@ -115,6 +115,9 @@ class BusinessMember extends Model
             'payment_methods_config_override' => $b->payment_methods_config_override,
             'qris_raw_payload' => $b->qris_raw_payload,
             'is_dynamic_qris_enabled' => (bool) ($b->is_dynamic_qris_enabled ?? false),
+            'booking_grace_period_minutes' => (int) ($b->booking_grace_period_minutes ?? 60),
+            'booking_auto_noshow' => $b->booking_auto_noshow !== null ? (bool) $b->booking_auto_noshow : true,
+            'allow_floating_unit_booking' => $b->allow_floating_unit_booking !== null ? (bool) $b->allow_floating_unit_booking : true,
         ])->values()->all();
     }
 }

@@ -96,6 +96,12 @@ class CashierController extends Controller
             'notes' => 'nullable|string|max:255',
             'frp_cleared' => 'nullable|boolean',
             'account_removed' => 'nullable|boolean',
+            'is_handover_settlement' => 'nullable|boolean',
+            'asset_unit_id' => 'nullable|integer|exists:assets,id',
+            'collateral_type' => 'nullable|string|max:50',
+            'collateral_storage_slot' => 'nullable|string|max:100',
+            'start_now' => 'nullable|boolean',
+            'keep_original_end_at' => 'nullable|boolean',
         ]);
 
         $user = $request->user();
@@ -165,9 +171,24 @@ class CashierController extends Controller
         try {
             return DB::transaction(function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey, $cashierBranchId, $activeShift) {
             // Re-fetch booking with row-level pessimistic lock
-            $lockedBooking = Booking::where('id', $booking->id)->lockForUpdate()->first();
+            $lockedBooking = Booking::withoutGlobalScopes()
+                ->with(['items.asset.model', 'items.assetModel', 'assetModel', 'assetUnit', 'affiliate', 'payments'])
+                ->where('id', $booking->id)
+                ->lockForUpdate()
+                ->first();
 
-            if ($type === 'settlement' || $type === 'extension') {
+            if (
+                $request->boolean('is_handover_settlement') &&
+                $request->boolean('start_now') &&
+                in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)
+            ) {
+                $lockedBooking = app(\App\Services\BookingService::class)->applyEarlyPickupShift(
+                    $lockedBooking,
+                    $request->boolean('keep_original_end_at')
+                );
+            }
+
+            if ($type === 'settlement' || $type === 'extension' || $type === 'dp') {
                 $alreadyPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                     ->where(function ($q) {
@@ -259,7 +280,8 @@ class CashierController extends Controller
             ]);
 
             // Update booking payment status
-            if ($type === 'settlement' || $type === 'extension') {
+            $handoverCompleted = false;
+            if ($type === 'settlement' || $type === 'extension' || $type === 'dp') {
                 $newTotalPaid = (float)$lockedBooking->payments()
                     ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
                     ->where(function ($q) {
@@ -267,7 +289,32 @@ class CashierController extends Controller
                     })
                     ->sum('amount');
                 $newPaymentStatus = ($newTotalPaid >= (float)$lockedBooking->total_bill) ? 'paid' : ($newTotalPaid > 0 ? 'partial' : 'unpaid');
-                $lockedBooking->update(['payment_status' => $newPaymentStatus]);
+                $lockedBooking->update([
+                    'payment_status' => $newPaymentStatus,
+                    'remaining_balance' => max(0.0, round((float)$lockedBooking->total_bill - $newTotalPaid, 2)),
+                ]);
+
+                if (
+                    $request->boolean('is_handover_settlement') &&
+                    in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)
+                ) {
+                    if ($newPaymentStatus !== 'paid') {
+                        throw ValidationException::withMessages([
+                            'amount' => ['Pembayaran pelunasan harus mencukupi sisa tagihan sebelum menyerahkan unit.'],
+                        ]);
+                    }
+
+                    $lockedBooking = app(\App\Services\BookingService::class)->checkInBooking(
+                        $lockedBooking,
+                        [
+                            'asset_unit_id' => $request->input('asset_unit_id'),
+                            'collateral_type' => $request->input('collateral_type'),
+                            'collateral_storage_slot' => $request->input('collateral_storage_slot'),
+                        ],
+                        $user
+                    );
+                    $handoverCompleted = true;
+                }
             } elseif ($type === 'penalty') {
                 $totalPenaltyPaid = (float)$lockedBooking->payments()
                     ->where('type', 'penalty')
@@ -311,11 +358,12 @@ class CashierController extends Controller
                 'message' => 'Pembayaran kasir POS berhasil diproses.',
                 'data' => [
                     'payment' => $paymentTx->load('paymentMethod'),
-                    'booking' => $lockedBooking->fresh(['customer', 'payments.paymentMethod', 'items.asset.model']),
+                    'booking' => $lockedBooking->fresh(['customer', 'payments.paymentMethod', 'items.asset.model', 'assetModel', 'assetUnit']),
                     'amount_due' => $amountToPay,
                     'cash_received' => $cashReceived,
                     'cash_change' => $cashChange,
                     'receipt_number' => $receiptNumber,
+                    'handover_completed' => $handoverCompleted,
                 ],
             ], 201);
         });

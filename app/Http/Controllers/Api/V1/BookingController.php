@@ -12,6 +12,7 @@ use App\Models\PricingTier;
 use App\Models\RentalExtension;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\BookingAvailabilityService;
 use App\Services\BookingService;
 use App\Services\ExchangeService;
 use App\Services\PricingService;
@@ -30,7 +31,8 @@ class BookingController extends Controller
         protected BookingService $bookingService,
         protected ReturnService $returnService,
         protected ExchangeService $exchangeService,
-        protected PricingService $pricingService
+        protected PricingService $pricingService,
+        protected BookingAvailabilityService $availabilityService
     ) {}
 
     /**
@@ -53,10 +55,16 @@ class BookingController extends Controller
         $query = Booking::with([
             'customer',
             'returnInspection',
+            'assetModel.category',
+            'assetModel.pricingTiers' => function ($pq) {
+                $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
+            },
+            'assetUnit.model',
             'items.asset.model.category',
             'items.asset.model.pricingTiers' => function ($pq) {
                 $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
             },
+            'items.assetModel.category',
             'payments.paymentMethod',
             'payments.processedBy',
             'exchanges.oldAsset.model',
@@ -157,10 +165,14 @@ class BookingController extends Controller
             }
         }
 
-        if ($request->has('status')) {
+        if ($request->filled('status')) {
             if ($request->status === 'overdue') {
                 $query->where('bookings.status', 'rented')
                       ->where('bookings.end_at', '<=', Carbon::now());
+            } elseif ($request->status === 'booked') {
+                $query->whereIn('bookings.status', ['booked', 'reserved', 'confirmed']);
+            } elseif ($request->status === 'active') {
+                $query->whereIn('bookings.status', ['rented', 'active']);
             } else {
                 $query->where('bookings.status', $request->status);
             }
@@ -177,6 +189,10 @@ class BookingController extends Controller
                   ->orWhereHas('customer', function ($cq) use ($search) {
                       $cq->where('name', 'like', "%{$search}%")
                          ->orWhere('phone', 'like', "%{$search}%");
+                  })
+                  ->orWhereHas('assetModel', function ($mq) use ($search) {
+                      $mq->where('name', 'like', "%{$search}%")
+                         ->orWhere('brand', 'like', "%{$search}%");
                   })
                   ->orWhereHas('items.asset', function ($aq) use ($search) {
                       $aq->where('asset_code', 'like', "%{$search}%")
@@ -198,11 +214,18 @@ class BookingController extends Controller
     }
 
     /**
-     * Create direct counter rental transaction.
+     * Create direct counter rental transaction or scheduled reservation (`booked`).
      */
     public function store(Request $request): JsonResponse
     {
+        $isScheduled = $request->has('is_scheduled')
+            ? $request->boolean('is_scheduled')
+            : ($request->input('booking_mode') === 'scheduled' || $request->input('status') === 'booked');
+
         $request->validate([
+            'is_scheduled' => 'nullable|boolean',
+            'booking_mode' => 'nullable|in:direct,scheduled',
+            'status' => 'nullable|in:rented,active,booked',
             'customer_id' => 'nullable|integer|exists:customers,id',
             'affiliate_id' => 'nullable|integer|exists:affiliates,id',
             'customer_name' => 'required|string|max:150',
@@ -213,26 +236,36 @@ class BookingController extends Controller
             'identity_number' => 'nullable|string|max:100',
             'identity_photo' => 'nullable',
             'identity_photo_base64' => 'nullable|string',
-            'asset_ids' => 'required|array|min:1',
+            'asset_model_id' => 'nullable|integer|exists:asset_models,id',
+            'device_model_id' => 'nullable|integer|exists:asset_models,id',
+            'asset_unit_id' => 'nullable|integer|exists:assets,id',
+            'asset_ids' => ($isScheduled ? 'nullable' : 'required') . '|array' . ($isScheduled ? '' : '|min:1'),
             'asset_ids.*' => 'integer|exists:assets,id',
             'addon_asset_ids' => 'nullable|array',
             'addon_asset_ids.*' => 'integer|exists:assets,id',
             'duration_hours' => 'nullable|integer|min:1',
             'duration_unit' => 'nullable|string|in:hour,day,week,month',
             'duration_value' => 'nullable|integer|min:1',
-            'start_at' => 'nullable|date',
+            'start_at' => $isScheduled
+                ? 'required|date|after_or_equal:' . now()->subMinutes(5)->toDateTimeString()
+                : 'nullable|date',
             'deposit_fee' => 'nullable|numeric|min:0',
             'voucher_code' => 'nullable|string',
             'manual_discount_amount' => 'nullable|numeric|min:0',
             'manual_discount_reason' => 'nullable|string',
             'manager_pin' => 'nullable|string',
-            'payment_method_id' => 'required|integer|exists:payment_methods,id',
+            'payment_method_id' => ($isScheduled ? 'nullable' : 'required') . '|integer|exists:payment_methods,id',
+            'paid_amount' => 'nullable|numeric|min:0',
+            'dp_amount' => 'nullable|numeric|min:0',
             'cash_received' => 'nullable|numeric|min:0',
             'collateral_type' => 'nullable|string|max:50',
             'collateral_storage_slot' => 'nullable|string|max:100',
             'notes' => 'nullable|string',
             'unit_prices' => 'nullable|array',
             'unit_prices.*' => 'numeric|min:0',
+        ], [
+            'start_at.required' => 'Waktu pengambilan wajib diisi untuk booking terjadwal.',
+            'start_at.after_or_equal' => 'Pilih waktu dan tanggal di masa mendatang untuk booking terjadwal.',
         ]);
 
         $payload = $request->all();
@@ -244,6 +277,15 @@ class BookingController extends Controller
         }
         if (empty($payload['affiliate_id']) && $headerBranchId) {
             $payload['affiliate_id'] = $headerBranchId;
+        }
+
+        if ($isScheduled) {
+            $booking = $this->bookingService->createScheduledBooking($payload, $request->user());
+            return response()->json([
+                'success' => true,
+                'message' => 'Booking terjadwal berhasil dibuat.',
+                'data' => $booking,
+            ], 201);
         }
 
         // Strict pre-checkout active shift enforcement
@@ -278,10 +320,16 @@ class BookingController extends Controller
     {
         $booking = Booking::with([
             'customer.identities',
+            'assetModel.category',
+            'assetModel.pricingTiers' => function ($pq) {
+                $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
+            },
+            'assetUnit.model',
             'items.asset.model.category',
             'items.asset.model.pricingTiers' => function ($pq) {
                 $pq->where('is_active', true)->orderBy('duration_hours', 'asc');
             },
+            'items.assetModel.category',
             'payments.paymentMethod',
             'payments.processedBy',
             'voucher',
@@ -360,7 +408,7 @@ class BookingController extends Controller
             $activeItems = $booking->activeItems->isNotEmpty() ? $booking->activeItems : $booking->items;
             $assetIds = $activeItems->pluck('asset_id')->toArray();
             $collision = Booking::where('id', '!=', $booking->id)
-                ->whereIn('status', ['confirmed', 'rented'])
+                ->whereIn('status', ['booked', 'reserved', 'confirmed', 'rented', 'active'])
                 ->whereHas('items', function ($iq) use ($assetIds) {
                     $iq->whereIn('asset_id', $assetIds)
                        ->where(function ($sq) {
@@ -650,7 +698,7 @@ class BookingController extends Controller
                     if ($potentialNewEndAt->gt($previousEndAt)) {
                         // Forward Collision Check for this specific add-on asset
                         $collision = Booking::where('id', '!=', $booking->id)
-                            ->whereIn('status', ['confirmed', 'rented'])
+                            ->whereIn('status', ['booked', 'reserved', 'confirmed', 'rented', 'active'])
                             ->whereHas('items', function ($iq) use ($targetItem) {
                                 $iq->where('asset_id', $targetItem->asset_id)
                                    ->where(function ($sq) {
@@ -721,7 +769,7 @@ class BookingController extends Controller
                     $activeItems = $booking->activeItems->isNotEmpty() ? $booking->activeItems : $booking->items;
                     $assetIds = $activeItems->pluck('asset_id')->toArray();
                     $collision = Booking::where('id', '!=', $booking->id)
-                        ->whereIn('status', ['confirmed', 'rented'])
+                        ->whereIn('status', ['booked', 'reserved', 'confirmed', 'rented', 'active'])
                         ->whereHas('items', function ($iq) use ($assetIds) {
                             $iq->whereIn('asset_id', $assetIds)
                                ->where(function ($sq) {
@@ -1059,13 +1107,16 @@ class BookingController extends Controller
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',
+            'addons_returned' => 'nullable|boolean',
+            'returned_addon_ids' => 'nullable|array',
+            'returned_addon_ids.*' => 'integer',
             'penalty_payment_method_id' => 'nullable|exists:payment_methods,id',
             'cash_received' => 'nullable|numeric|min:0',
             'staff_notes' => 'nullable|string',
             'idempotency_key' => 'nullable|string|max:64',
         ]);
 
-        $booking = Booking::with('items.asset.model.category')->findOrFail($id);
+        $booking = Booking::with(['items.asset.model.category', 'items.assetModel', 'addonItems'])->findOrFail($id);
 
         $data = $request->all();
         if ($request->hasHeader('X-Idempotency-Key') && empty($data['idempotency_key'])) {
@@ -1124,5 +1175,136 @@ class BookingController extends Controller
         $result = $this->exchangeService->executeExchange($booking, $request->all(), $request->user());
 
         return response()->json($result);
+    }
+
+    /**
+     * List ready physical units matching a scheduled booking's model & branch for check-in assignment.
+     */
+    public function availableUnits(Request $request, int $id): JsonResponse
+    {
+        $booking = Booking::with(['assetModel', 'assetUnit', 'items.asset.model'])->findOrFail($id);
+
+        $startOverride = null;
+        $endOverride = null;
+        if ($request->boolean('start_now') || $request->filled('new_start_at')) {
+            $startOverride = $request->filled('new_start_at')
+                ? Carbon::parse($request->input('new_start_at'))
+                : Carbon::now();
+            $keepOriginalEndAt = $request->boolean('keep_original_end_at');
+            if ($keepOriginalEndAt && $booking->end_at) {
+                $endOverride = Carbon::parse($booking->end_at);
+            } else {
+                $durationHours = max(1, (int) ($booking->duration_hours ?: Carbon::parse($booking->start_at)->diffInHours(Carbon::parse($booking->end_at))));
+                $endOverride = $startOverride->copy()->addHours($durationHours);
+            }
+        }
+
+        $units = $this->availabilityService->getReadyPhysicalUnitsForBooking($booking, $startOverride, $endOverride);
+
+        return response()->json([
+            'success' => true,
+            'data' => $units,
+        ]);
+    }
+
+    /**
+     * Check-in / Handover a scheduled booking (`booked` -> `rented`) and assign physical unit if floating.
+     */
+    public function checkIn(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'asset_unit_id' => 'nullable|integer|exists:assets,id',
+            'asset_id' => 'nullable|integer|exists:assets,id',
+            'collateral_type' => 'nullable|string|max:50',
+            'collateral_storage_slot' => 'nullable|string|max:100',
+            'start_now' => 'nullable|boolean',
+            'keep_original_end_at' => 'nullable|boolean',
+        ]);
+
+        $booking = Booking::findOrFail($id);
+        $updated = $this->bookingService->checkInBooking($booking, $validated, $request->user());
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Unit berhasil diserahkan dan sewa kini aktif.',
+            'data' => $updated,
+        ]);
+    }
+
+    /**
+     * Reschedule a booked reservation to a new start time with conflict-safe availability validation.
+     */
+    public function reschedule(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'new_start_at' => 'required|date',
+            'keep_original_end_at' => 'nullable|boolean',
+        ]);
+
+        $booking = Booking::findOrFail($id);
+        $updated = $this->bookingService->rescheduleBooking(
+            $booking,
+            Carbon::parse($validated['new_start_at'])->utc(),
+            (bool) ($validated['keep_original_end_at'] ?? false),
+            $request->user()
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Jadwal booking berhasil diperbarui.',
+            'data' => $updated,
+        ]);
+    }
+
+    /**
+     * Manually mark a scheduled booking as `no_show`.
+     */
+    public function markNoShow(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'reason' => 'nullable|string|max:255',
+        ]);
+
+        $booking = Booking::findOrFail($id);
+        $updated = $this->bookingService->markNoShow(
+            $booking,
+            $request->user(),
+            $validated['reason'] ?? null,
+            false
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Booking telah ditandai sebagai No-Show dan slot unit dilepas.',
+            'data' => $updated,
+        ]);
+    }
+
+    /**
+     * Manually extend the pickup grace period for a scheduled booking.
+     */
+    public function extendGrace(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'additional_minutes' => 'nullable|integer|min:5|max:1440',
+            'grace_expires_at' => 'nullable|date|after:now',
+        ]);
+
+        $booking = Booking::findOrFail($id);
+        $newGraceAt = !empty($validated['grace_expires_at'])
+            ? Carbon::parse($validated['grace_expires_at'])
+            : null;
+        $updated = $this->bookingService->extendGracePeriod(
+            $booking,
+            $request->user(),
+            isset($validated['additional_minutes']) ? (int) $validated['additional_minutes'] : null,
+            $newGraceAt
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Batas waktu ambil unit berhasil diperpanjang.',
+            'data' => $updated,
+        ]);
     }
 }
