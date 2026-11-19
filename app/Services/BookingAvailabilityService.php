@@ -42,6 +42,28 @@ class BookingAvailabilityService
     }
 
     /**
+     * Resolve and verify that the given active branch belongs to the expected business.
+     */
+    protected function resolveBranchBusinessId(int $branchId, ?int $businessId = null): ?int
+    {
+        if ($branchId <= 0) {
+            return null;
+        }
+
+        $branch = Affiliate::withoutGlobalScopes()
+            ->where('id', $branchId)
+            ->when($businessId !== null, fn ($q) => $q->where('business_id', $businessId))
+            ->where('is_active', true)
+            ->first(['id', 'business_id']);
+
+        if (!$branch || !$branch->business_id) {
+            return null;
+        }
+
+        return (int) $branch->business_id;
+    }
+
+    /**
      * Calculate model-level capacity for a branch over [startAt, endAt].
      * Counts total rentable physical units minus overlapping pinned and floating reservations.
      */
@@ -50,9 +72,25 @@ class BookingAvailabilityService
         int $modelId,
         Carbon $startAt,
         Carbon $endAt,
-        ?int $excludeBookingId = null
+        ?int $excludeBookingId = null,
+        ?int $businessId = null
     ): array {
+        $effectiveBusinessId = $this->resolveBranchBusinessId($branchId, $businessId);
+        if (!$effectiveBusinessId) {
+            return [
+                'model_id' => $modelId,
+                'branch_id' => $branchId,
+                'total_units' => 0,
+                'pinned_booked_units' => 0,
+                'floating_booked_units' => 0,
+                'booked_units' => 0,
+                'available_slots' => 0,
+                'available_asset_ids' => [],
+            ];
+        }
+
         $activeTransferAssetIds = InventoryTransfer::withoutGlobalScopes()
+            ->where('business_id', $effectiveBusinessId)
             ->whereIn('status', ['pending', 'in_transit'])
             ->pluck('asset_id')
             ->filter()
@@ -60,6 +98,7 @@ class BookingAvailabilityService
             ->all();
 
         $rentableAssets = Asset::withoutGlobalScopes()
+            ->where('business_id', $effectiveBusinessId)
             ->where('affiliate_id', $branchId)
             ->where('model_id', $modelId)
             ->whereIn('status', self::RENTABLE_ASSET_STATUSES)
@@ -69,7 +108,7 @@ class BookingAvailabilityService
         $totalUnits = $rentableAssets->count();
         $rentableAssetIds = $rentableAssets->pluck('id')->map(fn ($id) => (int) $id)->all();
 
-        $overlappingBookings = $this->queryOverlappingBookings($branchId, $startAt, $endAt, $excludeBookingId);
+        $overlappingBookings = $this->queryOverlappingBookings($branchId, $startAt, $endAt, $excludeBookingId, $effectiveBusinessId);
 
         $pinnedAssetIds = [];
         $floatingCount = 0;
@@ -112,6 +151,7 @@ class BookingAvailabilityService
 
     /**
      * Return active device models enriched with per-model available slot counts for [startAt, endAt].
+     * Strictly scoped to the branch's owning business and excludes models with 0 physical units at that branch.
      */
     public function getAvailableModelsForBranch(
         int $branchId,
@@ -121,16 +161,44 @@ class BookingAvailabilityService
         ?int $categoryId = null,
         ?string $search = null
     ): Collection {
+        $effectiveBusinessId = $this->resolveBranchBusinessId($branchId, $businessId);
+        if (!$effectiveBusinessId) {
+            return collect();
+        }
+
+        $activeTransferAssetIds = InventoryTransfer::withoutGlobalScopes()
+            ->where('business_id', $effectiveBusinessId)
+            ->whereIn('status', ['pending', 'in_transit'])
+            ->pluck('asset_id')
+            ->filter()
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $branchAssets = Asset::withoutGlobalScopes()
+            ->where('business_id', $effectiveBusinessId)
+            ->where('affiliate_id', $branchId)
+            ->whereIn('status', self::RENTABLE_ASSET_STATUSES)
+            ->when(!empty($activeTransferAssetIds), fn ($q) => $q->whereNotIn('id', $activeTransferAssetIds))
+            ->get(['id', 'model_id', 'status']);
+
+        if ($branchAssets->isEmpty()) {
+            return collect();
+        }
+
+        $branchModelIds = $branchAssets->pluck('model_id')->filter()->map(fn ($id) => (int) $id)->unique()->values()->all();
+        if (empty($branchModelIds)) {
+            return collect();
+        }
+
         $query = AssetModel::withoutGlobalScopes()
             ->with(['category', 'pricingTiers' => function ($q) {
                 $q->where('is_active', true)->orderBy('duration_hours', 'asc');
             }])
+            ->ownedByBusiness($effectiveBusinessId)
+            ->whereIn('id', $branchModelIds)
             ->devices()
             ->where('is_active', true);
 
-        if ($businessId) {
-            $query->where('business_id', $businessId);
-        }
         if ($categoryId) {
             $query->where('category_id', $categoryId);
         }
@@ -147,21 +215,8 @@ class BookingAvailabilityService
             return $models;
         }
 
-        $activeTransferAssetIds = InventoryTransfer::withoutGlobalScopes()
-            ->whereIn('status', ['pending', 'in_transit'])
-            ->pluck('asset_id')
-            ->filter()
-            ->map(fn ($id) => (int) $id)
-            ->all();
-
-        $branchAssets = Asset::withoutGlobalScopes()
-            ->where('affiliate_id', $branchId)
-            ->whereIn('status', self::RENTABLE_ASSET_STATUSES)
-            ->when(!empty($activeTransferAssetIds), fn ($q) => $q->whereNotIn('id', $activeTransferAssetIds))
-            ->get(['id', 'model_id', 'status']);
-
         $assetsByModel = $branchAssets->groupBy('model_id');
-        $overlappingBookings = $this->queryOverlappingBookings($branchId, $startAt, $endAt);
+        $overlappingBookings = $this->queryOverlappingBookings($branchId, $startAt, $endAt, null, $effectiveBusinessId);
 
         return $models->map(function (AssetModel $model) use ($assetsByModel, $overlappingBookings, $branchId) {
             $modelAssets = $assetsByModel->get($model->id, collect());
@@ -200,7 +255,7 @@ class BookingAvailabilityService
             $model->setAttribute('available_asset_ids', $availableAssetIds);
 
             return $model;
-        })->values();
+        })->filter(fn (AssetModel $model) => (int) $model->getAttribute('total_units') > 0)->values();
     }
 
     /**
@@ -212,6 +267,7 @@ class BookingAvailabilityService
         ?Carbon $endOverride = null
     ): Collection {
         $activeTransferAssetIds = InventoryTransfer::withoutGlobalScopes()
+            ->when($booking->business_id, fn ($q) => $q->where('business_id', $booking->business_id))
             ->whereIn('status', ['pending', 'in_transit'])
             ->pluck('asset_id')
             ->filter()
@@ -220,6 +276,7 @@ class BookingAvailabilityService
 
         $query = Asset::withoutGlobalScopes()
             ->with(['model.category', 'affiliate'])
+            ->when($booking->business_id, fn ($q) => $q->where('business_id', $booking->business_id))
             ->where('affiliate_id', $booking->affiliate_id)
             ->where('status', 'ready')
             ->when(!empty($activeTransferAssetIds), fn ($q) => $q->whereNotIn('id', $activeTransferAssetIds));
@@ -240,7 +297,8 @@ class BookingAvailabilityService
             (int) $booking->affiliate_id,
             $startAt,
             $endAt,
-            (int) $booking->id
+            (int) $booking->id,
+            $booking->business_id ? (int) $booking->business_id : null
         );
 
         $blockedAssetIds = [];
@@ -265,11 +323,13 @@ class BookingAvailabilityService
         int $branchId,
         Carbon $startAt,
         Carbon $endAt,
-        ?int $excludeBookingId = null
+        ?int $excludeBookingId = null,
+        ?int $businessId = null
     ): Collection {
         $now = Carbon::now();
 
         return Booking::withoutGlobalScopes()
+            ->when($businessId !== null, fn ($q) => $q->where('business_id', $businessId))
             ->where('affiliate_id', $branchId)
             ->whereIn('status', self::ACTIVE_RESERVATION_STATUSES)
             ->when($excludeBookingId, fn ($q) => $q->where('id', '!=', $excludeBookingId))

@@ -79,6 +79,17 @@ class AssetModel extends Model
             });
     }
 
+    public function scopeOwnedByBusiness($query, int $businessId)
+    {
+        return $query->where(function ($q) use ($businessId) {
+            $q->where('asset_models.business_id', $businessId)
+              ->orWhere(function ($cq) use ($businessId) {
+                  $cq->whereNull('asset_models.business_id')
+                     ->whereHas('category', fn ($catQ) => $catQ->where('asset_categories.business_id', $businessId));
+              });
+        });
+    }
+
     protected static function booted(): void
     {
         static::addGlobalScope(new \App\Scopes\TenantScope);

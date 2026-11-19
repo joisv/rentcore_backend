@@ -16,6 +16,7 @@ class Booking extends Model
     protected $fillable = [
         'business_id',
         'booking_code',
+        'idempotency_key',
         'affiliate_id',
         'asset_model_id',
         'asset_unit_id',
@@ -143,7 +144,7 @@ class Booking extends Model
             : $this->payments()->get();
 
         $inflow = (float) $payments
-            ->filter(fn ($p) => in_array($p->type, ['dp', 'settlement', 'extension', 'exchange'], true)
+            ->filter(fn ($p) => in_array($p->type, ['dp', 'settlement', 'extension', 'exchange', 'deposit'], true)
                 && ($p->status === null || $p->status !== 'void'))
             ->sum('amount');
 
@@ -308,5 +309,59 @@ class Booking extends Model
     public function activeItems(): HasMany
     {
         return $this->hasMany(BookingItem::class)->where('status', 'active');
+    }
+
+    /**
+     * Authoritatively recalculate `remaining_balance` and `payment_status`
+     * strictly within the valid enum `['unpaid', 'partial', 'paid']` using
+     * completed non-penalty payment transactions (`SUM(inflow) - SUM(outflow)`).
+     */
+    public function recalculateFinancials(bool $save = true): self
+    {
+        $inflowPaid = (float) $this->payments()
+            ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange', 'deposit'])
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', 'completed');
+            })
+            ->where(function ($q) {
+                $q->whereNull('direction')->orWhere('direction', 'inflow');
+            })
+            ->sum('amount');
+
+        $outflowRefund = (float) $this->payments()
+            ->where(function ($q) {
+                $q->where('type', 'refund')
+                    ->orWhere(function ($oq) {
+                        $oq->where('direction', 'outflow')
+                           ->where('type', '!=', 'deposit_refund');
+                    });
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', 'completed');
+            })
+            ->sum('amount');
+
+        $netPaid = max(0.0, round($inflowPaid - $outflowRefund, 2));
+        $totalBill = max(0.0, (float) $this->total_bill);
+        $remainingBalance = max(0.0, round($totalBill - $netPaid, 2));
+
+        if ($totalBill <= 0) {
+            $paymentStatus = 'paid';
+        } elseif ($netPaid >= $totalBill) {
+            $paymentStatus = 'paid';
+        } elseif ($netPaid > 0) {
+            $paymentStatus = 'partial';
+        } else {
+            $paymentStatus = 'unpaid';
+        }
+
+        $this->remaining_balance = $remainingBalance;
+        $this->payment_status = $paymentStatus;
+
+        if ($save) {
+            $this->save();
+        }
+
+        return $this;
     }
 }

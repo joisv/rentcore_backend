@@ -14,6 +14,7 @@ class BranchExpense extends Model
     protected $fillable = [
         'business_id',
         'branch_id',
+        'shift_id',
         'expense_number',
         'category',
         'title',
@@ -49,6 +50,11 @@ class BranchExpense extends Model
     public function branch(): BelongsTo
     {
         return $this->belongsTo(Affiliate::class, 'branch_id');
+    }
+
+    public function shift(): BelongsTo
+    {
+        return $this->belongsTo(CashDrawerShift::class, 'shift_id');
     }
 
     public function requestedBy(): BelongsTo

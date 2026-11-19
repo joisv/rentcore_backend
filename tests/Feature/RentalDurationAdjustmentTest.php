@@ -10,6 +10,7 @@ use App\Models\Booking;
 use App\Models\BookingItem;
 use App\Models\Business;
 use App\Models\BusinessMember;
+use App\Models\CashDrawerShift;
 use App\Models\Customer;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
@@ -219,6 +220,16 @@ class RentalDurationAdjustmentTest extends TestCase
             'phone' => '08987654321',
             'email' => 'budi@test.com',
         ]);
+
+        CashDrawerShift::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'opened_by' => $this->staff->id,
+            'shift_number' => 'SHF-TEST-DUR-01',
+            'opening_cash_float' => 500000.00,
+            'status' => 'open',
+            'opened_at' => Carbon::now()->subHour(),
+        ]);
     }
 
     protected function requestAs(User $user)
@@ -327,10 +338,18 @@ class RentalDurationAdjustmentTest extends TestCase
         $booking = $this->createActiveBooking(48, 0.00);
         $previousEndAt = Carbon::parse($booking->end_at);
 
+        // Decrease without Manager PIN is rejected
+        $this->requestAs($this->staff)->postJson("/api/v1/bookings/{$booking->id}/adjust-duration", [
+            'direction' => 'decrease',
+            'hours_delta' => 24,
+            'reason' => 'Pelanggan ingin selesai lebih awal',
+        ])->assertStatus(422);
+
         $response = $this->requestAs($this->staff)->postJson("/api/v1/bookings/{$booking->id}/adjust-duration", [
             'direction' => 'decrease',
             'hours_delta' => 24, // reduce from 48h to 24h
             'reason' => 'Pelanggan ingin selesai lebih awal',
+            'manager_pin' => '123456',
         ]);
 
         $response->assertStatus(200);
@@ -341,7 +360,7 @@ class RentalDurationAdjustmentTest extends TestCase
         $this->assertEquals(150000.00, (float)$booking->primary_subtotal); // 24h tier
         $this->assertEquals(30000.00, (float)$booking->addon_subtotal);    // 24h capped tripod tier
         $this->assertEquals(180000.00, (float)$booking->total_bill);
-        $this->assertEquals('pending', $booking->payment_status);
+        $this->assertEquals('unpaid', $booking->payment_status);
 
         $this->assertDatabaseHas('rental_extensions', [
             'booking_id' => $booking->id,
@@ -359,6 +378,7 @@ class RentalDurationAdjustmentTest extends TestCase
         $response = $this->requestAs($this->staff)->postJson("/api/v1/bookings/{$booking->id}/adjust-duration", [
             'direction' => 'decrease',
             'hours_delta' => 24, // reduce to 24h
+            'manager_pin' => '123456',
         ]);
 
         $response->assertStatus(200);
@@ -462,6 +482,7 @@ class RentalDurationAdjustmentTest extends TestCase
             'booking_item_id' => $tripodItem->id,
             'direction' => 'decrease',
             'hours_delta' => 24,
+            'manager_pin' => '123456',
         ]);
 
         $response->assertStatus(200);
@@ -486,7 +507,7 @@ class RentalDurationAdjustmentTest extends TestCase
         $initialPrimaryEndAt = Carbon::parse($booking->end_at);
         $tripodItem = $booking->items->where('item_type', 'addon')->first();
 
-        // Increase Tripod from 24h by 24h to 48h (with additional payment 20.000)
+        // Increase Tripod from 24h by 24h to 48h (custom fee override requires Manager PIN)
         $response = $this->requestAs($this->staff)->postJson("/api/v1/bookings/{$booking->id}/adjust-duration", [
             'booking_item_id' => $tripodItem->id,
             'direction' => 'increase',
@@ -495,6 +516,7 @@ class RentalDurationAdjustmentTest extends TestCase
             'payment_method_id' => $this->cashMethod->id,
             'cash_received' => 50000.00,
             'notes' => 'Pembayaran perpanjangan tripod add-on',
+            'manager_pin' => '123456',
         ]);
 
         $response->assertStatus(200);

@@ -15,6 +15,7 @@ use App\Services\AuditLogService;
 use App\Services\BookingAvailabilityService;
 use App\Services\BookingService;
 use App\Services\ExchangeService;
+use App\Services\ManagerPinVerificationService;
 use App\Services\PricingService;
 use App\Services\ReturnService;
 use App\Services\ShiftEnforcementService;
@@ -22,7 +23,6 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 
 class BookingController extends Controller
@@ -222,11 +222,50 @@ class BookingController extends Controller
             ? $request->boolean('is_scheduled')
             : ($request->input('booking_mode') === 'scheduled' || $request->input('status') === 'booked');
 
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId() ?? $request->user()?->business_id;
+
+        $isAllBranches = $request->boolean('all_branches')
+            || in_array((string) $request->input('branch_id'), ['all', '-1'], true)
+            || in_array((string) $request->input('affiliate_id'), ['all', '-1'], true);
+
+        if ($isAllBranches) {
+            throw ValidationException::withMessages([
+                'branch_id' => ['Cabang aktif wajib dipilih (mode Semua Cabang tidak dapat digunakan untuk membuat booking).'],
+            ]);
+        }
+
+        if ($request->filled('branch_id') && $request->filled('affiliate_id') && (int) $request->input('branch_id') !== (int) $request->input('affiliate_id')) {
+            throw ValidationException::withMessages([
+                'branch_id' => ['Parameter branch_id dan affiliate_id tidak sesuai.'],
+            ]);
+        }
+
+        if (!$request->filled('branch_id')) {
+            $fallbackBranchId = $request->input('affiliate_id')
+                ?? $request->header('X-Branch-Id')
+                ?? $tenantContext->getBranchId()
+                ?? $request->user()?->affiliate_id;
+            if ($fallbackBranchId !== null && $fallbackBranchId !== '' && $fallbackBranchId !== 'null') {
+                $request->merge(['branch_id' => $fallbackBranchId]);
+            }
+        }
+
         $request->validate([
             'is_scheduled' => 'nullable|boolean',
             'booking_mode' => 'nullable|in:direct,scheduled',
             'status' => 'nullable|in:rented,active,booked',
             'customer_id' => 'nullable|integer|exists:customers,id',
+            'branch_id' => [
+                'required',
+                'integer',
+                \Illuminate\Validation\Rule::exists('affiliates', 'id')->where(function ($q) use ($businessId) {
+                    $q->where('is_active', true);
+                    if ($businessId) {
+                        $q->where('business_id', $businessId);
+                    }
+                }),
+            ],
             'affiliate_id' => 'nullable|integer|exists:affiliates,id',
             'customer_name' => 'required|string|max:150',
             'customer_phone' => 'required|string|max:30',
@@ -261,14 +300,65 @@ class BookingController extends Controller
             'collateral_type' => 'nullable|string|max:50',
             'collateral_storage_slot' => 'nullable|string|max:100',
             'notes' => 'nullable|string',
+            'external_reference' => 'nullable|string|max:100',
             'unit_prices' => 'nullable|array',
             'unit_prices.*' => 'numeric|min:0',
+            'idempotency_key' => 'nullable|string|max:64',
         ], [
+            'branch_id.required' => 'Cabang aktif wajib dipilih untuk membuat booking.',
+            'branch_id.exists' => 'Cabang tidak valid atau tidak dimiliki oleh bisnis ini.',
             'start_at.required' => 'Waktu pengambilan wajib diisi untuk booking terjadwal.',
             'start_at.after_or_equal' => 'Pilih waktu dan tanggal di masa mendatang untuk booking terjadwal.',
         ]);
 
         $payload = $request->all();
+        $payload['branch_id'] = (int) $request->input('branch_id');
+        $payload['affiliate_id'] = (int) $request->input('branch_id');
+        $idempotencyKey = $request->header('X-Idempotency-Key') ?? $request->input('idempotency_key');
+        if (!empty($idempotencyKey)) {
+            $payload['idempotency_key'] = (string)$idempotencyKey;
+        }
+
+        $findExistingByIdempotency = function () use ($idempotencyKey, $businessId): ?Booking {
+            if (empty($idempotencyKey)) {
+                return null;
+            }
+            $existingBooking = Booking::withoutGlobalScopes()
+                ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+
+            if (!$existingBooking) {
+                $existingTx = PaymentTransaction::withoutGlobalScopes()
+                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+                    ->where('idempotency_key', $idempotencyKey)
+                    ->first();
+                $existingBooking = $existingTx?->booking_id
+                    ? Booking::withoutGlobalScopes()->find($existingTx->booking_id)
+                    : null;
+            }
+
+            return $existingBooking?->load([
+                'items.asset.model',
+                'items.assetModel',
+                'assetModel',
+                'assetUnit',
+                'customer',
+                'payments.paymentMethod',
+                'voucher',
+                'affiliate',
+            ]);
+        };
+
+        if ($existingBooking = $findExistingByIdempotency()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
+                'is_idempotent' => true,
+                'data' => $existingBooking,
+            ], 200);
+        }
+
         $headerBranchId = $request->header('X-Branch-Id') ? (int)$request->header('X-Branch-Id') : null;
         if (!empty($payload['affiliate_id']) && $headerBranchId && (int)$payload['affiliate_id'] !== $headerBranchId) {
             throw \Illuminate\Validation\ValidationException::withMessages([
@@ -279,38 +369,50 @@ class BookingController extends Controller
             $payload['affiliate_id'] = $headerBranchId;
         }
 
-        if ($isScheduled) {
-            $booking = $this->bookingService->createScheduledBooking($payload, $request->user());
+        try {
+            if ($isScheduled) {
+                $booking = $this->bookingService->createScheduledBooking($payload, $request->user());
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Booking terjadwal berhasil dibuat.',
+                    'data' => $booking,
+                ], 201);
+            }
+
+            // Strict pre-checkout active shift enforcement
+            $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
+            $activeShift = null;
+            if (!empty($payload['shift_id'])) {
+                $activeShift = \App\Models\CashDrawerShift::where('id', $payload['shift_id'])
+                    ->where('branch_id', $targetBranchId)
+                    ->where('status', 'open')
+                    ->first();
+            }
+            $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
+                $targetBranchId,
+                $request->user(),
+                true,
+                'memproses transaksi'
+            );
+
+            $booking = $this->bookingService->createCounterRental($payload, $request->user());
+
             return response()->json([
                 'success' => true,
-                'message' => 'Booking terjadwal berhasil dibuat.',
+                'message' => 'Transaksi sewa berhasil dibuat dan unit langsung aktif disewa.',
                 'data' => $booking,
             ], 201);
+        } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
+            if ($existingBooking = $findExistingByIdempotency()) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
+                    'is_idempotent' => true,
+                    'data' => $existingBooking,
+                ], 200);
+            }
+            throw $e;
         }
-
-        // Strict pre-checkout active shift enforcement
-        $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
-        $activeShift = null;
-        if (!empty($payload['shift_id'])) {
-            $activeShift = \App\Models\CashDrawerShift::where('id', $payload['shift_id'])
-                ->where('branch_id', $targetBranchId)
-                ->where('status', 'open')
-                ->first();
-        }
-        $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
-            $targetBranchId,
-            $request->user(),
-            true,
-            'memproses transaksi'
-        );
-
-        $booking = $this->bookingService->createCounterRental($payload, $request->user());
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Transaksi sewa berhasil dibuat dan unit langsung aktif disewa.',
-            'data' => $booking,
-        ], 201);
     }
 
     /**
@@ -542,16 +644,10 @@ class BookingController extends Controller
                 }
             }
 
-            $alreadyPaid = (float)$booking->payments()->whereIn('type', ['dp', 'settlement', 'extension'])->sum('amount')
-                + ($paymentTx ? (float)$paymentTx->amount : 0.0);
-            $newPaymentStatus = ($alreadyPaid >= $newTotalBill) ? 'paid' : 'partial';
-
-            $booking->update([
-                'end_at' => $newEndAt,
-                'duration_hours' => $booking->duration_hours + $additionalHours,
-                'total_bill' => $newTotalBill,
-                'payment_status' => $newPaymentStatus,
-            ]);
+            $booking->end_at = $newEndAt;
+            $booking->duration_hours = $booking->duration_hours + $additionalHours;
+            $booking->total_bill = $newTotalBill;
+            $booking->recalculateFinancials();
 
             // Immutable Audit Log
             AuditLogService::log(
@@ -601,9 +697,32 @@ class BookingController extends Controller
             'reason' => 'nullable|string|max:255',
             'current_end_at' => 'nullable|date',
             'additional_fee' => 'nullable|numeric|min:0',
+            'idempotency_key' => 'nullable|string|max:64',
         ]);
 
-        return DB::transaction(function () use ($request, $validated, $id) {
+        $idempotencyKey = $validated['idempotency_key'] ?? $request->header('X-Idempotency-Key');
+        if (!empty($idempotencyKey)) {
+            $existingTx = PaymentTransaction::where('booking_id', $id)
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+            if ($existingTx) {
+                $existingBooking = Booking::with(['items.asset.model.category', 'extensions', 'payments.paymentMethod'])->findOrFail($id);
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Penyesuaian durasi sewa telah diproses sebelumnya (Idempotent).',
+                    'data' => [
+                        'booking' => $existingBooking,
+                        'adjustment' => $existingBooking->extensions()->latest('id')->first(),
+                        'payment' => $existingTx,
+                        'fee_delta' => (float)$existingTx->amount,
+                        'new_end_at' => Carbon::parse($existingBooking->end_at)->toIso8601String(),
+                        'is_idempotent' => true,
+                    ],
+                ]);
+            }
+        }
+
+        return DB::transaction(function () use ($request, $validated, $id, $idempotencyKey) {
             $user = $request->user();
             $tenantContext = app(\App\Tenancy\TenantContext::class);
             $businessId = $tenantContext->getBusinessId() ?? $user->current_business_id ?? $user->business_id;
@@ -725,12 +844,27 @@ class BookingController extends Controller
                 }
 
                 $oldPrice = (float)$targetItem->unit_price;
+                $serverPrice = $this->pricingService->calculateItemPriceForDuration($targetModel, $newAddonHours);
+                $serverDelta = $serverPrice - $oldPrice;
+
                 if ($direction === 'increase' && $request->filled('additional_fee')) {
                     $feeDelta = (float)$request->additional_fee;
+                    if (abs($feeDelta - $serverDelta) > 0.01) {
+                        $matchingManager = ManagerPinVerificationService::verify(
+                            $user,
+                            $validated['manager_pin'] ?? null,
+                            $businessId ? (int)$businessId : null,
+                            (int)$booking->affiliate_id,
+                            'Override nominal biaya penyesuaian durasi memerlukan otorisasi PIN Manager.',
+                            $request->ip(),
+                            'DurationAdjustment'
+                        );
+                        $managerApprovedBy = $matchingManager->id;
+                    }
                     $newPrice = $oldPrice + $feeDelta;
                 } else {
-                    $newPrice = $this->pricingService->calculateItemPriceForDuration($targetModel, $newAddonHours);
-                    $feeDelta = $newPrice - $oldPrice;
+                    $newPrice = $serverPrice;
+                    $feeDelta = $serverDelta;
                 }
 
                 $targetItem->update([
@@ -791,11 +925,26 @@ class BookingController extends Controller
                 }
 
                 $oldPrimarySubtotal = (float)$booking->primary_subtotal;
+                $serverPrimarySubtotal = $this->pricingService->calculateItemPriceForDuration($targetModel, $newBookingHours);
+                $serverPrimaryDelta = $serverPrimarySubtotal - $oldPrimarySubtotal;
+
                 if ($direction === 'increase' && $request->filled('additional_fee')) {
                     $feeDelta = (float)$request->additional_fee;
+                    if (abs($feeDelta - $serverPrimaryDelta) > 0.01) {
+                        $matchingManager = ManagerPinVerificationService::verify(
+                            $user,
+                            $validated['manager_pin'] ?? null,
+                            $businessId ? (int)$businessId : null,
+                            (int)$booking->affiliate_id,
+                            'Override nominal biaya perpanjangan durasi memerlukan otorisasi PIN Manager.',
+                            $request->ip(),
+                            'DurationAdjustment'
+                        );
+                        $managerApprovedBy = $matchingManager->id;
+                    }
                     $newPrimarySubtotal = $oldPrimarySubtotal + $feeDelta;
                 } else {
-                    $newPrimarySubtotal = $this->pricingService->calculateItemPriceForDuration($targetModel, $newBookingHours);
+                    $newPrimarySubtotal = $serverPrimarySubtotal;
                 }
 
                 $targetItem->update([
@@ -828,19 +977,34 @@ class BookingController extends Controller
             }
 
             // Recalculate Subtotal & Total Bill
+            $previousTotalBill = (float)$booking->total_bill;
             $newSubtotal = (float)$booking->primary_subtotal + (float)$booking->addon_subtotal;
             $newTotalBill = max(0, $newSubtotal - (float)$booking->discount_amount + (float)$booking->deposit_fee);
             $booking->subtotal_amount = $newSubtotal;
             $booking->total_bill = $newTotalBill;
 
+            // Enforce Manager PIN whenever duration decrease reduces total_bill
+            if ($direction === 'decrease' && $newTotalBill < $previousTotalBill) {
+                $matchingManager = ManagerPinVerificationService::verify(
+                    $user,
+                    $validated['manager_pin'] ?? null,
+                    $businessId ? (int)$businessId : null,
+                    (int)$booking->affiliate_id,
+                    'Pengurangan durasi yang menurunkan total tagihan memerlukan otorisasi PIN Manager.',
+                    $request->ip(),
+                    'DurationAdjustment'
+                );
+                $managerApprovedBy = $matchingManager->id;
+            }
+
             // Audit Net Payments Received
             $inflowPaid = (float)$booking->payments()
-                ->whereIn('type', ['dp', 'settlement', 'extension'])
-                ->where('status', '!=', 'void')
+                ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                ->where(fn($q) => $q->whereNull('status')->orWhere('status', 'completed'))
                 ->sum('amount');
             $outflowRefunds = (float)$booking->payments()
                 ->where('type', 'refund')
-                ->where('status', '!=', 'void')
+                ->where(fn($q) => $q->whereNull('status')->orWhere('status', 'completed'))
                 ->sum('amount');
             $alreadyPaidNet = max(0, $inflowPaid - $outflowRefunds);
 
@@ -853,10 +1017,6 @@ class BookingController extends Controller
                     $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
                     $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
-
-                    // Resolve payment method for refund
-                    $paymentMethodId = $request->payment_method_id ?? $booking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id') ?? 1;
-                    $paymentMethod = PaymentMethod::find($paymentMethodId) ?? PaymentMethod::first();
 
                     // Enforce business & branch payment method availability
                     $business = Business::find($booking->business_id);
@@ -902,6 +1062,7 @@ class BookingController extends Controller
                         'status' => 'completed',
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
+                        'idempotency_key' => $idempotencyKey,
                         'booking_id' => $booking->id,
                         'payment_method_id' => $paymentMethod->id,
                         'processed_by' => $user->id,
@@ -913,24 +1074,11 @@ class BookingController extends Controller
                         'notes' => $request->notes ?? "Pembayaran penambahan durasi {$hoursDelta} jam",
                         'transacted_at' => Carbon::now(),
                     ]);
-
-                    $alreadyPaidNet += $feeDelta;
                 }
-                $booking->payment_status = ($alreadyPaidNet >= $newTotalBill) ? 'paid' : ($alreadyPaidNet > 0 ? 'partial' : 'pending');
             } elseif ($feeDelta < 0) {
                 // Price Decreased -> Check if Overpayment / Refund is Produced
                 if ($alreadyPaidNet > $newTotalBill) {
                     $refundAmount = $alreadyPaidNet - $newTotalBill;
-
-                    // Security: Manager PIN Verification
-                    if (empty($validated['manager_pin'])) {
-                        throw ValidationException::withMessages([
-                            'manager_pin' => [
-                                'Pengurangan durasi menghasilkan pengembalian dana (refund) sebesar Rp ' .
-                                number_format($refundAmount, 0, ',', '.') . '. Otorisasi PIN Manager diperlukan.'
-                            ],
-                        ]);
-                    }
 
                     $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
 
@@ -953,42 +1101,6 @@ class BookingController extends Controller
                         'mengeluarkan pengembalian dana (refund) dari laci kasir'
                     );
 
-                    $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
-
-                    if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
-                        $seconds = RateLimiter::availableIn($throttleKey);
-                        return response()->json([
-                            'success' => false,
-                            'message' => 'Terlalu banyak percobaan PIN Manager. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
-                            'code' => 'PIN_RATE_LIMITED',
-                        ], 429);
-                    }
-
-                    $managers = User::where(function ($q) use ($branchId, $businessId) {
-                        $q->where('affiliate_id', $branchId)
-                          ->where('role', 'admin')
-                          ->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                              $bm->where('business_id', $businessId)
-                                 ->whereIn('role', ['admin', 'owner'])
-                                 ->where('is_active', true);
-                          });
-                    })->whereNotNull('manager_override_pin')->get();
-
-                    $matchingManager = $managers->first(function ($mgr) use ($validated) {
-                        return password_verify($validated['manager_pin'], $mgr->manager_override_pin);
-                    });
-
-                    if (!$matchingManager) {
-                        RateLimiter::hit($throttleKey, 300);
-                        $remaining = RateLimiter::remaining($throttleKey, 5);
-                        throw ValidationException::withMessages([
-                            'manager_pin' => ['PIN Manager tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : '')],
-                        ]);
-                    }
-
-                    RateLimiter::clear($throttleKey);
-                    $managerApprovedBy = $matchingManager->id;
-
                     // Record Outflow Refund PaymentTransaction
                     $datePrefix = Carbon::now()->format('ymd');
                     $countToday = PaymentTransaction::withoutGlobalScopes()
@@ -1009,6 +1121,7 @@ class BookingController extends Controller
                         'status' => 'completed',
                         'transaction_code' => $txCode,
                         'receipt_number' => $receiptNumber,
+                        'idempotency_key' => $idempotencyKey,
                         'booking_id' => $booking->id,
                         'payment_method_id' => $paymentMethodId,
                         'processed_by' => $user->id,
@@ -1022,10 +1135,9 @@ class BookingController extends Controller
                         'transacted_at' => Carbon::now(),
                     ]);
                 }
-                $booking->payment_status = ($alreadyPaidNet >= $newTotalBill) ? 'paid' : ($alreadyPaidNet > 0 ? 'partial' : 'pending');
             }
 
-            $booking->save();
+            $booking->recalculateFinancials();
 
             // Record Extension/Adjustment History
             $extension = RentalExtension::create([
@@ -1107,6 +1219,7 @@ class BookingController extends Controller
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',
+            'manager_pin' => 'nullable|string',
             'addons_returned' => 'nullable|boolean',
             'returned_addon_ids' => 'nullable|array',
             'returned_addon_ids.*' => 'integer',
@@ -1276,6 +1389,36 @@ class BookingController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Booking telah ditandai sebagai No-Show dan slot unit dilepas.',
+            'data' => $updated,
+        ]);
+    }
+
+    /**
+     * Cancel a scheduled booking (`booked` -> `cancelled`), release reserved inventory,
+     * and optionally refund any paid DP with Manager PIN verification.
+     */
+    public function cancel(Request $request, int $booking): JsonResponse
+    {
+        $validated = $request->validate([
+            'reason' => 'nullable|string|max:255',
+            'refund_dp' => 'nullable|boolean',
+            'manager_pin' => 'nullable|string',
+            'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+        ]);
+
+        $bookingModel = Booking::findOrFail($booking);
+        $updated = $this->bookingService->cancelBooking(
+            $bookingModel,
+            $request->user(),
+            $validated['reason'] ?? null,
+            (bool) ($validated['refund_dp'] ?? false),
+            $validated['manager_pin'] ?? null,
+            isset($validated['payment_method_id']) ? (int) $validated['payment_method_id'] : null
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Booking berhasil dibatalkan dan slot unit dilepas.',
             'data' => $updated,
         ]);
     }

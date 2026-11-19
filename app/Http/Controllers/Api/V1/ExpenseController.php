@@ -5,9 +5,9 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Models\Affiliate;
 use App\Models\BranchExpense;
-use App\Models\BusinessMember;
-use App\Models\User;
+use App\Models\CashDrawerShift;
 use App\Services\AuditLogService;
+use App\Services\ManagerPinVerificationService;
 use App\Services\ShiftEnforcementService;
 use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
@@ -15,7 +15,6 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -249,61 +248,17 @@ class ExpenseController extends Controller
             if (!$requirePin) {
                 $approvedBy = $user->id;
             } else {
-                if (empty($validated['manager_pin'])) {
-                    throw ValidationException::withMessages([
-                        'manager_pin' => [
-                            'Pengeluaran kas cabang di atas Rp ' . number_format($threshold, 0, ',', '.') . 
-                            ' (Rp ' . number_format($amount, 0, ',', '.') . 
-                            ') wajib diverifikasi menggunakan PIN Manager Cabang.'
-                        ],
-                    ]);
-                }
-
-                $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
-                if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
-                    $seconds = RateLimiter::availableIn($throttleKey);
-                    AuditLogService::log(
-                        $user,
-                        'security.pin_brute_force_lockout',
-                        'BranchExpense',
-                        'LOCKOUT',
-                        ['seconds_remaining' => $seconds, 'ip' => $request->ip()],
-                        null,
-                        $request->ip(),
-                        $branchId
-                    );
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Terlalu banyak percobaan PIN Manager yang salah. Akses PIN dikunci sementara. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
-                        'code' => 'PIN_RATE_LIMITED',
-                        'retry_after' => $seconds,
-                    ], 429);
-                }
-
-                $managers = User::where(function ($q) use ($branchId, $businessId) {
-                        $q->where('affiliate_id', $branchId);
-                        if ($businessId) {
-                            $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                                $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                            });
-                        }
-                    })
-                    ->whereNotNull('manager_override_pin')
-                    ->get();
-
-                $matchingManager = $managers->first(function ($mgr) use ($validated) {
-                    return password_verify($validated['manager_pin'], $mgr->manager_override_pin);
-                });
-
-                if (!$matchingManager) {
-                    RateLimiter::hit($throttleKey, 900);
-                    $remaining = 5 - RateLimiter::attempts($throttleKey);
-                    throw ValidationException::withMessages([
-                        'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : ' Akun Anda dikunci sementara.')],
-                    ]);
-                }
-
-                RateLimiter::clear($throttleKey);
+                $matchingManager = ManagerPinVerificationService::verify(
+                    $user,
+                    $validated['manager_pin'] ?? null,
+                    $businessId ? (int)$businessId : null,
+                    (int)$branchId,
+                    'Pengeluaran kas cabang di atas Rp ' . number_format($threshold, 0, ',', '.') .
+                    ' (Rp ' . number_format($amount, 0, ',', '.') .
+                    ') wajib diverifikasi menggunakan PIN Manager Cabang.',
+                    $request->ip(),
+                    'BranchExpense'
+                );
                 $approvedBy = $matchingManager->id;
             }
         }
@@ -333,21 +288,24 @@ class ExpenseController extends Controller
             ->count() + 1;
         $expenseNumber = sprintf('EXP-%s-%s-%04d-%s', $branch->code ?? 'CBG', $datePrefix, $countToday, strtoupper(Str::random(3)));
 
+        $shiftId = null;
         $disbursedAt = null;
-        if ($status === 'approved' && $validated['payment_source'] === 'cash_drawer') {
-            ShiftEnforcementService::requireActiveShift(
+        if ($validated['payment_source'] === 'cash_drawer') {
+            $activeShift = $this->requireOpenCashDrawerShift(
                 (int)$branch->id,
-                $user,
-                true,
-                'mencairkan kas pengeluaran dari laci kasir'
+                $businessId ? (int)$businessId : (int)$branch->business_id
             );
-            $status = 'disbursed';
-            $disbursedAt = Carbon::now();
+            $shiftId = $activeShift->id;
+            if ($status === 'approved') {
+                $status = 'disbursed';
+                $disbursedAt = Carbon::now();
+            }
         }
 
         $expense = BranchExpense::create([
             'business_id' => $businessId ?? $branch->business_id,
             'branch_id' => $branch->id,
+            'shift_id' => $shiftId,
             'expense_number' => $expenseNumber,
             'category' => $validated['category'],
             'title' => $validated['title'],
@@ -381,6 +339,7 @@ class ExpenseController extends Controller
             'message' => 'Pengeluaran cabang berhasil dicatat.',
             'data' => [
                 'id' => $expense->id,
+                'shift_id' => $expense->shift_id,
                 'expense_number' => $expense->expense_number,
                 'amount' => (float)$expense->amount,
                 'status' => $expense->status,
@@ -388,6 +347,28 @@ class ExpenseController extends Controller
                 'disbursed_at' => $expense->disbursed_at?->toIso8601String(),
             ],
         ], 201);
+    }
+
+    /**
+     * Ensure an open CashDrawerShift exists before binding a cash_drawer expense.
+     */
+    protected function requireOpenCashDrawerShift(int $branchId, ?int $businessId = null): CashDrawerShift
+    {
+        $activeShift = CashDrawerShift::where('branch_id', $branchId)
+            ->where('status', 'open')
+            ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+            ->latest('opened_at')
+            ->first();
+
+        if (!$activeShift) {
+            throw ValidationException::withMessages([
+                'shift' => ['Buka shift kasir terlebih dahulu untuk pengeluaran dari laci tunai.'],
+                'cash_shift' => ['Buka shift kasir terlebih dahulu untuk pengeluaran dari laci tunai.'],
+                'code' => ['SHIFT_NOT_ACTIVE'],
+            ])->status(422);
+        }
+
+        return $activeShift;
     }
 
     /**
@@ -408,19 +389,20 @@ class ExpenseController extends Controller
             ], 403);
         }
 
-        if ($expense->payment_source === 'cash_drawer') {
-            ShiftEnforcementService::requireActiveShift(
+        $shiftId = $expense->shift_id;
+        if ($expense->payment_source === 'cash_drawer' && !$shiftId) {
+            $activeShift = $this->requireOpenCashDrawerShift(
                 (int)$expense->branch_id,
-                $user,
-                true,
-                'mencairkan kas pengeluaran dari laci kasir'
+                $expense->business_id ? (int)$expense->business_id : null
             );
+            $shiftId = $activeShift->id;
         }
 
         $newStatus = ($expense->payment_source === 'cash_drawer') ? 'disbursed' : 'approved';
         $disbursedAt = ($newStatus === 'disbursed') ? Carbon::now() : $expense->disbursed_at;
 
         $expense->update([
+            'shift_id' => $shiftId,
             'status' => $newStatus,
             'approved_by' => $user->id,
             'disbursed_at' => $disbursedAt,
@@ -478,51 +460,16 @@ class ExpenseController extends Controller
         $voidedByUserId = $user->id;
 
         if (!$isOwnerOrAdmin) {
-            if (empty($request->manager_pin)) {
-                throw ValidationException::withMessages([
-                    'manager_pin' => ['Pembatalan pengeluaran kas wajib disetujui menggunakan PIN Manager Cabang.'],
-                ]);
-            }
-
             $branchId = $expense->branch_id ?? $user->affiliate_id;
-            $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
-
-            if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
-                $seconds = RateLimiter::availableIn($throttleKey);
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Terlalu banyak percobaan PIN salah. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
-                    'code' => 'PIN_RATE_LIMITED',
-                    'retry_after' => $seconds,
-                ], 429);
-            }
-
-            $managers = User::where(function ($q) use ($branchId, $businessId) {
-                if ($branchId) {
-                    $q->where('affiliate_id', $branchId);
-                }
-                if ($businessId) {
-                    $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                        $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                    });
-                }
-            })
-            ->whereNotNull('manager_override_pin')
-            ->get();
-
-            $matchingManager = $managers->first(function ($mgr) use ($request) {
-                return password_verify($request->manager_pin, $mgr->manager_override_pin);
-            });
-
-            if (!$matchingManager) {
-                RateLimiter::hit($throttleKey, 900);
-                $remaining = 5 - RateLimiter::attempts($throttleKey);
-                throw ValidationException::withMessages([
-                    'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining}." : '')],
-                ]);
-            }
-
-            RateLimiter::clear($throttleKey);
+            $matchingManager = ManagerPinVerificationService::verify(
+                $user,
+                $request->manager_pin,
+                $businessId ? (int)$businessId : null,
+                $branchId ? (int)$branchId : null,
+                'Pembatalan pengeluaran kas wajib disetujui menggunakan PIN Manager Cabang.',
+                $request->ip(),
+                'BranchExpense'
+            );
             $voidedByUserId = $matchingManager->id;
         }
 

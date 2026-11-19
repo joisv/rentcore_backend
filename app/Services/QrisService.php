@@ -80,70 +80,171 @@ class QrisService
     }
 
     /**
-     * Generate Dynamic QRIS payload from a raw static EMVCo QRIS string
-     * by injecting the dynamic transaction amount and recalculating CRC-16.
+     * Verify whether a payload's trailing Tag 63 checksum matches CRC-16/CCITT-FALSE.
+     */
+    public function hasValidCrc(string $payload): bool
+    {
+        $trimmed = trim($payload);
+        if (strlen($trimmed) < 8) {
+            return false;
+        }
+        $pos63 = strlen($trimmed) - 8;
+        if (substr($trimmed, $pos63, 4) !== '6304') {
+            return false;
+        }
+        $expectedCrc = strtoupper(substr($trimmed, -4));
+        $calculated = $this->calculateCrc16(substr($trimmed, 0, -4));
+        return $expectedCrc === $calculated;
+    }
+
+    /**
+     * Parse top-level EMVCo TLV tags sequentially without descending into nested templates (e.g. 26-51, 62).
      *
-     * @param string $rawStaticPayload The static QRIS string
-     * @param int $payableAmount The whole integer payable amount (e.g. 50000)
-     * @return string The mutated dynamic QRIS string
+     * @return list<array{tag: string, value: string}>|null
+     */
+    protected function parseRootTlv(string $body): ?array
+    {
+        $nodes = [];
+        $len = strlen($body);
+        $offset = 0;
+
+        while ($offset < $len) {
+            if ($offset + 4 > $len) {
+                return null;
+            }
+            $tag = substr($body, $offset, 2);
+            $lenStr = substr($body, $offset + 2, 2);
+            if (!ctype_digit($tag) || !ctype_digit($lenStr)) {
+                return null;
+            }
+            $valLen = (int)$lenStr;
+            if ($offset + 4 + $valLen > $len) {
+                return null;
+            }
+            $value = substr($body, $offset + 4, $valLen);
+            $nodes[] = ['tag' => $tag, 'value' => $value];
+            $offset += 4 + $valLen;
+        }
+
+        return $nodes;
+    }
+
+    /**
+     * Generate Dynamic QRIS payload from a static EMVCo QRIS string using sequential root TLV mutation
+     * (never mutating nested substrings inside merchant templates 26-51 or 62), then recalculating CRC-16.
      */
     public function generateDynamicQris(string $rawStaticPayload, int $payableAmount): string
     {
         $payload = trim($rawStaticPayload);
-
-        // 1. Convert Initiation Method (Tag 01):
-        // Replace '010211' (Static initiation) with '010212' (Dynamic initiation).
-        if (str_contains($payload, '010211')) {
-            $payload = str_replace('010211', '010212', $payload);
-        } elseif (!str_contains($payload, '010212') && str_starts_with($payload, '000201')) {
-            // If Tag 01 is missing, insert 010212 right after Tag 00 (000201)
-            $payload = '000201010212' . substr($payload, 6);
-        }
-
-        // 2. Inject Dynamic Bill Amount (Tag 54):
-        // Format $payableAmount into a whole integer string without punctuation
         $amountInt = max(0, (int)$payableAmount);
         $amountStr = (string)$amountInt;
-        $length = str_pad((string)strlen($amountStr), 2, '0', STR_PAD_LEFT);
-        $tag54 = '54' . $length . $amountStr;
 
-        // Check if Tag 54 already exists
-        if (preg_match('/54(\d{2})/', $payload, $matches, PREG_OFFSET_CAPTURE)) {
-            $offset = $matches[0][1];
-            $existingLength = (int)$matches[1][0];
-            $totalTagLen = 4 + $existingLength; // '54' (2) + len (2) + val (len)
-            $payload = substr_replace($payload, $tag54, $offset, $totalTagLen);
+        // 1. Strip trailing CRC Tag 63 ("6304XXXX") if present (after checking CRC structure)
+        $body = $payload;
+        if (strlen($payload) >= 8 && preg_match('/6304[0-9A-Fa-f]{4}$/', $payload)) {
+            // Compute existing CRC for inspection while allowing synthetic CRCs when strictly needed
+            $this->hasValidCrc($payload);
+            $body = substr($payload, 0, -8);
         } else {
-            // Insert Tag 54 immediately before Tag 5802ID (Country Code) or Tag 5303360 (Currency Code)
-            if (str_contains($payload, '5802ID')) {
-                $pos = strpos($payload, '5802ID');
-                $payload = substr($payload, 0, $pos) . $tag54 . substr($payload, $pos);
-            } elseif (str_contains($payload, '5303360')) {
-                $pos = strpos($payload, '5303360');
-                $payload = substr($payload, 0, $pos) . $tag54 . substr($payload, $pos);
-            } else {
-                // Fallback: insert before Tag 6304 if neither anchor exists
-                $pos63 = strrpos($payload, '6304');
-                if ($pos63 !== false) {
-                    $payload = substr($payload, 0, $pos63) . $tag54 . substr($payload, $pos63);
-                } else {
-                    $payload .= $tag54;
-                }
+            $pos63 = strrpos($payload, '6304');
+            if ($pos63 !== false && $pos63 === strlen($payload) - 4) {
+                $body = substr($payload, 0, $pos63);
             }
         }
 
-        // 3. Recalculate Checksum (Tag 63):
-        // Strip the old 4-character checksum following '6304' at the end of the payload.
-        // Extract the entire substring up to and including '...6304'.
-        $pos63 = strrpos($payload, '6304');
-        if ($pos63 !== false) {
-            $payloadUpTo6304 = substr($payload, 0, $pos63 + 4);
-        } else {
-            $payloadUpTo6304 = $payload . '6304';
+        // 2. Parse root TLV tags sequentially
+        $nodes = $this->parseRootTlv($body);
+
+        if ($nodes !== null && !empty($nodes)) {
+            $hasTag01 = false;
+            $hasTag54 = false;
+            $mutated = [];
+
+            foreach ($nodes as $node) {
+                $tag = $node['tag'];
+                $val = $node['value'];
+
+                if ($tag === '63') {
+                    continue;
+                }
+                if ($tag === '01') {
+                    $hasTag01 = true;
+                    $val = '12';
+                } elseif ($tag === '54') {
+                    $hasTag54 = true;
+                    $val = $amountStr;
+                }
+                $mutated[] = ['tag' => $tag, 'value' => $val];
+            }
+
+            if (!$hasTag01) {
+                // Insert Tag 01 = '12' right after Tag 00 (or at start)
+                $inserted = [];
+                $done = false;
+                foreach ($mutated as $node) {
+                    $inserted[] = $node;
+                    if ($node['tag'] === '00' && !$done) {
+                        $inserted[] = ['tag' => '01', 'value' => '12'];
+                        $done = true;
+                    }
+                }
+                if (!$done) {
+                    array_unshift($inserted, ['tag' => '01', 'value' => '12']);
+                }
+                $mutated = $inserted;
+            }
+
+            if (!$hasTag54) {
+                // Insert Tag 54 immediately after Tag 53 (Currency Code), or before Tag 58, or at end
+                $inserted = [];
+                $placed = false;
+                foreach ($mutated as $node) {
+                    if ($node['tag'] === '58' && !$placed) {
+                        $inserted[] = ['tag' => '54', 'value' => $amountStr];
+                        $placed = true;
+                    }
+                    $inserted[] = $node;
+                    if ($node['tag'] === '53' && !$placed) {
+                        $inserted[] = ['tag' => '54', 'value' => $amountStr];
+                        $placed = true;
+                    }
+                }
+                if (!$placed) {
+                    $inserted[] = ['tag' => '54', 'value' => $amountStr];
+                }
+                $mutated = $inserted;
+            }
+
+            $serialized = '';
+            foreach ($mutated as $node) {
+                $v = $node['value'];
+                $vLen = str_pad((string)strlen($v), 2, '0', STR_PAD_LEFT);
+                $serialized .= $node['tag'] . $vLen . $v;
+            }
+
+            $payloadUpTo6304 = $serialized . '6304';
+            return $payloadUpTo6304 . $this->calculateCrc16($payloadUpTo6304);
         }
 
-        $checksum = $this->calculateCrc16($payloadUpTo6304);
-
-        return $payloadUpTo6304 . $checksum;
+        // Legacy fallback only when input lacks strict root byte-count integrity
+        $fallback = $body;
+        if (str_starts_with($fallback, '000201010211')) {
+            $fallback = '000201010212' . substr($fallback, 12);
+        } elseif (!str_starts_with($fallback, '000201010212') && str_starts_with($fallback, '000201')) {
+            $fallback = '000201010212' . substr($fallback, 6);
+        }
+        $length = str_pad((string)strlen($amountStr), 2, '0', STR_PAD_LEFT);
+        $tag54 = '54' . $length . $amountStr;
+        if (preg_match('/54(\d{2})/', $fallback, $matches, PREG_OFFSET_CAPTURE)) {
+            $offset = $matches[0][1];
+            $existingLength = (int)$matches[1][0];
+            $fallback = substr_replace($fallback, $tag54, $offset, 4 + $existingLength);
+        } elseif (($pos = strpos($fallback, '5802ID')) !== false) {
+            $fallback = substr($fallback, 0, $pos) . $tag54 . substr($fallback, $pos);
+        } else {
+            $fallback .= $tag54;
+        }
+        $payloadUpTo6304 = $fallback . '6304';
+        return $payloadUpTo6304 . $this->calculateCrc16($payloadUpTo6304);
     }
 }

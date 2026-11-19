@@ -41,102 +41,16 @@ class BookingService
     public function createCounterRental(array $data, User $cashier): Booking
     {
         return DB::transaction(function () use ($data, $cashier) {
-            $tenantContext = app(TenantContext::class);
-            $businessId = $tenantContext->getBusinessId();
-
-            // 1. Resolve affiliate_id safely without undefined array key
-            $affiliateId = !empty($data['affiliate_id']) ? (int)$data['affiliate_id'] : null;
-
-            // Fallback to TenantContext active branch (e.g. from X-Branch-Id header)
-            if (empty($affiliateId)) {
-                $affiliateId = $tenantContext->getBranchId();
-            }
-
-            // Fallback to cashier's explicit affiliate assignment (legacy role)
-            if (empty($affiliateId) && !empty($cashier->affiliate_id)) {
-                $affiliateId = $cashier->affiliate_id;
-            }
+            [$affiliate, $businessId] = $this->resolveAuthorizedBranchAndBusiness($data, $cashier);
+            $affiliateId = (int) $affiliate->id;
 
             $rawPrimaryIds = (array)($data['asset_ids'] ?? []);
             $rawAddonIds = (array)($data['addon_asset_ids'] ?? []);
             $assetIds = array_values(array_unique(array_filter(array_merge($rawPrimaryIds, $rawAddonIds))));
 
-            // Fallback to the business's central/default active branch
-            if (empty($affiliateId) && $businessId) {
-                $defaultBranch = Affiliate::where('business_id', $businessId)
-                    ->where('is_active', true)
-                    ->orderBy('is_central', 'desc')
-                    ->first();
-                $affiliateId = $defaultBranch?->id;
-            }
-
-            // Fail closed if affiliate still cannot be determined
-            if (empty($affiliateId)) {
-                throw ValidationException::withMessages([
-                    'affiliate_id' => ['Cabang/outlet tidak dapat ditentukan. Harap tentukan cabang aktif.'],
-                ]);
-            }
-
-            // Validate affiliate existence
-            $affiliate = Affiliate::find($affiliateId);
-            if (!$affiliate) {
-                throw ValidationException::withMessages([
-                    'affiliate_id' => ['Cabang yang dipilih tidak ditemukan.'],
-                ]);
-            }
-
-            // Derive businessId from affiliate if not set in TenantContext
-            if (!$businessId && $affiliate->business_id) {
-                $businessId = $affiliate->business_id;
-            }
-
-            // Multi-tenant isolation: Verify branch belongs to active business
-            if ($businessId && $affiliate->business_id && (int)$affiliate->business_id !== (int)$businessId) {
-                throw ValidationException::withMessages([
-                    'affiliate_id' => ['Cabang tidak valid untuk bisnis rental ini.'],
-                ]);
-            }
-
-            // Authorize user access to this business
-            if ($affiliate->business_id && !$cashier->isSuperAdmin()) {
-                $isMember = BusinessMember::where('business_id', $affiliate->business_id)
-                    ->where('user_id', $cashier->id)
-                    ->where('is_active', true)
-                    ->exists();
-
-                if (!$isMember && (int)$cashier->affiliate_id !== (int)$affiliate->id) {
-                    throw ValidationException::withMessages([
-                        'affiliate_id' => ['Anda tidak memiliki akses ke cabang bisnis ini.'],
-                    ]);
-                }
-            }
-
-            // Authorize user access to this specific branch (if branch-restricted)
-            if (!$cashier->isSuperAdmin()) {
-                if (!empty($cashier->affiliate_id) && (int)$cashier->affiliate_id !== (int)$affiliate->id) {
-                    throw ValidationException::withMessages([
-                        'affiliate_id' => ['Akses cabang ditolak. Anda tidak berwenang untuk cabang ini.'],
-                    ]);
-                }
-
-                $member = $tenantContext->getMember() ?? BusinessMember::where('business_id', $businessId)
-                    ->where('user_id', $cashier->id)
-                    ->where('is_active', true)
-                    ->first();
-
-                if ($member && $member->isStaff()) {
-                    $allowedBranches = $member->branchMembers()->pluck('affiliate_id')->toArray();
-                    if (!empty($allowedBranches) && !in_array((int)$affiliate->id, $allowedBranches)) {
-                        throw ValidationException::withMessages([
-                            'affiliate_id' => ['Akses cabang ditolak. Anda tidak ditugaskan di cabang ini.'],
-                        ]);
-                    }
-                }
-            }
-
             // Strict Pre-Checkout Shift Enforcement Check: Ensure Cash Drawer Shift is OPEN before anything is processed
             $activeShift = ShiftEnforcementService::requireActiveShift(
-                (int)$affiliate->id,
+                $affiliateId,
                 $cashier,
                 false,
                 'memproses transaksi'
@@ -230,18 +144,32 @@ class BookingService
                 ->where('affiliate_id', $affiliateId);
 
             if ($businessId) {
-                $assetQuery->where(function ($q) use ($businessId) {
-                    $q->where('business_id', $businessId)
-                      ->orWhereNull('business_id');
-                });
+                $assetQuery->where('business_id', $businessId);
             }
 
             $assets = $assetQuery->lockForUpdate()->get();
 
             if ($assets->count() !== count($assetIds)) {
                 throw ValidationException::withMessages([
-                    'asset_ids' => ['Sebagian perangkat yang dipilih tidak ditemukan di cabang ini atau telah dipindahkan ke cabang lain.'],
+                    'asset_ids' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
                 ]);
+            }
+
+            $requestedCounterModelId = !empty($data['asset_model_id'])
+                ? (int) $data['asset_model_id']
+                : (!empty($data['device_model_id']) ? (int) $data['device_model_id'] : null);
+            if ($requestedCounterModelId) {
+                $validCounterModel = AssetModel::withoutGlobalScopes()
+                    ->when($businessId, fn ($q) => $q->ownedByBusiness((int) $businessId))
+                    ->where('is_active', true)
+                    ->where('id', $requestedCounterModelId)
+                    ->exists();
+                $matchesSelectedPrimary = $assets->contains(fn ($a) => (int) $a->model_id === $requestedCounterModelId);
+                if (!$validCounterModel || !$matchesSelectedPrimary) {
+                    throw ValidationException::withMessages([
+                        'asset_model_id' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                    ]);
+                }
             }
 
             foreach ($assets as $asset) {
@@ -353,50 +281,23 @@ class BookingService
                 $isAddonItem = in_array((int)$asset->id, $addonAssetIdsList, true) || ($asset->model && $asset->model->isAddon());
                 $passedPrice = null;
                 if (!empty($data['unit_prices']) && is_array($data['unit_prices'])) {
-                    $passedPrice = $data['unit_prices'][$asset->id] ?? $data['unit_prices'][(string)$asset->id] ?? null;
+                    $rawPassed = $data['unit_prices'][$asset->id] ?? $data['unit_prices'][(string)$asset->id] ?? null;
+                    $passedPrice = $rawPassed !== null ? (float)$rawPassed : null;
                 }
 
-                try {
-                    $calc = $this->pricingService->calculate($asset->model, $durationUnit, $durationValue, $startAt);
-                    $unitPrice = $passedPrice !== null ? (float)$passedPrice : $calc['price'];
-                    $snapshot = $calc['rate_snapshot'];
-                } catch (ValidationException $e) {
-                    if ($passedPrice !== null) {
-                        $unitPrice = (float)$passedPrice;
-                        $snapshot = [
-                            'tier_id' => null,
-                            'duration_unit' => $durationUnit,
-                            'duration_value' => $durationValue,
-                            'duration_hours' => $durationHours,
-                            'price' => $unitPrice,
-                            'extension_hourly_rate' => 15000.00,
-                            'model_id' => $asset->model->id,
-                            'model_name' => $asset->model->name,
-                            'brand' => $asset->model->brand,
-                            'category_name' => $asset->model->category?->name,
-                            'calculated_at' => Carbon::now()->toIso8601String(),
-                        ];
-                    } elseif ($isAddonItem) {
-                        // Fallback for add-ons: use their first active tier or standard rate
-                        $firstTier = $asset->model ? $asset->model->pricingTiers()->where('is_active', true)->first() : null;
-                        $unitPrice = $firstTier ? (float)$firstTier->price : 20000.00;
-                        $snapshot = [
-                            'tier_id' => $firstTier?->id,
-                            'duration_unit' => $durationUnit,
-                            'duration_value' => $durationValue,
-                            'duration_hours' => $durationHours,
-                            'price' => $unitPrice,
-                            'extension_hourly_rate' => $firstTier ? (float)$firstTier->extension_hourly_rate : 5000.00,
-                            'model_id' => $asset->model?->id,
-                            'model_name' => $asset->model?->name,
-                            'brand' => $asset->model?->brand,
-                            'category_name' => $asset->model?->category?->name,
-                            'calculated_at' => Carbon::now()->toIso8601String(),
-                        ];
-                    } else {
-                        throw $e;
-                    }
-                }
+                [$unitPrice, $snapshot] = $this->resolveAuthoritativeItemPrice(
+                    $asset->model,
+                    $durationUnit,
+                    $durationValue,
+                    $startAt,
+                    $durationHours,
+                    $passedPrice,
+                    $isAddonItem,
+                    $data,
+                    $cashier,
+                    $affiliate,
+                    $businessId ? (int)$businessId : null
+                );
 
                 if (in_array((int)$asset->id, $addonAssetIdsList, true)) {
                     $addonSubtotal += $unitPrice;
@@ -411,63 +312,14 @@ class BookingService
             $subtotal = $primarySubtotal + $addonSubtotal;
 
             // 5. Discount Calculation (Voucher or Manual)
-            $discountType = 'none';
-            $discountAmount = 0.00;
-            $voucherId = null;
-            $approvedBy = null;
-
-            if (!empty($data['voucher_code'])) {
-                $voucherResult = $this->voucherService->validateVoucher(
-                    $data['voucher_code'],
-                    $subtotal,
-                    $customer->id,
-                    $affiliateId
-                );
-
-                $discountType = 'voucher';
-                $discountAmount = $voucherResult['calculated_discount'];
-                $voucherId = $voucherResult['voucher_id'];
-            } elseif (!empty($data['manual_discount_amount']) && (float)$data['manual_discount_amount'] > 0) {
-                $discountType = 'manual';
-                $discountAmount = (float)$data['manual_discount_amount'];
-
-                // Validate Cashier discount limits
-                $discountPercent = ($discountAmount / $subtotal) * 100;
-                $maxPercent = (float)$affiliate->cashier_discount_limit_percent;
-                $maxNominal = (float)$affiliate->cashier_discount_limit_nominal;
-
-                if ($discountPercent > $maxPercent || $discountAmount > $maxNominal) {
-                    if (empty($data['manager_pin'])) {
-                        throw ValidationException::withMessages([
-                            'manager_pin' => ['Diskon manual melebihi batas wewenang kasir (Max: ' . $maxPercent . '% / Rp ' . number_format($maxNominal, 0, ',', '.') . '). Diperlukan PIN Manager.'],
-                        ]);
-                    }
-                    // Validate Manager PIN
-                    $managers = User::where(function ($q) use ($affiliateId, $businessId) {
-                            $q->where('affiliate_id', $affiliateId);
-                            if ($businessId) {
-                                $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                                    $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                                });
-                            }
-                        })
-                        ->whereNotNull('manager_override_pin')
-                        ->get();
-
-                    $matchingManager = $managers->first(function ($mgr) use ($data) {
-                        return password_verify($data['manager_pin'], $mgr->manager_override_pin);
-                    });
-
-                    if (!$matchingManager) {
-                        throw ValidationException::withMessages([
-                            'manager_pin' => ['PIN Manager tidak valid.'],
-                        ]);
-                    }
-                    $approvedBy = $matchingManager->id;
-                } else {
-                    $approvedBy = $cashier->id;
-                }
-            }
+            [$discountType, $discountAmount, $voucherId, $approvedBy] = $this->resolveDiscountAndApprover(
+                $data,
+                $subtotal,
+                $customer,
+                $affiliate,
+                $businessId ? (int)$businessId : null,
+                $cashier
+            );
 
             $depositFee = (float)($data['deposit_fee'] ?? 0.00);
             $totalBill = max(0, $subtotal + $depositFee - $discountAmount);
@@ -487,10 +339,16 @@ class BookingService
                 ? $primaryAssets[0]->id
                 : ($assets->first()?->id);
 
+            $idempotencyKey = !empty($data['idempotency_key']) ? (string)$data['idempotency_key'] : null;
+
             // 7. Create Booking (Direct activation: status = 'rented')
+            $idempotencyKey = !empty($data['idempotency_key']) ? (string)$data['idempotency_key'] : null;
+
             $booking = Booking::withoutGlobalScopes()->create([
                 'business_id' => $businessId,
                 'booking_code' => $bookingCode,
+                'idempotency_key' => $idempotencyKey,
+                'idempotency_key' => $idempotencyKey,
                 'affiliate_id' => $affiliateId,
                 'asset_model_id' => $primaryAssetModelId,
                 'asset_unit_id' => $primaryAssetUnitId,
@@ -591,29 +449,22 @@ class BookingService
                 : $totalBill;
             $cashChange = $isCash ? max(0, $cashReceived - $totalBill) : 0.00;
 
-            $txEntropy = strtoupper(Str::random(4));
-            $txCount = (int)PaymentTransaction::where('business_id', $businessId)->count() + 1;
-            $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
-            $receiptNumber = sprintf('REC-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6)));
-
-            PaymentTransaction::create([
-                'business_id' => $businessId,
-                'branch_id' => $affiliateId,
-                'shift_id' => $activeShift?->id,
-                'transaction_code' => $txCode,
-                'receipt_number' => $receiptNumber,
-                'booking_id' => $booking->id,
-                'payment_method_id' => $paymentMethod->id,
-                'processed_by' => $cashier->id,
-                'type' => 'settlement',
-                'status' => 'completed',
-                'direction' => 'inflow',
-                'amount' => $totalBill,
-                'cash_received' => $cashReceived,
-                'cash_change' => $cashChange,
-                'notes' => 'Pembayaran lunas sewa langsung di counter kasir',
-                'transacted_at' => Carbon::now(),
-            ]);
+            $this->recordRentalAndDepositTransactions(
+                $booking,
+                $affiliate,
+                $cashier,
+                $paymentMethod,
+                $isCash,
+                $totalBill,
+                $depositFee,
+                $cashReceived,
+                $cashChange,
+                'settlement',
+                $activeShift?->id,
+                'Pembayaran lunas sewa langsung di counter kasir',
+                $idempotencyKey,
+                !empty($data['external_reference']) ? (string)$data['external_reference'] : null
+            );
 
             // 11. Immutable Security Audit Logging
             AuditLogService::log(
@@ -702,11 +553,18 @@ class BookingService
                 }
 
                 $model = AssetModel::withoutGlobalScopes()
-                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
-                    ->findOrFail((int) $requestedModelId);
+                    ->when($businessId, fn ($q) => $q->ownedByBusiness((int) $businessId))
+                    ->where('is_active', true)
+                    ->find((int) $requestedModelId);
+                if (!$model) {
+                    throw ValidationException::withMessages([
+                        'asset_model_id' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                    ]);
+                }
 
                 // Serialize concurrent bookings at the branch level by locking branch assets of this model
                 Asset::withoutGlobalScopes()
+                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
                     ->where('affiliate_id', $affiliateId)
                     ->where('model_id', $model->id)
                     ->lockForUpdate()
@@ -716,8 +574,16 @@ class BookingService
                     $affiliateId,
                     (int) $model->id,
                     $startAt,
-                    $endAt
+                    $endAt,
+                    null,
+                    $businessId ? (int) $businessId : null
                 );
+
+                if ($capacity['total_units'] < 1) {
+                    throw ValidationException::withMessages([
+                        'asset_model_id' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                    ]);
+                }
 
                 if ($capacity['available_slots'] < 1) {
                     throw ValidationException::withMessages([
@@ -729,37 +595,29 @@ class BookingService
                 $primaryModelId = (int) $model->id;
                 $primaryUnitId = null;
 
-                $passedModelPrice = $data['unit_prices']['model_' . $model->id]
+                $rawPassedModelPrice = $data['unit_prices']['model_' . $model->id]
                     ?? $data['unit_prices']['primary']
                     ?? null;
-                $calc = null;
-                try {
-                    $calc = $this->pricingService->calculate($model, $durationUnit, $durationValue, $startAt);
-                    $primaryPrice = $passedModelPrice !== null ? (float) $passedModelPrice : (float) $calc['price'];
-                    $primarySnapshot = $calc['rate_snapshot'];
-                } catch (ValidationException $e) {
-                    if ($passedModelPrice === null) {
-                        throw $e;
-                    }
-                    $primaryPrice = (float) $passedModelPrice;
-                    $primarySnapshot = [
-                        'tier_id' => null,
-                        'duration_unit' => $durationUnit,
-                        'duration_value' => $durationValue,
-                        'duration_hours' => $durationHours,
-                        'price' => $primaryPrice,
-                        'extension_hourly_rate' => 15000.00,
-                        'model_id' => $model->id,
-                        'model_name' => $model->name,
-                        'brand' => $model->brand,
-                        'category_name' => $model->category?->name,
-                        'calculated_at' => Carbon::now()->toIso8601String(),
-                    ];
-                }
+                $passedModelPrice = $rawPassedModelPrice !== null ? (float) $rawPassedModelPrice : null;
+
+                [$primaryPrice, $primarySnapshot] = $this->resolveAuthoritativeItemPrice(
+                    $model,
+                    $durationUnit,
+                    $durationValue,
+                    $startAt,
+                    $durationHours,
+                    $passedModelPrice,
+                    false,
+                    $data,
+                    $cashier,
+                    $affiliate,
+                    $businessId
+                );
                 $primarySubtotal = $primaryPrice;
             } else {
                 $primaryAssets = Asset::withoutGlobalScopes()
                     ->with(['model.category'])
+                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
                     ->whereIn('id', $rawPrimaryIds)
                     ->where('affiliate_id', $affiliateId)
                     ->lockForUpdate()
@@ -767,8 +625,21 @@ class BookingService
 
                 if ($primaryAssets->count() !== count($rawPrimaryIds)) {
                     throw ValidationException::withMessages([
-                        'asset_ids' => ['Sebagian perangkat yang dipilih tidak ditemukan di cabang ini.'],
+                        'asset_ids' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
                     ]);
+                }
+
+                if ($requestedModelId) {
+                    $validModel = AssetModel::withoutGlobalScopes()
+                        ->when($businessId, fn ($q) => $q->ownedByBusiness((int) $businessId))
+                        ->where('is_active', true)
+                        ->where('id', (int) $requestedModelId)
+                        ->exists();
+                    if (!$validModel || $primaryAssets->contains(fn ($a) => (int) $a->model_id !== (int) $requestedModelId)) {
+                        throw ValidationException::withMessages([
+                            'asset_model_id' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                        ]);
+                    }
                 }
 
                 foreach ($primaryAssets as $asset) {
@@ -786,8 +657,15 @@ class BookingService
                         $affiliateId,
                         (int) $asset->model_id,
                         $startAt,
-                        $endAt
+                        $endAt,
+                        null,
+                        $businessId ? (int) $businessId : null
                     );
+                    if ($cap['total_units'] < 1) {
+                        throw ValidationException::withMessages([
+                            'asset_ids' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                        ]);
+                    }
                     if ($cap['available_slots'] < 1) {
                         throw ValidationException::withMessages([
                             'asset_ids' => ["Kapasitas model {$asset->model?->name} pada jadwal tersebut sudah penuh."],
@@ -806,10 +684,17 @@ class BookingService
             if (!empty($rawAddonIds)) {
                 $addonAssets = Asset::withoutGlobalScopes()
                     ->with(['model.category'])
+                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
                     ->whereIn('id', $rawAddonIds)
                     ->where('affiliate_id', $affiliateId)
                     ->lockForUpdate()
                     ->get();
+
+                if ($addonAssets->count() !== count($rawAddonIds)) {
+                    throw ValidationException::withMessages([
+                        'addon_asset_ids' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
+                    ]);
+                }
 
                 foreach ($addonAssets as $addon) {
                     if (!$this->pricingService->isAssetAvailable($addon, $startAt, $endAt)) {
@@ -838,30 +723,21 @@ class BookingService
             $itemPrices = [];
             $itemSnapshots = [];
             foreach ($primaryAssets as $asset) {
-                $passedPrice = $data['unit_prices'][$asset->id] ?? $data['unit_prices'][(string) $asset->id] ?? null;
-                try {
-                    $calc = $this->pricingService->calculate($asset->model, $durationUnit, $durationValue, $startAt);
-                    $unitPrice = $passedPrice !== null ? (float) $passedPrice : (float) $calc['price'];
-                    $snapshot = $calc['rate_snapshot'];
-                } catch (ValidationException $e) {
-                    if ($passedPrice === null) {
-                        throw $e;
-                    }
-                    $unitPrice = (float) $passedPrice;
-                    $snapshot = [
-                        'tier_id' => null,
-                        'duration_unit' => $durationUnit,
-                        'duration_value' => $durationValue,
-                        'duration_hours' => $durationHours,
-                        'price' => $unitPrice,
-                        'extension_hourly_rate' => 15000.00,
-                        'model_id' => $asset->model?->id,
-                        'model_name' => $asset->model?->name,
-                        'brand' => $asset->model?->brand,
-                        'category_name' => $asset->model?->category?->name,
-                        'calculated_at' => Carbon::now()->toIso8601String(),
-                    ];
-                }
+                $rawPassed = $data['unit_prices'][$asset->id] ?? $data['unit_prices'][(string) $asset->id] ?? null;
+                $passedPrice = $rawPassed !== null ? (float) $rawPassed : null;
+                [$unitPrice, $snapshot] = $this->resolveAuthoritativeItemPrice(
+                    $asset->model,
+                    $durationUnit,
+                    $durationValue,
+                    $startAt,
+                    $durationHours,
+                    $passedPrice,
+                    false,
+                    $data,
+                    $cashier,
+                    $affiliate,
+                    $businessId
+                );
                 $primarySubtotal += $unitPrice;
                 $itemPrices[$asset->id] = $unitPrice;
                 $itemSnapshots[$asset->id] = $snapshot;
@@ -869,24 +745,21 @@ class BookingService
 
             $addonSubtotal = 0.0;
             foreach ($addonAssets as $addon) {
-                $passedPrice = $data['unit_prices'][$addon->id] ?? $data['unit_prices'][(string) $addon->id] ?? null;
-                try {
-                    $calc = $this->pricingService->calculate($addon->model, $durationUnit, $durationValue, $startAt);
-                    $unitPrice = $passedPrice !== null ? (float) $passedPrice : (float) $calc['price'];
-                    $snapshot = $calc['rate_snapshot'];
-                } catch (ValidationException) {
-                    $firstTier = $addon->model?->pricingTiers()->where('is_active', true)->first();
-                    $unitPrice = $passedPrice !== null ? (float) $passedPrice : ($firstTier ? (float) $firstTier->price : 20000.00);
-                    $snapshot = [
-                        'tier_id' => $firstTier?->id,
-                        'duration_unit' => $durationUnit,
-                        'duration_value' => $durationValue,
-                        'duration_hours' => $durationHours,
-                        'price' => $unitPrice,
-                        'model_id' => $addon->model?->id,
-                        'model_name' => $addon->model?->name,
-                    ];
-                }
+                $rawPassed = $data['unit_prices'][$addon->id] ?? $data['unit_prices'][(string) $addon->id] ?? null;
+                $passedPrice = $rawPassed !== null ? (float) $rawPassed : null;
+                [$unitPrice, $snapshot] = $this->resolveAuthoritativeItemPrice(
+                    $addon->model,
+                    $durationUnit,
+                    $durationValue,
+                    $startAt,
+                    $durationHours,
+                    $passedPrice,
+                    true,
+                    $data,
+                    $cashier,
+                    $affiliate,
+                    $businessId
+                );
                 $addonSubtotal += $unitPrice;
                 $itemPrices[$addon->id] = $unitPrice;
                 $itemSnapshots[$addon->id] = $snapshot;
@@ -925,9 +798,12 @@ class BookingService
                 ->count() + 1;
             $bookingCode = sprintf('RC-%s-%04d-%s', $datePrefix, $countToday, strtoupper(Str::random(3)));
 
+            $idempotencyKey = !empty($data['idempotency_key']) ? (string)$data['idempotency_key'] : null;
+
             $booking = Booking::withoutGlobalScopes()->create([
                 'business_id' => $businessId,
                 'booking_code' => $bookingCode,
+                'idempotency_key' => $idempotencyKey,
                 'affiliate_id' => $affiliateId,
                 'asset_model_id' => $primaryModelId,
                 'asset_unit_id' => $primaryUnitId,
@@ -1023,7 +899,9 @@ class BookingService
                     isset($data['cash_received']) ? (float) $data['cash_received'] : null,
                     $txType,
                     $data['shift_id'] ?? null,
-                    $txType === 'dp' ? 'Pembayaran DP booking terjadwal' : 'Pembayaran lunas booking terjadwal'
+                    $txType === 'dp' ? 'Pembayaran DP booking terjadwal' : 'Pembayaran lunas booking terjadwal',
+                    $idempotencyKey,
+                    !empty($data['external_reference']) ? (string)$data['external_reference'] : null
                 );
             }
 
@@ -1290,6 +1168,143 @@ class BookingService
     }
 
     /**
+     * Cancel a scheduled reservation (`booked` -> `cancelled`), release reserved inventory,
+     * and optionally refund any paid DP with Manager PIN verification.
+     */
+    public function cancelBooking(
+        Booking $booking,
+        User $actor,
+        ?string $reason = null,
+        bool $refundDp = false,
+        ?string $managerPin = null,
+        ?int $paymentMethodId = null
+    ): Booking {
+        return DB::transaction(function () use ($booking, $actor, $reason, $refundDp, $managerPin, $paymentMethodId) {
+            $lockedBooking = Booking::withoutGlobalScopes()
+                ->with(['payments', 'items.asset', 'assetUnit', 'customer', 'assetModel', 'affiliate'])
+                ->lockForUpdate()
+                ->findOrFail($booking->id);
+
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)) {
+                throw ValidationException::withMessages([
+                    'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat dibatalkan (status saat ini: {$lockedBooking->status})."],
+                ]);
+            }
+
+            // Release any reserved physical unit pinned to this booking
+            $reservedAssetIds = collect();
+            if ($lockedBooking->asset_unit_id) {
+                $reservedAssetIds->push((int) $lockedBooking->asset_unit_id);
+            }
+            foreach ($lockedBooking->items as $item) {
+                if ($item->asset_id) {
+                    $reservedAssetIds->push((int) $item->asset_id);
+                }
+            }
+            if ($reservedAssetIds->isNotEmpty()) {
+                Asset::withoutGlobalScopes()
+                    ->whereIn('id', $reservedAssetIds->unique()->all())
+                    ->where('status', 'reserved')
+                    ->lockForUpdate()
+                    ->update(['status' => 'ready']);
+            }
+
+            // Optional DP refund (requires Manager PIN + active shift)
+            $lockedBooking->recalculateFinancials(false);
+            $paidAmount = (float) $lockedBooking->paid_amount;
+
+            if ($refundDp && $paidAmount > 0) {
+                $approver = ManagerPinVerificationService::verify(
+                    $actor,
+                    $managerPin,
+                    $lockedBooking->business_id ? (int) $lockedBooking->business_id : null,
+                    (int) $lockedBooking->affiliate_id,
+                    'Pengembalian DP saat pembatalan booking memerlukan otorisasi PIN Manager.',
+                    request()?->ip(),
+                    'BookingCancel'
+                );
+
+                $activeShift = ShiftEnforcementService::requireActiveShift(
+                    (int) $lockedBooking->affiliate_id,
+                    $actor,
+                    true,
+                    'mengeluarkan pengembalian dana DP pembatalan booking dari laci kasir'
+                );
+
+                $resolvedMethodId = $paymentMethodId
+                    ?? $lockedBooking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id')
+                    ?? PaymentMethod::where('code', 'CASH')->value('id')
+                    ?? PaymentMethod::value('id')
+                    ?? 1;
+
+                $datePrefix = Carbon::now()->format('ymd');
+                $countToday = PaymentTransaction::withoutGlobalScopes()
+                    ->where('business_id', $lockedBooking->business_id)
+                    ->whereDate('transacted_at', Carbon::today())
+                    ->count() + 1;
+                $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, strtoupper(Str::random(3)));
+                $receiptNumber = sprintf('REC-REF-%s-%s-%s', $lockedBooking->affiliate->code ?? 'PST', $datePrefix, strtoupper(Str::random(4)));
+                $latestInflowId = $lockedBooking->payments()->where('direction', 'inflow')->latest('id')->value('id');
+
+                PaymentTransaction::create([
+                    'business_id' => $lockedBooking->business_id,
+                    'branch_id' => $lockedBooking->affiliate_id,
+                    'shift_id' => $activeShift?->id,
+                    'status' => 'completed',
+                    'transaction_code' => $txCode,
+                    'receipt_number' => $receiptNumber,
+                    'booking_id' => $lockedBooking->id,
+                    'payment_method_id' => $resolvedMethodId,
+                    'processed_by' => $actor->id,
+                    'reversal_of_id' => $latestInflowId,
+                    'type' => 'refund',
+                    'direction' => 'outflow',
+                    'amount' => $paidAmount,
+                    'cash_received' => 0.00,
+                    'cash_change' => 0.00,
+                    'notes' => $reason
+                        ? "Refund pembatalan booking ({$reason}) [Approved by: {$approver->name}]"
+                        : "Refund pembatalan booking [Approved by: {$approver->name}]",
+                    'transacted_at' => Carbon::now(),
+                ]);
+            }
+
+            $lockedBooking->status = 'cancelled';
+            $lockedBooking->is_overdue_pickup = false;
+            if ($reason) {
+                $lockedBooking->notes = trim(($lockedBooking->notes ? $lockedBooking->notes . "\n" : '') . "[Dibatalkan] {$reason}");
+            }
+            $lockedBooking->recalculateFinancials();
+
+            AuditLogService::log(
+                $actor,
+                'booking.cancelled',
+                'Booking',
+                $lockedBooking->booking_code,
+                [
+                    'booking_code' => $lockedBooking->booking_code,
+                    'refund_dp' => $refundDp,
+                    'refunded_amount' => $refundDp ? $paidAmount : 0.0,
+                    'reason' => $reason,
+                ],
+                null,
+                request()?->ip(),
+                $lockedBooking->affiliate_id
+            );
+
+            return $lockedBooking->fresh([
+                'items.asset.model',
+                'items.assetModel',
+                'assetModel',
+                'assetUnit',
+                'customer',
+                'payments.paymentMethod',
+                'affiliate',
+            ]);
+        });
+    }
+
+    /**
      * Extend the pickup grace period for an active/overdue scheduled booking.
      */
     public function extendGracePeriod(
@@ -1532,7 +1547,7 @@ class BookingService
                 $newTotalBill = max(0.0, $newSubtotal - (float) ($lockedBooking->discount_amount ?? 0.0) + (float) ($lockedBooking->deposit_fee ?? 0.0));
 
                 $inflowPaid = (float) $lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange', 'deposit'])
                     ->where(fn ($q) => $q->whereNull('status')->orWhere('status', '!=', 'void'))
                     ->sum('amount');
                 $outflowRefunds = (float) $lockedBooking->payments()
@@ -1586,31 +1601,41 @@ class BookingService
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
 
-        $affiliateId = !empty($data['affiliate_id']) ? (int) $data['affiliate_id'] : null;
+        if (!empty($data['all_branches']) || in_array((string) ($data['branch_id'] ?? $data['affiliate_id'] ?? ''), ['all', '-1'], true)) {
+            throw ValidationException::withMessages([
+                'branch_id' => ['Cabang aktif wajib dipilih untuk membuat transaksi sewa.'],
+            ]);
+        }
+
+        if (!empty($data['branch_id']) && !empty($data['affiliate_id']) && (int) $data['branch_id'] !== (int) $data['affiliate_id']) {
+            throw ValidationException::withMessages([
+                'branch_id' => ['Parameter branch_id dan affiliate_id tidak sesuai.'],
+            ]);
+        }
+
+        $affiliateId = !empty($data['branch_id'])
+            ? (int) $data['branch_id']
+            : (!empty($data['affiliate_id']) ? (int) $data['affiliate_id'] : null);
         if (empty($affiliateId)) {
             $affiliateId = $tenantContext->getBranchId();
         }
         if (empty($affiliateId) && !empty($cashier->affiliate_id)) {
             $affiliateId = $cashier->affiliate_id;
         }
-        if (empty($affiliateId) && $businessId) {
-            $defaultBranch = Affiliate::where('business_id', $businessId)
-                ->where('is_active', true)
-                ->orderBy('is_central', 'desc')
-                ->first();
-            $affiliateId = $defaultBranch?->id;
-        }
 
         if (empty($affiliateId)) {
             throw ValidationException::withMessages([
-                'affiliate_id' => ['Cabang/outlet tidak dapat ditentukan. Harap tentukan cabang aktif.'],
+                'branch_id' => ['Cabang aktif wajib dipilih untuk membuat transaksi sewa.'],
             ]);
         }
 
-        $affiliate = Affiliate::find($affiliateId);
+        $affiliate = Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+            ->where('id', $affiliateId)
+            ->where('is_active', true)
+            ->first();
         if (!$affiliate) {
             throw ValidationException::withMessages([
-                'affiliate_id' => ['Cabang yang dipilih tidak ditemukan.'],
+                'branch_id' => ['Cabang yang dipilih tidak ditemukan atau tidak aktif.'],
             ]);
         }
 
@@ -1749,6 +1774,120 @@ class BookingService
     }
 
     /**
+     * Server-side authoritative pricing resolver.
+     * Ignores client-supplied `unit_prices` overrides unless a valid Manager PIN is verified.
+     *
+     * @return array{0: float, 1: array}
+     */
+    protected function resolveAuthoritativeItemPrice(
+        ?AssetModel $model,
+        string $durationUnit,
+        int $durationValue,
+        Carbon $startAt,
+        int $durationHours,
+        ?float $passedPrice,
+        bool $isAddonItem,
+        array $data,
+        User $cashier,
+        Affiliate $affiliate,
+        ?int $businessId
+    ): array {
+        if ($model) {
+            $calc = null;
+            try {
+                $calc = $this->pricingService->calculate($model, $durationUnit, $durationValue, $startAt);
+            } catch (ValidationException $e) {
+                $multiplier = !empty($data['duration_multiplier']) ? (int)$data['duration_multiplier'] : 1;
+                if ($multiplier > 1 && $durationValue % $multiplier === 0) {
+                    try {
+                        $baseValue = intdiv($durationValue, $multiplier);
+                        $baseCalc = $this->pricingService->calculate($model, $durationUnit, $baseValue, $startAt);
+                        $calc = $baseCalc;
+                        $calc['price'] = (float)$baseCalc['price'] * $multiplier;
+                        $calc['rate_snapshot']['price'] = $calc['price'];
+                        $calc['rate_snapshot']['duration_value'] = $durationValue;
+                        $calc['rate_snapshot']['duration_hours'] = $durationHours;
+                    } catch (ValidationException) {
+                        $calc = null;
+                    }
+                }
+
+                if ($calc === null) {
+                    if ($passedPrice !== null && !empty($data['manager_pin'])) {
+                        ManagerPinVerificationService::verify(
+                            $cashier,
+                            $data['manager_pin'],
+                            $businessId,
+                            (int)$affiliate->id,
+                            'Override harga manual memerlukan otorisasi PIN Manager.',
+                            request()?->ip(),
+                            'BookingPricing'
+                        );
+                        return [
+                            $passedPrice,
+                            [
+                                'tier_id' => null,
+                                'duration_unit' => $durationUnit,
+                                'duration_value' => $durationValue,
+                                'duration_hours' => $durationHours,
+                                'price' => $passedPrice,
+                                'extension_hourly_rate' => $isAddonItem ? 5000.00 : 15000.00,
+                                'model_id' => $model->id,
+                                'model_name' => $model->name,
+                                'brand' => $model->brand,
+                                'category_name' => $model->category?->name,
+                                'calculated_at' => Carbon::now()->toIso8601String(),
+                            ],
+                        ];
+                    }
+
+                    if ($isAddonItem) {
+                        $firstTier = $model->pricingTiers()->where('is_active', true)->first();
+                        $unitPrice = $firstTier ? (float)$firstTier->price : 20000.00;
+                        return [
+                            $unitPrice,
+                            [
+                                'tier_id' => $firstTier?->id,
+                                'duration_unit' => $durationUnit,
+                                'duration_value' => $durationValue,
+                                'duration_hours' => $durationHours,
+                                'price' => $unitPrice,
+                                'extension_hourly_rate' => $firstTier ? (float)$firstTier->extension_hourly_rate : 5000.00,
+                                'model_id' => $model->id,
+                                'model_name' => $model->name,
+                                'brand' => $model->brand,
+                                'category_name' => $model->category?->name,
+                                'calculated_at' => Carbon::now()->toIso8601String(),
+                            ],
+                        ];
+                    }
+
+                    throw $e;
+                }
+            }
+
+            $serverPrice = (float)$calc['price'];
+            $finalPrice = $serverPrice;
+            if ($passedPrice !== null && abs($passedPrice - $serverPrice) > 0.01 && !empty($data['manager_pin'])) {
+                ManagerPinVerificationService::verify(
+                    $cashier,
+                    $data['manager_pin'],
+                    $businessId,
+                    (int)$affiliate->id,
+                    'Override harga sewa memerlukan otorisasi PIN Manager.',
+                    request()?->ip(),
+                    'BookingPricing'
+                );
+                $finalPrice = $passedPrice;
+            }
+
+            return [$finalPrice, $calc['rate_snapshot']];
+        }
+
+        return [20000.00, ['price' => 20000.00]];
+    }
+
+    /**
      * Shared voucher/manual discount calculation & manager PIN verification.
      *
      * @return array{0: string, 1: float, 2: int|null, 3: string|null}
@@ -1787,26 +1926,15 @@ class BookingService
             $maxNominal = (float) $affiliate->cashier_discount_limit_nominal;
 
             if ($discountPercent > $maxPercent || $discountAmount > $maxNominal) {
-                if (empty($data['manager_pin'])) {
-                    throw ValidationException::withMessages([
-                        'manager_pin' => ['Diskon manual melebihi batas wewenang kasir. Diperlukan PIN Manager.'],
-                    ]);
-                }
-                $managers = User::where(function ($q) use ($affiliateId, $businessId) {
-                    $q->where('affiliate_id', $affiliateId);
-                    if ($businessId) {
-                        $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                            $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                        });
-                    }
-                })->whereNotNull('manager_override_pin')->get();
-
-                $matchingManager = $managers->first(fn ($mgr) => password_verify($data['manager_pin'], $mgr->manager_override_pin));
-                if (!$matchingManager) {
-                    throw ValidationException::withMessages([
-                        'manager_pin' => ['PIN Manager tidak valid.'],
-                    ]);
-                }
+                $matchingManager = ManagerPinVerificationService::verify(
+                    $cashier,
+                    $data['manager_pin'] ?? null,
+                    $businessId,
+                    $affiliateId,
+                    'Diskon manual melebihi batas wewenang kasir (Max: ' . $maxPercent . '% / Rp ' . number_format($maxNominal, 0, ',', '.') . '). Diperlukan PIN Manager.',
+                    request()?->ip(),
+                    'BookingDiscount'
+                );
                 $approvedBy = $matchingManager->id;
             } else {
                 $approvedBy = $cashier->id;
@@ -1828,7 +1956,9 @@ class BookingService
         ?float $cashReceivedInput,
         string $txType,
         ?int $shiftId,
-        string $notes
+        string $notes,
+        ?string $idempotencyKey = null,
+        ?string $externalReference = null
     ): PaymentTransaction {
         $paymentMethod = PaymentMethod::findOrFail($paymentMethodId);
         $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
@@ -1863,29 +1993,131 @@ class BookingService
 
         $cashReceived = $isCash ? ($cashReceivedInput ?? $amount) : $amount;
         $cashChange = $isCash ? max(0, $cashReceived - $amount) : 0.00;
-        $datePrefix = Carbon::now()->format('ymd');
-        $txEntropy = strtoupper(Str::random(4));
-        $txCount = (int) PaymentTransaction::where('business_id', $businessId)->count() + 1;
-        $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
-        $receiptNumber = sprintf('REC-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6)));
+        $recordedDeposit = (float) $booking->payments()
+            ->where('type', 'deposit')
+            ->where(fn ($q) => $q->whereNull('status')->orWhere('status', '!=', 'void'))
+            ->sum('amount');
+        $remainingDeposit = ($txType === 'settlement')
+            ? max(0.0, round((float) ($booking->deposit_fee ?? 0.0) - $recordedDeposit, 2))
+            : 0.0;
 
-        return PaymentTransaction::create([
-            'business_id' => $businessId,
-            'branch_id' => $affiliate->id,
-            'shift_id' => $activeShift?->id,
-            'transaction_code' => $txCode,
-            'receipt_number' => $receiptNumber,
-            'booking_id' => $booking->id,
-            'payment_method_id' => $paymentMethod->id,
-            'processed_by' => $cashier->id,
-            'type' => $txType,
-            'status' => 'completed',
-            'direction' => 'inflow',
-            'amount' => $amount,
-            'cash_received' => $cashReceived,
-            'cash_change' => $cashChange,
-            'notes' => $notes,
-            'transacted_at' => Carbon::now(),
-        ]);
+        return $this->recordRentalAndDepositTransactions(
+            $booking,
+            $affiliate,
+            $cashier,
+            $paymentMethod,
+            $isCash,
+            $amount,
+            $remainingDeposit,
+            $cashReceived,
+            $cashChange,
+            $txType,
+            $activeShift?->id,
+            $notes,
+            $idempotencyKey,
+            $externalReference
+        );
+    }
+
+    /**
+     * Split rental revenue and refundable security deposit (`type = 'deposit'`) into distinct ledger entries.
+     */
+    protected function recordRentalAndDepositTransactions(
+        Booking $booking,
+        Affiliate $affiliate,
+        User $cashier,
+        PaymentMethod $paymentMethod,
+        bool $isCash,
+        float $totalCollected,
+        float $depositPortion,
+        float $cashReceived,
+        float $cashChange,
+        string $primaryType,
+        ?int $shiftId,
+        string $notes,
+        ?string $idempotencyKey = null,
+        ?string $externalReference = null
+    ): PaymentTransaction {
+        $businessId = $booking->business_id;
+        $datePrefix = Carbon::now()->format('ymd');
+        $depositAmount = min($totalCollected, max(0.0, round($depositPortion, 2)));
+        $rentalAmount = max(0.0, round($totalCollected - $depositAmount, 2));
+
+        $primaryTx = null;
+
+        if ($rentalAmount > 0) {
+            $txCount = (int) PaymentTransaction::where('business_id', $businessId)->count() + 1;
+            $primaryTx = PaymentTransaction::create([
+                'business_id' => $businessId,
+                'branch_id' => $affiliate->id,
+                'shift_id' => $shiftId,
+                'transaction_code' => sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, strtoupper(Str::random(4))),
+                'receipt_number' => sprintf('REC-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6))),
+                'external_reference' => $externalReference,
+                'idempotency_key' => $idempotencyKey,
+                'booking_id' => $booking->id,
+                'payment_method_id' => $paymentMethod->id,
+                'processed_by' => $cashier->id,
+                'type' => $primaryType,
+                'status' => 'completed',
+                'direction' => 'inflow',
+                'amount' => $rentalAmount,
+                'cash_received' => $isCash ? max($rentalAmount, $cashReceived - $depositAmount) : $rentalAmount,
+                'cash_change' => $cashChange,
+                'notes' => $notes,
+                'transacted_at' => Carbon::now(),
+            ]);
+        }
+
+        if ($depositAmount > 0) {
+            $txCount = (int) PaymentTransaction::where('business_id', $businessId)->count() + 1;
+            $depositTx = PaymentTransaction::create([
+                'business_id' => $businessId,
+                'branch_id' => $affiliate->id,
+                'shift_id' => $shiftId,
+                'transaction_code' => sprintf('TX-DEP-%s-%04d-%s', $datePrefix, $txCount, strtoupper(Str::random(4))),
+                'receipt_number' => sprintf('REC-DEP-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6))),
+                'external_reference' => $externalReference,
+                'idempotency_key' => $primaryTx ? null : $idempotencyKey,
+                'booking_id' => $booking->id,
+                'payment_method_id' => $paymentMethod->id,
+                'processed_by' => $cashier->id,
+                'type' => 'deposit',
+                'status' => 'completed',
+                'direction' => 'inflow',
+                'amount' => $depositAmount,
+                'cash_received' => $depositAmount,
+                'cash_change' => 0.00,
+                'notes' => 'Uang titipan jaminan sewa (deposit)',
+                'transacted_at' => Carbon::now(),
+            ]);
+            $primaryTx ??= $depositTx;
+        }
+
+        if (!$primaryTx) {
+            $txCount = (int) PaymentTransaction::where('business_id', $businessId)->count() + 1;
+            $primaryTx = PaymentTransaction::create([
+                'business_id' => $businessId,
+                'branch_id' => $affiliate->id,
+                'shift_id' => $shiftId,
+                'transaction_code' => sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, strtoupper(Str::random(4))),
+                'receipt_number' => sprintf('REC-%s-%s-%s', $affiliate->code ?? 'CTR', $datePrefix, strtoupper(Str::random(6))),
+                'external_reference' => $externalReference,
+                'idempotency_key' => $idempotencyKey,
+                'booking_id' => $booking->id,
+                'payment_method_id' => $paymentMethod->id,
+                'processed_by' => $cashier->id,
+                'type' => $primaryType,
+                'status' => 'completed',
+                'direction' => 'inflow',
+                'amount' => 0.00,
+                'cash_received' => $cashReceived,
+                'cash_change' => $cashChange,
+                'notes' => $notes,
+                'transacted_at' => Carbon::now(),
+            ]);
+        }
+
+        return $primaryTx;
     }
 }

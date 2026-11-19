@@ -223,9 +223,9 @@ class FinancialControlP0Test extends TestCase
 
         $this->assertEquals(200000.00, (float)$result->deposit_refunded);
 
-        // Verify that a PaymentTransaction of type 'refund' and direction 'outflow' was created
+        // Verify that a PaymentTransaction of type 'deposit_refund' and direction 'outflow' was created
         $refundTx = PaymentTransaction::where('booking_id', $booking->id)
-            ->where('type', 'refund')
+            ->where('type', 'deposit_refund')
             ->first();
 
         $this->assertNotNull($refundTx);

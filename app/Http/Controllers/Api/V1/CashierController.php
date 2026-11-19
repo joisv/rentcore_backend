@@ -6,8 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\Booking;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
-use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\ManagerPinVerificationService;
 use App\Services\ShiftEnforcementService;
 use App\Services\TimezoneService;
 use App\Tenancy\TenantContext;
@@ -16,7 +16,6 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 
 class CashierController extends Controller
@@ -94,6 +93,7 @@ class CashierController extends Controller
             'amount' => 'nullable|numeric|min:0',
             'cash_received' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string|max:255',
+            'external_reference' => 'nullable|string|max:100',
             'frp_cleared' => 'nullable|boolean',
             'account_removed' => 'nullable|boolean',
             'is_handover_settlement' => 'nullable|boolean',
@@ -190,7 +190,7 @@ class CashierController extends Controller
 
             if ($type === 'settlement' || $type === 'extension' || $type === 'dp') {
                 $alreadyPaid = (float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange', 'deposit'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -259,31 +259,69 @@ class CashierController extends Controller
             $txCode = sprintf('TX-%s-%04d-%s', $datePrefix, $txCount, $txEntropy);
             $receiptNumber = sprintf('REC-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(6)));
 
-            $paymentTx = PaymentTransaction::create([
-                'business_id' => $booking->business_id ?? $user->business_id,
-                'branch_id' => $cashierBranchId ?: null,
-                'shift_id' => $activeShift?->id,
-                'transaction_code' => $txCode,
-                'receipt_number' => $receiptNumber,
-                'idempotency_key' => $idempotencyKey,
-                'booking_id' => $booking->id,
-                'payment_method_id' => $paymentMethod->id,
-                'processed_by' => $user->id,
-                'type' => $type,
-                'status' => 'completed',
-                'direction' => $type === 'refund' ? 'outflow' : 'inflow',
-                'amount' => $amountToPay,
-                'cash_received' => $cashReceived,
-                'cash_change' => $cashChange,
-                'notes' => $request->notes ?? ($type === 'penalty' ? 'Pelunasan denda via Kasir POS' : ($type === 'extension' ? 'Pembayaran perpanjangan sewa via Kasir POS' : 'Pembayaran sewa via Kasir POS')),
-                'transacted_at' => Carbon::now(),
-            ]);
+            $recordedDeposit = (float)$lockedBooking->payments()
+                ->where('type', 'deposit')
+                ->where(fn ($q) => $q->whereNull('status')->orWhere('status', '!=', 'void'))
+                ->sum('amount');
+            $remainingDeposit = ($type === 'settlement' && (float)$lockedBooking->deposit_fee > 0)
+                ? max(0.0, round((float)$lockedBooking->deposit_fee - $recordedDeposit, 2))
+                : 0.0;
+            $depositAmount = min($amountToPay, $remainingDeposit);
+            $primaryTxAmount = max(0.0, round($amountToPay - $depositAmount, 2));
+
+            $paymentTx = null;
+            if ($primaryTxAmount > 0 || $depositAmount <= 0) {
+                $paymentTx = PaymentTransaction::create([
+                    'business_id' => $booking->business_id ?? $user->business_id,
+                    'branch_id' => $cashierBranchId ?: null,
+                    'shift_id' => $activeShift?->id,
+                    'transaction_code' => $txCode,
+                    'receipt_number' => $receiptNumber,
+                    'external_reference' => $request->input('external_reference'),
+                    'idempotency_key' => $idempotencyKey,
+                    'booking_id' => $booking->id,
+                    'payment_method_id' => $paymentMethod->id,
+                    'processed_by' => $user->id,
+                    'type' => $type,
+                    'status' => 'completed',
+                    'direction' => $type === 'refund' ? 'outflow' : 'inflow',
+                    'amount' => $primaryTxAmount > 0 ? $primaryTxAmount : $amountToPay,
+                    'cash_received' => $isCash ? max($primaryTxAmount, $cashReceived - $depositAmount) : $primaryTxAmount,
+                    'cash_change' => $cashChange,
+                    'notes' => $request->notes ?? ($type === 'penalty' ? 'Pelunasan denda via Kasir POS' : ($type === 'extension' ? 'Pembayaran perpanjangan sewa via Kasir POS' : 'Pembayaran sewa via Kasir POS')),
+                    'transacted_at' => Carbon::now(),
+                ]);
+            }
+
+            if ($depositAmount > 0) {
+                $depTxCount = (int)PaymentTransaction::where('business_id', $txBusinessId)->count() + 1;
+                $depTx = PaymentTransaction::create([
+                    'business_id' => $booking->business_id ?? $user->business_id,
+                    'branch_id' => $cashierBranchId ?: null,
+                    'shift_id' => $activeShift?->id,
+                    'transaction_code' => sprintf('TX-DEP-%s-%04d-%s', $datePrefix, $depTxCount, strtoupper(\Illuminate\Support\Str::random(4))),
+                    'receipt_number' => sprintf('REC-DEP-%s-%s-%s', $booking->affiliate->code ?? 'PST', $datePrefix, strtoupper(\Illuminate\Support\Str::random(6))),
+                    'idempotency_key' => $paymentTx ? null : $idempotencyKey,
+                    'booking_id' => $booking->id,
+                    'payment_method_id' => $paymentMethod->id,
+                    'processed_by' => $user->id,
+                    'type' => 'deposit',
+                    'status' => 'completed',
+                    'direction' => 'inflow',
+                    'amount' => $depositAmount,
+                    'cash_received' => $depositAmount,
+                    'cash_change' => 0.00,
+                    'notes' => 'Uang titipan jaminan sewa (deposit)',
+                    'transacted_at' => Carbon::now(),
+                ]);
+                $paymentTx ??= $depTx;
+            }
 
             // Update booking payment status
             $handoverCompleted = false;
             if ($type === 'settlement' || $type === 'extension' || $type === 'dp') {
                 $newTotalPaid = (float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange', 'deposit'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -324,7 +362,7 @@ class CashierController extends Controller
                     ->sum('amount');
                 $totalPenaltyDue = (float)($lockedBooking->returnInspection?->total_penalty ?? 0.0);
                 $isRentalSettled = ((float)$lockedBooking->payments()
-                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
+                    ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange', 'deposit'])
                     ->where(function ($q) {
                         $q->whereNull('status')->orWhere('status', '!=', 'void');
                     })
@@ -654,14 +692,42 @@ class CashierController extends Controller
             ? \App\Models\Affiliate::where('business_id', $businessId)->get()->keyBy('id')
             : collect();
 
+        $drawerCashInflow = 0.00;
+        $drawerCashOutflow = 0.00;
+
         foreach ($txSummaryList as $tx) {
-            // Exclude void transactions from revenue calculations
+            // Exclude void transactions from revenue and drawer calculations
             if (($tx->status ?? 'completed') === 'void') {
                 continue;
             }
 
             $amount = (float)$tx->amount;
+            $methodName = $tx->paymentMethod->name ?? 'Lainnya';
+            $methodCode = strtolower($tx->paymentMethod->code ?? '');
+            $isCash = $methodCode === 'cash' || str_contains(strtolower($methodName), 'tunai');
+
+            // Security deposits (`deposit` / `deposit_refund`) affect physical cash drawer balance
+            // when settled in cash, but are excluded from net revenue calculations.
+            if (in_array($tx->type, ['deposit', 'deposit_refund'], true)) {
+                if ($isCash) {
+                    if ($tx->type === 'deposit') {
+                        $drawerCashInflow += $amount;
+                    } else {
+                        $drawerCashOutflow += $amount;
+                    }
+                }
+                continue;
+            }
+
             $isRefund = ($tx->type === 'refund' || ($tx->direction ?? 'inflow') === 'outflow');
+
+            if ($isCash) {
+                if ($isRefund) {
+                    $drawerCashOutflow += $amount;
+                } else {
+                    $drawerCashInflow += $amount;
+                }
+            }
 
             if ($isRefund) {
                 $totalRevenue -= $amount;
@@ -684,7 +750,6 @@ class CashierController extends Controller
                 $typeBreakdown['rental']['total'] += $amount;
             }
 
-            $methodName = $tx->paymentMethod->name ?? 'Lainnya';
             if (!isset($breakdown[$methodName])) {
                 $breakdown[$methodName] = [
                     'count' => 0,
@@ -697,9 +762,6 @@ class CashierController extends Controller
             } else {
                 $breakdown[$methodName]['total'] += $amount;
             }
-
-            $methodCode = strtolower($tx->paymentMethod->code ?? '');
-            $isCash = $methodCode === 'cash' || str_contains(strtolower($methodName), 'tunai');
 
             $bId = $tx->branch_id ?? $tx->booking?->affiliate_id;
             if ($bId !== null) {
@@ -779,7 +841,7 @@ class CashierController extends Controller
         // Active shift & opening float if single branch
         $activeShiftData = null;
         $openingFloat = 0.00;
-        $shiftExpectedCash = null;
+        $hasOpenShift = false;
         if ($targetBranchId !== null) {
             $activeShift = \App\Models\CashDrawerShift::where('branch_id', $targetBranchId)
                 ->where('status', 'open')
@@ -787,75 +849,56 @@ class CashierController extends Controller
                 ->first();
 
             if ($activeShift) {
+                $hasOpenShift = true;
                 $openingFloat = (float)$activeShift->opening_cash_float;
-                $sStart = $activeShift->opened_at;
-                $sNow = \Carbon\Carbon::now();
 
-                $sCashPaymentQuery = \App\Models\PaymentTransaction::where(function ($sq) use ($activeShift, $sStart, $sNow) {
-                        $sq->where('payment_transactions.shift_id', $activeShift->id)
-                           ->orWhere(function ($tsq) use ($sStart, $sNow) {
-                               $tsq->whereNull('payment_transactions.shift_id')
-                                   ->whereBetween('payment_transactions.transacted_at', [$sStart, $sNow]);
-                           });
-                    })
-                    ->where('status', '!=', 'void')
-                    ->where(function ($q) use ($targetBranchId) {
-                        $q->where('payment_transactions.branch_id', $targetBranchId)
-                          ->orWhere(function ($fb) use ($targetBranchId) {
-                              $fb->whereNull('payment_transactions.branch_id')
-                                 ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $targetBranchId));
-                          });
-                    })
-                    ->whereHas('paymentMethod', function ($mq) {
-                        $mq->whereRaw('LOWER(code) = ?', ['cash'])
-                           ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
-                    });
-
-                $sCashInflow = (float)(clone $sCashPaymentQuery)
-                    ->where('type', '!=', 'refund')
-                    ->where(function ($q) {
-                        $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
-                    })
-                    ->sum('amount');
-
-                $sCashRefund = (float)(clone $sCashPaymentQuery)
-                    ->where(function ($q) {
-                        $q->where('type', 'refund')->orWhere('direction', 'outflow');
-                    })
-                    ->sum('amount');
-
-                $sExpenses = (float)\App\Models\BranchExpense::whereBetween('disbursed_at', [$sStart, $sNow])
-                    ->where('branch_id', $targetBranchId)
-                    ->where('payment_source', 'cash_drawer')
-                    ->where('status', 'disbursed')
-                    ->sum('amount');
-
-                $shiftExpectedCash = max(0.00, $openingFloat + ($sCashInflow - $sCashRefund) - $sExpenses);
-
+                // True Blind Close: redact expected_cash_now and cash movement totals while shift is open
                 $activeShiftData = [
                     'id' => $activeShift->id,
                     'shift_number' => $activeShift->shift_number,
                     'opened_at' => $activeShift->opened_at->toIso8601String(),
                     'opening_cash_float' => $openingFloat,
                     'status' => $activeShift->status,
-                    'expected_cash_now' => $shiftExpectedCash,
-                    'current_cash_inflow' => $sCashInflow,
-                    'current_cash_refund' => $sCashRefund,
-                    'current_cash_expenses' => $sExpenses,
+                    'is_blind_close' => true,
                 ];
             }
         }
 
-        $totalCashRevenue = 0.00;
-        foreach ($breakdown as $mName => $mStat) {
-            if (str_contains(strtolower($mName), 'cash') || str_contains(strtolower($mName), 'tunai')) {
-                $totalCashRevenue += (float)($mStat['total'] ?? 0);
-            }
-        }
+        $cashReconciliation = [
+            'opening_cash_float' => (float)$openingFloat,
+            'net_cash_revenue' => (float)($drawerCashInflow - $drawerCashOutflow),
+            'cash_drawer_expenses' => (float)$cashDrawerExpenses,
+            'active_shift' => $activeShiftData,
+        ];
 
-        $expectedDrawerCash = $shiftExpectedCash !== null
-            ? $shiftExpectedCash
-            : max(0.00, $openingFloat + $totalCashRevenue - $cashDrawerExpenses);
+        // Only expose expected_cash_in_drawer when no open shift is enforcing blind close.
+        // Aggregate opening_cash_float across all shifts in the date range + cash inflows - outflows - cash_drawer expenses.
+        if (!$hasOpenShift) {
+            $periodShifts = \App\Models\CashDrawerShift::query()
+                ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+                ->when($targetBranchId !== null, fn ($q) => $q->where('branch_id', $targetBranchId))
+                ->where(function ($q) use ($start, $end) {
+                    $q->whereBetween('opened_at', [$start, $end])
+                      ->orWhereBetween('closed_at', [$start, $end]);
+                })
+                ->get();
+
+            $openingFloat = (float)$periodShifts->sum('opening_cash_float');
+            $periodShiftIds = $periodShifts->pluck('id')->all();
+            $periodDrawerExpenses = !empty($periodShiftIds)
+                ? (float)\App\Models\BranchExpense::whereIn('shift_id', $periodShiftIds)
+                    ->where('payment_source', 'cash_drawer')
+                    ->where('status', 'disbursed')
+                    ->sum('amount')
+                : (float)$cashDrawerExpenses;
+
+            $cashReconciliation['opening_cash_float'] = $openingFloat;
+            $cashReconciliation['cash_drawer_expenses'] = $periodDrawerExpenses;
+            $cashReconciliation['expected_cash_in_drawer'] = (float)max(
+                0.00,
+                $openingFloat + $drawerCashInflow - $drawerCashOutflow - $periodDrawerExpenses
+            );
+        }
 
         $limit = max(10, min(500, (int)$request->get('limit', $request->get('per_page', 50))));
         $recentTransactions = (clone $baseQuery)
@@ -890,13 +933,15 @@ class CashierController extends Controller
                 'amount' => (float)$tx->amount,
                 'payment_method' => $tx->paymentMethod?->name ?? 'Tunai',
                 'type' => $tx->type,
-                'type_label' => $tx->type === 'penalty'
-                    ? 'Denda Keterlambatan (Late Return Penalty)'
-                    : ($tx->type === 'extension'
-                        ? 'Perpanjangan Sewa'
-                        : ($tx->type === 'refund'
-                            ? 'Pengembalian Dana / Deposit (Refund)'
-                            : ($tx->type === 'dp' ? 'Uang Muka (DP)' : 'Sewa Kontrak Pokok'))),
+                'type_label' => match ($tx->type) {
+                    'penalty' => 'Denda Keterlambatan (Late Return Penalty)',
+                    'extension' => 'Perpanjangan Sewa',
+                    'refund' => 'Pengembalian Dana / Deposit (Refund)',
+                    'deposit' => 'Titipan Jaminan (Deposit)',
+                    'deposit_refund' => 'Pengembalian Deposit Jaminan',
+                    'dp' => 'Uang Muka (DP)',
+                    default => 'Sewa Kontrak Pokok',
+                },
                 'cash_received' => (float)$tx->cash_received,
                 'cash_change' => (float)$tx->cash_change,
                 'notes' => $tx->notes,
@@ -929,13 +974,7 @@ class CashierController extends Controller
                 'total_expenses' => (float)$totalExpenses,
                 'cash_drawer_expenses' => (float)$cashDrawerExpenses,
                 'expense_breakdown' => (object)$expenseCategoryBreakdown,
-                'cash_reconciliation' => [
-                    'opening_cash_float' => (float)$openingFloat,
-                    'net_cash_revenue' => (float)$totalCashRevenue,
-                    'cash_drawer_expenses' => (float)$cashDrawerExpenses,
-                    'expected_cash_in_drawer' => (float)$expectedDrawerCash,
-                    'active_shift' => $activeShiftData,
-                ],
+                'cash_reconciliation' => $cashReconciliation,
                 'breakdown_by_type' => (object)$typeBreakdown,
                 'breakdown_by_method' => (object)$breakdown,
                 'breakdown_by_branch' => $branchBreakdownList,
@@ -977,52 +1016,16 @@ class CashierController extends Controller
         $voidedByUserId = $user->id;
 
         if (!$isOwnerOrAdmin) {
-            // Staff attempting void requires manager PIN
-            if (empty($request->manager_pin)) {
-                throw ValidationException::withMessages([
-                    'manager_pin' => ['Pembatalan transaksi pembayaran kasir wajib disetujui menggunakan PIN Manager Cabang.'],
-                ]);
-            }
-
             $branchId = $transaction->branch_id ?? $user->affiliate_id;
-            $throttleKey = 'manager_pin_verify:biz_' . ($businessId ?? 0) . ':user_' . $user->id;
-
-            if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
-                $seconds = RateLimiter::availableIn($throttleKey);
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Terlalu banyak percobaan PIN Manager salah. Silakan coba lagi dalam ' . ceil($seconds / 60) . ' menit.',
-                    'code' => 'PIN_RATE_LIMITED',
-                    'retry_after' => $seconds,
-                ], 429);
-            }
-
-            $managers = User::where(function ($q) use ($branchId, $businessId) {
-                if ($branchId) {
-                    $q->where('affiliate_id', $branchId);
-                }
-                if ($businessId) {
-                    $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                        $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                    });
-                }
-            })
-            ->whereNotNull('manager_override_pin')
-            ->get();
-
-            $matchingManager = $managers->first(function ($mgr) use ($request) {
-                return password_verify($request->manager_pin, $mgr->manager_override_pin);
-            });
-
-            if (!$matchingManager) {
-                RateLimiter::hit($throttleKey, 900);
-                $remaining = 5 - RateLimiter::attempts($throttleKey);
-                throw ValidationException::withMessages([
-                    'manager_pin' => ['PIN Manager Cabang tidak valid.' . ($remaining > 0 ? " Sisa percobaan: {$remaining} kali." : ' Akun Anda dikunci sementara.')],
-                ]);
-            }
-
-            RateLimiter::clear($throttleKey);
+            $matchingManager = ManagerPinVerificationService::verify(
+                $user,
+                $request->manager_pin,
+                $businessId ? (int)$businessId : null,
+                $branchId ? (int)$branchId : null,
+                'Pembatalan transaksi pembayaran kasir wajib disetujui menggunakan PIN Manager Cabang.',
+                $request->ip(),
+                'PaymentTransaction'
+            );
             $voidedByUserId = $matchingManager->id;
         }
 
@@ -1032,22 +1035,11 @@ class CashierController extends Controller
             $transaction->void_by = $voidedByUserId;
             $transaction->save();
 
-            // Recalculate related booking payment status if linked
+            // Authoritatively recalculate linked booking remaining_balance & payment_status
             if ($transaction->booking_id) {
-                $booking = Booking::find($transaction->booking_id);
+                $booking = Booking::withoutGlobalScopes()->lockForUpdate()->find($transaction->booking_id);
                 if ($booking) {
-                    $validPaid = (float)$booking->payments()
-                        ->whereIn('type', ['dp', 'settlement', 'extension', 'exchange'])
-                        ->where(function ($q) {
-                            $q->whereNull('status')->orWhere('status', '!=', 'void');
-                        })
-                        ->sum('amount');
-
-                    $newPaymentStatus = ($validPaid >= (float)$booking->total_bill)
-                        ? 'paid'
-                        : ($validPaid > 0 ? 'partial' : 'unpaid');
-
-                    $booking->update(['payment_status' => $newPaymentStatus]);
+                    $booking->recalculateFinancials();
                 }
             }
 

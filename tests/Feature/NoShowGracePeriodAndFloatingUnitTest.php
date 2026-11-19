@@ -536,13 +536,15 @@ class NoShowGracePeriodAndFloatingUnitTest extends TestCase
         $this->assertEquals(100000.0, (float) $floatingRes->json('data.paid_amount'));
         $this->assertEquals(250000.0, (float) $floatingRes->json('data.remaining_balance'));
 
-        // Verify Cash DP recorded in active shift current cash inflow
+        // True Blind Close: current_cash_inflow is redacted while shift is open
         $shiftRes = $this->withHeaders($this->authHeaders($this->staff))
             ->getJson('/api/v1/cashier/shift/current?branch_id=' . $this->branch->id)
-            ->assertStatus(200);
-        $this->assertEquals(100000.0, (float) $shiftRes->json('data.shift.current_cash_inflow'));
+            ->assertStatus(200)
+            ->assertJsonPath('data.shift.is_blind_close', true)
+            ->assertJsonMissingPath('data.shift.current_cash_inflow')
+            ->assertJsonMissingPath('data.shift.expected_cash_now');
 
-        // 2. Pinned scheduled booking with 2-day duration multiplier (passed unit_prices) + QRIS DP (200k of 700k)
+        // 2. Pinned scheduled booking with 2-day duration multiplier (server authoritative 2 * 350k = 700k) + QRIS DP (200k of 700k)
         $pinnedRes = $this->withHeaders($this->authHeaders($this->staff))
             ->postJson('/api/v1/bookings', [
                 'is_scheduled' => true,
@@ -556,9 +558,6 @@ class NoShowGracePeriodAndFloatingUnitTest extends TestCase
                 'duration_unit' => 'day',
                 'duration_value' => 2,
                 'duration_multiplier' => 2,
-                'unit_prices' => [
-                    (string) $this->unit2->id => 700000,
-                ],
                 'payment_method_id' => $qrisMethod->id,
                 'paid_amount' => 200000,
                 'dp_amount' => 200000,
@@ -637,11 +636,18 @@ class NoShowGracePeriodAndFloatingUnitTest extends TestCase
         $this->assertTrue($booking->collateral_secured);
         $this->assertEquals('rented', $this->unit2->fresh()->status);
 
-        // Shift cash inflow should now total 100k (DP) + 250k (settlement) = 350k
-        $shiftRes = $this->withHeaders($this->authHeaders($this->staff))
+        // Shift cash inflow remains redacted while open, and reveals 350k total upon closing shift
+        $this->withHeaders($this->authHeaders($this->staff))
             ->getJson('/api/v1/cashier/shift/current?branch_id=' . $this->branch->id)
-            ->assertStatus(200);
-        $this->assertEquals(350000.0, (float) $shiftRes->json('data.shift.current_cash_inflow'));
+            ->assertStatus(200)
+            ->assertJsonMissingPath('data.shift.current_cash_inflow');
+
+        $closeRes = $this->withHeaders($this->authHeaders($this->staff))
+            ->postJson('/api/v1/cashier/shift/close', [
+                'actual_cash_counted' => 550000,
+            ])
+            ->assertOk();
+        $this->assertEquals(350000.0, (float) $closeRes->json('data.cash_inflow'));
 
         Carbon::setTestNow();
     }

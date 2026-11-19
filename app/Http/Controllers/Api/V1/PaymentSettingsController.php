@@ -66,9 +66,9 @@ class PaymentSettingsController extends Controller
     }
 
     /**
-     * Format payment configuration payload cleanly.
+     * Format shared payment configuration payload cleanly without user-specific permission flags.
      */
-    protected function formatSettingsData(Business $business, ?int $branchId, bool $isOwnerOrAdmin): array
+    protected function formatSettingsData(Business $business, ?int $branchId): array
     {
         $config = $business->getPaymentMethodsConfig($branchId);
         $qrisImageUrl = $business->getQrisImageUrl($branchId);
@@ -83,7 +83,6 @@ class PaymentSettingsController extends Controller
             'business_id' => $business->id,
             'branch_id' => $branchId ? (int)$branchId : null,
             'is_branch_override' => $isBranchOverride,
-            'is_owner_or_admin' => $isOwnerOrAdmin,
             'config' => [
                 'ewallet_enabled' => (bool)($config['ewallet_enabled'] ?? true),
                 'ewallet_providers' => [
@@ -138,12 +137,11 @@ class PaymentSettingsController extends Controller
             ], 404);
         }
 
-        $isOwnerOrAdmin = $this->checkIsOwnerOrAdmin($request, $business);
-
         $cacheKey = $branchId ? "branch_{$branchId}_payment_settings" : "business_{$businessId}_payment_settings";
-        $data = Cache::remember($cacheKey, 3600, function () use ($business, $branchId, $isOwnerOrAdmin) {
-            return $this->formatSettingsData($business, $branchId, $isOwnerOrAdmin);
+        $data = Cache::remember($cacheKey, 3600, function () use ($business, $branchId) {
+            return $this->formatSettingsData($business, $branchId);
         });
+        $data['is_owner_or_admin'] = $this->checkIsOwnerOrAdmin($request, $business);
 
         return response()->json([
             'success' => true,
@@ -406,11 +404,8 @@ class PaymentSettingsController extends Controller
         );
 
         $freshBusiness = $business->fresh();
-        $freshData = $this->formatSettingsData(
-            $freshBusiness,
-            $branchId,
-            $this->checkIsOwnerOrAdmin($request, $freshBusiness)
-        );
+        $freshData = $this->formatSettingsData($freshBusiness, $branchId);
+        $freshData['is_owner_or_admin'] = $this->checkIsOwnerOrAdmin($request, $freshBusiness);
 
         return response()->json([
             'success' => true,

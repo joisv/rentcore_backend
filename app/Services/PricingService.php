@@ -165,6 +165,7 @@ class PricingService
 
         // Assets with an active stock transfer (pending approval or in transit) are unavailable
         $hasActiveTransfer = \App\Models\InventoryTransfer::withoutGlobalScopes()
+            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
             ->where('asset_id', $asset->id)
             ->whereIn('status', ['pending', 'in_transit'])
             ->exists();
@@ -174,6 +175,8 @@ class PricingService
         }
 
         $collisionQuery = Booking::withoutGlobalScopes()
+            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
+            ->when($asset->affiliate_id, fn ($q) => $q->where('affiliate_id', $asset->affiliate_id))
             ->whereIn('status', ['reserved', 'booked', 'confirmed', 'rented', 'active'])
             ->where(function ($bq) use ($asset) {
                 $bq->where('asset_unit_id', $asset->id)

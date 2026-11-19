@@ -196,6 +196,7 @@ class BranchExpenseAndShiftTest extends TestCase
         BranchExpense::create([
             'business_id' => $this->business->id,
             'branch_id' => $this->branchMataram->id,
+            'shift_id' => $shiftId,
             'expense_number' => 'EXP-TEST-001',
             'category' => 'utilities',
             'title' => 'Token Listrik',
@@ -207,7 +208,7 @@ class BranchExpenseAndShiftTest extends TestCase
             'disbursed_at' => Carbon::now(),
         ]);
 
-        // 3. Check current shift status
+        // 3. Check current shift status (True Blind Close: expected/flow totals redacted while open)
         $statusResp = $this->actingAs($this->staff)
             ->withHeader('X-Business-Id', (string)$this->business->id)
             ->getJson('/api/v1/cashier/shift/current');
@@ -215,8 +216,9 @@ class BranchExpenseAndShiftTest extends TestCase
         $statusResp->assertOk()
             ->assertJsonPath('data.has_active_shift', true)
             ->assertJsonPath('data.shift.opening_cash_float', 500000)
-            ->assertJsonPath('data.shift.current_cash_expenses', 100000)
-            ->assertJsonPath('data.shift.expected_cash_now', 400000); // 500k - 100k = 400k
+            ->assertJsonPath('data.shift.is_blind_close', true)
+            ->assertJsonMissingPath('data.shift.current_cash_expenses')
+            ->assertJsonMissingPath('data.shift.expected_cash_now');
 
         // 4. Close Shift: If discrepancy exists without reason, validation fails
         $closeFailResp = $this->actingAs($this->staff)

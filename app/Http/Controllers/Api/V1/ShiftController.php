@@ -44,6 +44,11 @@ class ShiftController extends Controller
             ], 422);
         }
 
+        $business = $businessId
+            ? \App\Models\Business::find($businessId)
+            : Affiliate::find($branchId)?->business;
+        $enforcementEnabled = (bool)($business?->shift_enforcement_enabled ?? true);
+
         $activeShift = CashDrawerShift::with(['openedBy', 'branch'])
             ->where('branch_id', $branchId)
             ->where('status', 'open')
@@ -55,63 +60,19 @@ class ShiftController extends Controller
                 'success' => true,
                 'data' => [
                     'has_active_shift' => false,
+                    'shift_enforcement_enabled' => $enforcementEnabled,
                     'shift' => null,
                 ],
             ]);
         }
 
-        $shiftStart = $activeShift->opened_at;
-        $now = Carbon::now();
-
-        // Calculate real-time net cash within this shift
-        $cashPaymentQuery = PaymentTransaction::where(function ($sq) use ($activeShift, $shiftStart, $now) {
-                $sq->where('payment_transactions.shift_id', $activeShift->id)
-                   ->orWhere(function ($tsq) use ($shiftStart, $now) {
-                       $tsq->whereNull('payment_transactions.shift_id')
-                           ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
-                   });
-            })
-            ->where('status', '!=', 'void')
-            ->where(function ($q) use ($branchId) {
-                $q->where('payment_transactions.branch_id', $branchId)
-                  ->orWhere(function ($fb) use ($branchId) {
-                      $fb->whereNull('payment_transactions.branch_id')
-                         ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $branchId));
-                  });
-            })
-            ->whereHas('paymentMethod', function ($mq) {
-                $mq->whereRaw('LOWER(code) = ?', ['cash'])
-                   ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
-            });
-
-        $cashInflow = (float)(clone $cashPaymentQuery)
-            ->where('type', '!=', 'refund')
-            ->where(function ($q) {
-                $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
-            })
-            ->sum('amount');
-
-        $cashRefund = (float)(clone $cashPaymentQuery)
-            ->where(function ($q) {
-                $q->where('type', 'refund')->orWhere('direction', 'outflow');
-            })
-            ->sum('amount');
-
-        $netCashRevenue = $cashInflow - $cashRefund;
-
-        // Disbursed cash drawer expenses during this shift
-        $disbursedCashExpenses = (float)BranchExpense::whereBetween('disbursed_at', [$shiftStart, $now])
-            ->where('branch_id', $branchId)
-            ->where('payment_source', 'cash_drawer')
-            ->where('status', 'disbursed')
-            ->sum('amount');
-
-        $expectedCash = max(0.00, (float)$activeShift->opening_cash_float + $netCashRevenue - $disbursedCashExpenses);
-
+        // True Blind Close: while shift status === 'open', redact expected cash and cash movement totals
+        // so cashiers count physical cash without knowing the target figure beforehand.
         return response()->json([
             'success' => true,
             'data' => [
                 'has_active_shift' => true,
+                'shift_enforcement_enabled' => $enforcementEnabled,
                 'shift' => [
                     'id' => $activeShift->id,
                     'shift_number' => $activeShift->shift_number,
@@ -120,11 +81,8 @@ class ShiftController extends Controller
                     'opened_by_name' => $activeShift->openedBy?->name ?? 'Kasir',
                     'opened_at' => $activeShift->opened_at->toIso8601String(),
                     'opening_cash_float' => (float)$activeShift->opening_cash_float,
-                    'current_cash_inflow' => $cashInflow,
-                    'current_cash_refund' => $cashRefund,
-                    'current_cash_expenses' => $disbursedCashExpenses,
-                    'expected_cash_now' => $expectedCash,
                     'status' => $activeShift->status,
+                    'is_blind_close' => true,
                 ],
             ],
         ]);
@@ -270,14 +228,17 @@ class ShiftController extends Controller
         $now = Carbon::now();
         $shiftStart = $shift->opened_at;
         $branchId = $shift->branch_id;
+        $business = \App\Models\Business::find($shift->business_id ?? $businessId);
+        $shiftEnforcementEnabled = (bool)($business?->shift_enforcement_enabled ?? true);
 
-        // Calculate cash inflow & refund during this shift
-        $cashPaymentQuery = PaymentTransaction::where(function ($sq) use ($shift, $shiftStart, $now) {
-                $sq->where('payment_transactions.shift_id', $shift->id)
-                   ->orWhere(function ($tsq) use ($shiftStart, $now) {
-                       $tsq->whereNull('payment_transactions.shift_id')
-                           ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
-                   });
+        $allShiftPaymentsQuery = PaymentTransaction::where(function ($sq) use ($shift, $shiftStart, $now, $shiftEnforcementEnabled) {
+                $sq->where('payment_transactions.shift_id', $shift->id);
+                if (!$shiftEnforcementEnabled) {
+                    $sq->orWhere(function ($tsq) use ($shiftStart, $now) {
+                        $tsq->whereNull('payment_transactions.shift_id')
+                            ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
+                    });
+                }
             })
             ->where('status', '!=', 'void')
             ->where(function ($q) use ($branchId) {
@@ -286,14 +247,29 @@ class ShiftController extends Controller
                       $fb->whereNull('payment_transactions.branch_id')
                          ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $branchId));
                   });
+            });
+
+        $totalTransactions = (int)(clone $allShiftPaymentsQuery)->count();
+        $nonCashInflow = (float)(clone $allShiftPaymentsQuery)
+            ->whereNotIn('type', ['refund', 'deposit_refund'])
+            ->where(function ($q) {
+                $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
             })
+            ->whereDoesntHave('paymentMethod', function ($mq) {
+                $mq->whereRaw('LOWER(code) = ?', ['cash'])
+                   ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
+            })
+            ->sum('amount');
+
+        // Calculate cash inflow (including deposit) & outflow (including refund & deposit_refund) during this shift
+        $cashPaymentQuery = (clone $allShiftPaymentsQuery)
             ->whereHas('paymentMethod', function ($mq) {
                 $mq->whereRaw('LOWER(code) = ?', ['cash'])
                    ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
             });
 
         $cashInflow = (float)(clone $cashPaymentQuery)
-            ->where('type', '!=', 'refund')
+            ->whereNotIn('type', ['refund', 'deposit_refund'])
             ->where(function ($q) {
                 $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
             })
@@ -301,12 +277,11 @@ class ShiftController extends Controller
 
         $cashRefund = (float)(clone $cashPaymentQuery)
             ->where(function ($q) {
-                $q->where('type', 'refund')->orWhere('direction', 'outflow');
+                $q->whereIn('type', ['refund', 'deposit_refund'])->orWhere('direction', 'outflow');
             })
             ->sum('amount');
 
-        $disbursedCashExpenses = (float)BranchExpense::whereBetween('disbursed_at', [$shiftStart, $now])
-            ->where('branch_id', $branchId)
+        $disbursedCashExpenses = (float)BranchExpense::where('shift_id', $shift->id)
             ->where('payment_source', 'cash_drawer')
             ->where('status', 'disbursed')
             ->sum('amount');
@@ -347,16 +322,24 @@ class ShiftController extends Controller
             ]
         );
 
+        $shift->loadMissing(['branch', 'openedBy', 'closedBy']);
+
         return response()->json([
             'success' => true,
             'message' => 'Shift kasir berhasil ditutup.',
             'data' => [
                 'id' => $shift->id,
                 'shift_number' => $shift->shift_number,
+                'branch_id' => $shift->branch_id,
+                'branch_name' => $shift->branch?->name,
+                'opened_by_name' => $shift->openedBy?->name ?? $user->name,
+                'closed_by_name' => $user->name,
                 'opened_at' => $shift->opened_at->toIso8601String(),
                 'closed_at' => $shift->closed_at->toIso8601String(),
                 'opening_cash_float' => (float)$shift->opening_cash_float,
+                'total_transactions' => $totalTransactions,
                 'cash_inflow' => $cashInflow,
+                'non_cash_inflow' => $nonCashInflow,
                 'cash_refund' => $cashRefund,
                 'cash_expenses' => $disbursedCashExpenses,
                 'expected_cash_total' => $expectedCash,

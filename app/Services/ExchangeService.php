@@ -292,36 +292,15 @@ class ExchangeService
 
             // 8. Authorize Fee Waiver or Manager Override if requested
             if ($isFeeWaived || !empty($data['manager_pin'])) {
-                if (empty($data['manager_pin'])) {
-                    throw ValidationException::withMessages([
-                        'manager_pin' => ['Penghapusan / pembebasan biaya selisih tukar unit memerlukan otorisasi PIN Manager.'],
-                    ]);
-                }
-
-                $businessId = $booking->business_id;
-                $affiliateId = $booking->affiliate_id;
-
-                $managers = User::where(function ($q) use ($affiliateId, $businessId) {
-                        $q->where('affiliate_id', $affiliateId);
-                        if ($businessId) {
-                            $q->orWhereHas('businessMembers', function ($bm) use ($businessId) {
-                                $bm->where('business_id', $businessId)->whereIn('role', ['owner', 'admin']);
-                            });
-                        }
-                    })
-                    ->whereNotNull('manager_override_pin')
-                    ->get();
-
-                $matchingManager = $managers->first(function ($mgr) use ($data) {
-                    return password_verify($data['manager_pin'], $mgr->manager_override_pin);
-                });
-
-                if (!$matchingManager) {
-                    throw ValidationException::withMessages([
-                        'manager_pin' => ['PIN Manager tidak valid.'],
-                    ]);
-                }
-
+                $matchingManager = ManagerPinVerificationService::verify(
+                    $cashier,
+                    $data['manager_pin'] ?? null,
+                    $booking->business_id ? (int)$booking->business_id : null,
+                    $booking->affiliate_id ? (int)$booking->affiliate_id : null,
+                    'Penghapusan / pembebasan biaya selisih tukar unit memerlukan otorisasi PIN Manager.',
+                    request()?->ip(),
+                    'RentalUnitExchange'
+                );
                 $managerApprovedBy = $matchingManager->id;
             }
 
@@ -396,9 +375,9 @@ class ExchangeService
                     'transacted_at' => Carbon::now(),
                 ]);
 
-                // Update booking total bill
+                // Update booking total bill & recalculate remaining_balance + payment_status
                 $booking->total_bill = (float)$booking->total_bill + $payableDifferential;
-                $booking->save();
+                $booking->recalculateFinancials();
             }
 
             // 10. Update Old Asset -> 'maintenance' (Quarantine Defect)

@@ -206,12 +206,12 @@ class DashboardController extends Controller
             });
         }
 
-        // Consolidated aggregate query: replaces 2 Schema::hasColumn calls and 3 separate queries with 1 single query
+        // Exclude refundable security deposits & deposit refunds from net daily revenue while preserving physical cash drawer tracking
         $financialSummary = (clone $paymentQuery)
             ->selectRaw("
                 COUNT(*) as total_count,
-                COALESCE(SUM(CASE WHEN payment_transactions.type != 'refund' AND (payment_transactions.direction IS NULL OR payment_transactions.direction != 'outflow') THEN payment_transactions.amount ELSE 0 END), 0) as inflow,
-                COALESCE(SUM(CASE WHEN payment_transactions.type = 'refund' OR payment_transactions.direction = 'outflow' THEN payment_transactions.amount ELSE 0 END), 0) as outflow
+                COALESCE(SUM(CASE WHEN payment_transactions.type NOT IN ('refund', 'deposit', 'deposit_refund') AND (payment_transactions.direction IS NULL OR payment_transactions.direction != 'outflow') THEN payment_transactions.amount ELSE 0 END), 0) as inflow,
+                COALESCE(SUM(CASE WHEN payment_transactions.type != 'deposit_refund' AND (payment_transactions.type = 'refund' OR payment_transactions.direction = 'outflow') THEN payment_transactions.amount ELSE 0 END), 0) as outflow
             ")
             ->first();
 

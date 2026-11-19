@@ -265,17 +265,32 @@ class ReturnService
                 }
             }
 
-            // Client-inspected penalty sync & tender tolerance guard:
-            // If client submitted an inspected late_fee, sync if within 1 hour boundary tolerance
-            // (prevents race-condition shortfall errors when cashier tender takes seconds to complete)
-            if (isset($data['late_fee']) && is_numeric($data['late_fee'])) {
-                $clientLateFee = (float)$data['late_fee'];
-                if (abs($clientLateFee - $lateFee) <= $hourlyRate) {
-                    $lateFee = $clientLateFee;
+            $damageFee = (float)($data['damage_fee'] ?? 0.00);
+
+            // Server-side Penalty Authority: require valid Manager PIN if damage_fee > 0
+            // or if client late_fee deviates from server-computed lateFee.
+            $clientLateFeeDeviates = isset($data['late_fee'])
+                && is_numeric($data['late_fee'])
+                && abs((float)$data['late_fee'] - $lateFee) > 0.01;
+
+            if ($damageFee > 0 || $clientLateFeeDeviates) {
+                ManagerPinVerificationService::verify(
+                    $inspector,
+                    $data['manager_pin'] ?? null,
+                    $booking->business_id ? (int)$booking->business_id : null,
+                    (int)($inspector->affiliate_id ?? $booking->affiliate_id ?? $booking->branch_id),
+                    $damageFee > 0
+                        ? 'Pengenaan biaya kerusakan unit memerlukan otorisasi PIN Manager.'
+                        : 'Perubahan nominal denda keterlambatan dari hitungan sistem memerlukan otorisasi PIN Manager.',
+                    request()?->ip(),
+                    'ReturnInspection'
+                );
+
+                if ($clientLateFeeDeviates) {
+                    $lateFee = max(0.00, (float)$data['late_fee']);
                 }
             }
 
-            $damageFee = (float)($data['damage_fee'] ?? 0.00);
             $totalPenalty = $lateFee + $damageFee;
             $depositRefunded = max(0, (float)$booking->deposit_fee - $totalPenalty);
 
@@ -435,10 +450,10 @@ class ReturnService
                 }
             }
 
-            // 6b. Record Deposit Refund if deposit exceeds penalties
+            // 6b. Record Deposit Refund distinctly (`type = 'deposit_refund'`) so it is tracked in cash drawer outflow without distorting net daily revenue
             if ($depositRefunded > 0) {
                 $existingRefundTx = PaymentTransaction::where('booking_id', $booking->id)
-                    ->where('type', 'refund')
+                    ->whereIn('type', ['deposit_refund', 'refund'])
                     ->first();
 
                 if (!$existingRefundTx) {
@@ -450,8 +465,8 @@ class ReturnService
                         ->whereDate('created_at', Carbon::today())
                         ->count() + 1;
                     $randomSuffix = strtoupper(substr(uniqid(), -4));
-                    $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
-                    $receiptNumber = sprintf('REC-REF-%s-%s-%s', $booking->affiliate->code ?? 'CTR', $datePrefix, $randomSuffix);
+                    $txCode = sprintf('TX-DEPREF-%s-%04d-%s', $datePrefix, $countToday, $randomSuffix);
+                    $receiptNumber = sprintf('REC-DEPREF-%s-%s-%s', $booking->affiliate->code ?? 'CTR', $datePrefix, $randomSuffix);
 
                     PaymentTransaction::create([
                         'business_id' => $booking->business_id ?? app(\App\Tenancy\TenantContext::class)->getBusinessId(),
@@ -462,7 +477,7 @@ class ReturnService
                         'booking_id' => $booking->id,
                         'payment_method_id' => $cashMethod ? $cashMethod->id : 1,
                         'processed_by' => $inspector->id,
-                        'type' => 'refund',
+                        'type' => 'deposit_refund',
                         'status' => 'completed',
                         'direction' => 'outflow',
                         'amount' => $depositRefunded,
