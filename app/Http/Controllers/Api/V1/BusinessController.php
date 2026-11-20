@@ -88,27 +88,37 @@ class BusinessController extends Controller
 
         $user = $request->user();
 
-        // Idempotency check: Reuse and update existing pending business owned by user
+        // Only reuse an explicitly referenced pending business that belongs to this user,
+        // has not completed onboarding, and has zero branches and zero bookings.
         $existingBusiness = null;
         if (!empty($validated['pending_business_id'])) {
-            $existingBusiness = Business::where('id', $validated['pending_business_id'])
+            $candidate = Business::where('id', $validated['pending_business_id'])
                 ->where('owner_id', $user->id)
-                ->first();
-        }
-        if (!$existingBusiness) {
-            $existingBusiness = Business::where('owner_id', $user->id)
                 ->where('has_completed_onboarding', false)
                 ->first();
+
+            if ($candidate
+                && !$candidate->branches()->withoutGlobalScopes()->exists()
+                && !$candidate->bookings()->withoutGlobalScopes()->exists()
+            ) {
+                $existingBusiness = $candidate;
+            }
         }
-        if (!$existingBusiness) {
-            $existingBusiness = Business::where('owner_id', $user->id)
-                ->where('name', trim($validated['name']))
-                ->first();
+
+        $baseSlug = Str::slug($validated['name']) ?: 'bisnis';
+        $uniqueSlug = $baseSlug;
+        $slugCounter = 1;
+        while (Business::where('slug', $uniqueSlug)
+            ->when($existingBusiness, fn($q) => $q->where('id', '!=', $existingBusiness->id))
+            ->exists()
+        ) {
+            $uniqueSlug = $baseSlug . '-' . $slugCounter++;
         }
 
         if ($existingBusiness) {
             $existingBusiness->update(array_filter([
                 'name' => $validated['name'],
+                'slug' => $uniqueSlug,
                 'phone' => $validated['phone'] ?? $existingBusiness->phone,
                 'email' => $validated['email'] ?? $existingBusiness->email,
                 'address' => $validated['address'] ?? $existingBusiness->address,
@@ -125,9 +135,10 @@ class BusinessController extends Controller
             ], 200);
         }
 
-        $business = DB::transaction(function () use ($validated, $user, $request) {
+        $business = DB::transaction(function () use ($validated, $user, $request, $uniqueSlug) {
             $business = Business::create([
                 'name' => $validated['name'],
+                'slug' => $uniqueSlug,
                 'phone' => $validated['phone'] ?? $user->phone,
                 'email' => $validated['email'] ?? $user->email,
                 'address' => $validated['address'] ?? null,
@@ -182,7 +193,8 @@ class BusinessController extends Controller
                 ['name' => $business->name, 'branch' => $branch->name],
                 null,
                 $request->ip(),
-                $branch->id
+                $branch->id,
+                $business->id
             );
 
             return $business->load('branches');

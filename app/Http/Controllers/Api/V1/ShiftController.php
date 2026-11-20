@@ -12,6 +12,7 @@ use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 
 class ShiftController extends Controller
@@ -27,6 +28,7 @@ class ShiftController extends Controller
 
         $branchId = $request->get('branch_id')
             ?? $request->header('X-Branch-Id')
+            ?? $tenantContext->getBranchId()
             ?? $user->affiliate_id;
 
         if (!$branchId && $businessId) {
@@ -44,12 +46,17 @@ class ShiftController extends Controller
             ], 422);
         }
 
+        if ($denied = $this->authorizeBranchAccess($request, (int)$branchId, $businessId)) {
+            return $denied;
+        }
+
         $business = $businessId
             ? \App\Models\Business::find($businessId)
             : Affiliate::find($branchId)?->business;
         $enforcementEnabled = (bool)($business?->shift_enforcement_enabled ?? true);
 
         $activeShift = CashDrawerShift::with(['openedBy', 'branch'])
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
             ->where('branch_id', $branchId)
             ->where('status', 'open')
             ->latest('opened_at')
@@ -68,6 +75,7 @@ class ShiftController extends Controller
 
         // True Blind Close: while shift status === 'open', redact expected cash and cash movement totals
         // so cashiers count physical cash without knowing the target figure beforehand.
+        // Any non-blind expectation must go through $this->calculateExpectedCash($activeShift).
         return response()->json([
             'success' => true,
             'data' => [
@@ -207,12 +215,20 @@ class ShiftController extends Controller
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
 
-        $shiftQuery = CashDrawerShift::where('status', 'open');
+        $shiftQuery = CashDrawerShift::where('status', 'open')
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId));
+
         if (!empty($validated['shift_id'])) {
             $shiftQuery->where('id', $validated['shift_id']);
         } else {
-            $branchId = $request->header('X-Branch-Id') ?? $user->affiliate_id;
+            $branchId = $tenantContext->isBranchRestricted()
+                ? $tenantContext->getBranchId()
+                : ($request->header('X-Branch-Id') ?? $tenantContext->getBranchId() ?? $user->affiliate_id);
+
             if ($branchId) {
+                if ($denied = $this->authorizeBranchAccess($request, (int)$branchId, $businessId)) {
+                    return $denied;
+                }
                 $shiftQuery->where('branch_id', $branchId);
             }
         }
@@ -225,78 +241,34 @@ class ShiftController extends Controller
             ]);
         }
 
+        if ($denied = $this->authorizeBranchAccess($request, (int)$shift->branch_id, $businessId)) {
+            return $denied;
+        }
+
         $now = Carbon::now();
-        $shiftStart = $shift->opened_at;
-        $branchId = $shift->branch_id;
-        $business = \App\Models\Business::find($shift->business_id ?? $businessId);
-        $shiftEnforcementEnabled = (bool)($business?->shift_enforcement_enabled ?? true);
+        $cashSummary = $this->calculateExpectedCash($shift);
+        $totalTransactions = $cashSummary['total_transactions'];
+        $cashInflow = $cashSummary['cash_inflow'];
+        $cashRefund = $cashSummary['cash_outflow'];
+        $nonCashInflow = $cashSummary['non_cash_inflow'];
+        $disbursedCashExpenses = $cashSummary['cash_expenses'];
+        $expectedCash = $cashSummary['expected_cash'];
 
-        $allShiftPaymentsQuery = PaymentTransaction::where(function ($sq) use ($shift, $shiftStart, $now, $shiftEnforcementEnabled) {
-                $sq->where('payment_transactions.shift_id', $shift->id);
-                if (!$shiftEnforcementEnabled) {
-                    $sq->orWhere(function ($tsq) use ($shiftStart, $now) {
-                        $tsq->whereNull('payment_transactions.shift_id')
-                            ->whereBetween('payment_transactions.transacted_at', [$shiftStart, $now]);
-                    });
-                }
-            })
-            ->where('status', '!=', 'void')
-            ->where(function ($q) use ($branchId) {
-                $q->where('payment_transactions.branch_id', $branchId)
-                  ->orWhere(function ($fb) use ($branchId) {
-                      $fb->whereNull('payment_transactions.branch_id')
-                         ->whereHas('booking', fn($bq) => $bq->where('affiliate_id', $branchId));
-                  });
-            });
+        $actualCounted = round((float)$validated['actual_cash_counted'], 2);
+        $cashDifference = round($actualCounted - $expectedCash, 2);
 
-        $totalTransactions = (int)(clone $allShiftPaymentsQuery)->count();
-        $nonCashInflow = (float)(clone $allShiftPaymentsQuery)
-            ->whereNotIn('type', ['refund', 'deposit_refund'])
-            ->where(function ($q) {
-                $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
-            })
-            ->whereDoesntHave('paymentMethod', function ($mq) {
-                $mq->whereRaw('LOWER(code) = ?', ['cash'])
-                   ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
-            })
-            ->sum('amount');
+        $tolerance = 5000;
+        if (abs($cashDifference) > $tolerance && empty(trim((string)($validated['difference_reason'] ?? '')))) {
+            $neutralMessage = 'Hitungan kas fisik tidak sesuai dengan catatan sistem. Isi keterangan/alasan selisih kas untuk menyelesaikan tutup shift.';
 
-        // Calculate cash inflow (including deposit) & outflow (including refund & deposit_refund) during this shift
-        $cashPaymentQuery = (clone $allShiftPaymentsQuery)
-            ->whereHas('paymentMethod', function ($mq) {
-                $mq->whereRaw('LOWER(code) = ?', ['cash'])
-                   ->orWhereRaw('LOWER(name) LIKE ?', ['%tunai%']);
-            });
-
-        $cashInflow = (float)(clone $cashPaymentQuery)
-            ->whereNotIn('type', ['refund', 'deposit_refund'])
-            ->where(function ($q) {
-                $q->whereNull('direction')->orWhere('direction', '!=', 'outflow');
-            })
-            ->sum('amount');
-
-        $cashRefund = (float)(clone $cashPaymentQuery)
-            ->where(function ($q) {
-                $q->whereIn('type', ['refund', 'deposit_refund'])->orWhere('direction', 'outflow');
-            })
-            ->sum('amount');
-
-        $disbursedCashExpenses = (float)BranchExpense::where('shift_id', $shift->id)
-            ->where('payment_source', 'cash_drawer')
-            ->where('status', 'disbursed')
-            ->sum('amount');
-
-        $expectedCash = max(0.00, (float)$shift->opening_cash_float + $cashInflow - $cashRefund - $disbursedCashExpenses);
-        $actualCounted = (float)$validated['actual_cash_counted'];
-        $cashDifference = $actualCounted - $expectedCash;
-
-        if (abs($cashDifference) > 5000 && empty($validated['difference_reason'])) {
-            throw ValidationException::withMessages([
-                'difference_reason' => [
-                    'Terdapat selisih kas fisik sebesar ' . number_format($cashDifference, 0, ',', '.') . 
-                    '. Keterangan/alasan selisih kas wajib diisi sebelum shift dapat ditutup.'
+            return response()->json([
+                'success' => false,
+                'message' => $neutralMessage,
+                'requires_difference_reason' => true,
+                'errors' => [
+                    'difference_reason' => [$neutralMessage],
                 ],
-            ]);
+            ], 422);
         }
 
         $shift->update([
@@ -339,6 +311,7 @@ class ShiftController extends Controller
                 'opening_cash_float' => (float)$shift->opening_cash_float,
                 'total_transactions' => $totalTransactions,
                 'cash_inflow' => $cashInflow,
+                'cash_outflow' => $cashRefund,
                 'non_cash_inflow' => $nonCashInflow,
                 'cash_refund' => $cashRefund,
                 'cash_expenses' => $disbursedCashExpenses,
@@ -349,6 +322,70 @@ class ShiftController extends Controller
                 'status' => $shift->status,
             ],
         ]);
+    }
+
+    /**
+     * Single source of truth for shift physical cash drawer expectation.
+     *
+     * Strictly scopes payment_transactions to the shift's business, branch, shift_id,
+     * completed status, and CASH payment method code (excluding QRIS/e-wallets/bank transfers).
+     */
+    private function calculateExpectedCash(CashDrawerShift $shift): array
+    {
+        $baseQuery = PaymentTransaction::where('payment_transactions.business_id', $shift->business_id)
+            ->where('payment_transactions.branch_id', $shift->branch_id)
+            ->where('payment_transactions.shift_id', $shift->id)
+            ->where('payment_transactions.status', 'completed');
+
+        $totalTransactions = (int) (clone $baseQuery)->count();
+
+        $nonCashInflow = (float) (clone $baseQuery)
+            ->where('payment_transactions.direction', 'inflow')
+            ->whereHas('paymentMethod', function ($mq) {
+                $mq->whereRaw('UPPER(code) != ?', ['CASH']);
+            })
+            ->sum('amount');
+
+        $cashPaymentQuery = (clone $baseQuery)
+            ->whereHas('paymentMethod', function ($mq) {
+                $mq->whereRaw('UPPER(code) = ?', ['CASH']);
+            });
+
+        $cashInflow = (float) (clone $cashPaymentQuery)
+            ->where('payment_transactions.direction', 'inflow')
+            ->sum('amount');
+
+        $cashOutflow = (float) (clone $cashPaymentQuery)
+            ->where('payment_transactions.direction', 'outflow')
+            ->sum('amount');
+
+        $expenseQuery = BranchExpense::where('branch_id', $shift->branch_id)
+            ->where('payment_source', 'cash_drawer')
+            ->where('status', 'disbursed');
+
+        if (Schema::hasColumn('branch_expenses', 'shift_id')) {
+            $expenseQuery->where('shift_id', $shift->id);
+        } else {
+            $expenseQuery->whereBetween('disbursed_at', [
+                $shift->opened_at,
+                $shift->closed_at ?? Carbon::now(),
+            ]);
+        }
+
+        $cashExpenses = (float) $expenseQuery->sum('amount');
+        $expectedCash = round(
+            (float) $shift->opening_cash_float + $cashInflow - $cashOutflow - $cashExpenses,
+            2
+        );
+
+        return [
+            'total_transactions' => $totalTransactions,
+            'cash_inflow' => round($cashInflow, 2),
+            'cash_outflow' => round($cashOutflow, 2),
+            'non_cash_inflow' => round($nonCashInflow, 2),
+            'cash_expenses' => round($cashExpenses, 2),
+            'expected_cash' => $expectedCash,
+        ];
     }
 
     /**
@@ -383,7 +420,8 @@ class ShiftController extends Controller
         $shifts = $query->paginate($perPage);
 
         $formatted = $shifts->getCollection()->map(function ($s) {
-            return [
+            $isOpen = $s->status === 'open';
+            $row = [
                 'id' => $s->id,
                 'shift_number' => $s->shift_number,
                 'branch_id' => $s->branch_id,
@@ -395,14 +433,20 @@ class ShiftController extends Controller
                 'opened_at' => $s->opened_at?->toIso8601String(),
                 'closed_at' => $s->closed_at?->toIso8601String(),
                 'opening_cash_float' => (float)$s->opening_cash_float,
-                'expected_cash_total' => $s->expected_cash_total !== null ? (float)$s->expected_cash_total : null,
-                'actual_cash_counted' => $s->actual_cash_counted !== null ? (float)$s->actual_cash_counted : null,
-                'cash_difference' => $s->cash_difference !== null ? (float)$s->cash_difference : null,
                 'difference_reason' => $s->difference_reason,
                 'status' => $s->status,
+                'is_blind_close' => $isOpen,
                 'closing_notes' => $s->closing_notes,
                 'created_at' => $s->created_at?->toIso8601String(),
             ];
+
+            if (!$isOpen) {
+                $row['expected_cash_total'] = $s->expected_cash_total !== null ? (float)$s->expected_cash_total : null;
+                $row['actual_cash_counted'] = $s->actual_cash_counted !== null ? (float)$s->actual_cash_counted : null;
+                $row['cash_difference'] = $s->cash_difference !== null ? (float)$s->cash_difference : null;
+            }
+
+            return $row;
         });
 
         return response()->json([
@@ -593,5 +637,63 @@ class ShiftController extends Controller
         );
 
         return $this->getSchedule($request);
+    }
+
+    /**
+     * Ensure the authenticated user is authorized to inspect or operate a branch's shift.
+     */
+    private function authorizeBranchAccess(Request $request, int $branchId, ?int $businessId): ?JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+
+        if ($user && $user->isSuperAdmin()) {
+            return null;
+        }
+
+        if ($businessId) {
+            $branchExists = Affiliate::withoutGlobalScopes()
+                ->where('id', $branchId)
+                ->where('business_id', $businessId)
+                ->exists();
+            if (!$branchExists) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Anda tidak memiliki hak akses ke cabang ini.',
+                ], 403);
+            }
+        }
+
+        if ($tenantContext->isBranchRestricted() && (int) $tenantContext->getBranchId() !== $branchId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Anda tidak memiliki hak akses ke cabang ini.',
+            ], 403);
+        }
+
+        if ($user && $businessId) {
+            $membership = $user->getBusinessMembership($businessId);
+            if ($membership && !$membership->isOwner()) {
+                $allowedBranches = array_map('intval', $user->getBranchIdsForBusiness($businessId));
+                if (!empty($allowedBranches) && !in_array($branchId, $allowedBranches, true)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Anda tidak memiliki hak akses ke cabang ini.',
+                    ], 403);
+                }
+            } elseif (!$membership && $user->affiliate_id && (int) $user->affiliate_id !== $branchId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Anda tidak memiliki hak akses ke cabang ini.',
+                ], 403);
+            }
+        } elseif ($user && $user->affiliate_id && (int) $user->affiliate_id !== $branchId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Anda tidak memiliki hak akses ke cabang ini.',
+            ], 403);
+        }
+
+        return null;
     }
 }

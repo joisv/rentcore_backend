@@ -427,21 +427,60 @@ class PaymentSettingsController extends Controller
      */
     public function getQrisImage(Request $request): Response
     {
-        $businessId = $request->query('business_id');
+        $user = $request->user();
+        $tenantContext = app(TenantContext::class);
+        $contextBusinessId = $tenantContext->getBusinessId();
+        $requestedBusinessId = $request->query('business_id');
         $branchId = $request->query('branch_id');
 
-        if (!$businessId && $branchId) {
-            $branch = Affiliate::find($branchId);
-            $business = $branch?->business;
-        } else {
-            $business = Business::find($businessId);
+        $businessId = $contextBusinessId;
+        if (!$businessId && $user?->isSuperAdmin()) {
+            $businessId = $requestedBusinessId ? (int) $requestedBusinessId : null;
         }
+
+        if (!$businessId) {
+            return response()->json(['message' => 'Akses ditolak. Konteks bisnis tidak valid.'], 403);
+        }
+
+        if ($requestedBusinessId && (int) $requestedBusinessId !== (int) $businessId && !$user?->isSuperAdmin()) {
+            return response()->json(['message' => 'Anda tidak memiliki akses ke QRIS bisnis lain.'], 403);
+        }
+
+        if ($user && !$user->isSuperAdmin()) {
+            $hasMembership = \App\Models\BusinessMember::where('business_id', $businessId)
+                ->where('user_id', $user->id)
+                ->where('is_active', true)
+                ->exists();
+            $hasLegacyAffiliate = $user->affiliate_id
+                ? Affiliate::withoutGlobalScopes()
+                    ->where('id', $user->affiliate_id)
+                    ->where('business_id', $businessId)
+                    ->exists()
+                : false;
+
+            if (!$hasMembership && !$hasLegacyAffiliate) {
+                return response()->json(['message' => 'Anda tidak memiliki akses ke bisnis ini.'], 403);
+            }
+        }
+
+        $business = Business::find($businessId);
 
         if (!$business) {
             return response()->json(['message' => 'Bisnis tidak ditemukan.'], 404);
         }
 
-        $config = $business->getPaymentMethodsConfig($branchId ? (int)$branchId : null);
+        $resolvedBranchId = null;
+        if ($branchId) {
+            $branch = Affiliate::withoutGlobalScopes()
+                ->where('business_id', $business->id)
+                ->find((int) $branchId);
+            if (!$branch) {
+                return response()->json(['message' => 'Cabang tidak ditemukan pada bisnis ini.'], 404);
+            }
+            $resolvedBranchId = $branch->id;
+        }
+
+        $config = $business->getPaymentMethodsConfig($resolvedBranchId);
         $path = $config['qris_image_path'] ?? null;
 
         if ($path) {

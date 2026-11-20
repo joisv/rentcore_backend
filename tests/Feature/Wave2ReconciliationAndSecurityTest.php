@@ -447,4 +447,175 @@ class Wave2ReconciliationAndSecurityTest extends TestCase
             ->assertJsonPath('data.shift_enforcement_enabled', false)
             ->assertJsonPath('data.shift', null);
     }
+
+    public function test_close_shift_strictly_scopes_to_shift_completed_and_cash_code(): void
+    {
+        // Even with shift_enforcement_enabled = false, closeShift must NOT sweep null-shift_id transactions
+        $this->business->update(['shift_enforcement_enabled' => false]);
+
+        $qrisMethod = PaymentMethod::create([
+            'code' => 'QRIS',
+            'name' => 'QRIS Dinamis Tunai', // contains "Tunai" in name to verify strict code=CASH check
+            'type' => 'qris',
+            'is_active' => true,
+        ]);
+
+        $shift = CashDrawerShift::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'opened_by' => $this->staff->id,
+            'shift_number' => 'SHF-STRICT-001',
+            'opening_cash_float' => 100000.00,
+            'status' => 'open',
+            'opened_at' => Carbon::now()->subDays(3),
+        ]);
+
+        $booking = Booking::create([
+            'business_id' => $this->business->id,
+            'affiliate_id' => $this->branch->id,
+            'booking_code' => 'BK-STRICT-01',
+            'customer_id' => $this->customer->id,
+            'created_by' => $this->staff->id,
+            'start_at' => Carbon::now()->subHour(),
+            'end_at' => Carbon::now()->addHours(23),
+            'duration_hours' => 24,
+            'duration_unit' => 'hour',
+            'duration_value' => 24,
+            'status' => 'rented',
+            'total_bill' => 500000.00,
+            'paid_amount' => 500000.00,
+            'remaining_balance' => 0.00,
+            'payment_status' => 'paid',
+        ]);
+
+        // 1. Valid completed CASH inflow on this shift (+270,000)
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'transaction_code' => 'TX-STRICT-CASH',
+            'receipt_number' => 'REC-STRICT-CASH',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'settlement',
+            'status' => 'completed',
+            'direction' => 'inflow',
+            'amount' => 270000.00,
+            'transacted_at' => Carbon::now()->subMinutes(15),
+        ]);
+
+        // 2. Valid completed CASH outflow on this shift (-20,000)
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'transaction_code' => 'TX-STRICT-OUT',
+            'receipt_number' => 'REC-STRICT-OUT',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'refund',
+            'status' => 'completed',
+            'direction' => 'outflow',
+            'amount' => 20000.00,
+            'transacted_at' => Carbon::now()->subMinutes(10),
+        ]);
+
+        // 3. Excluded: shift_id = null historical transaction within opened_at..now
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => null,
+            'transaction_code' => 'TX-STRICT-NULL-SHIFT',
+            'receipt_number' => 'REC-STRICT-NULL-SHIFT',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'settlement',
+            'status' => 'completed',
+            'direction' => 'inflow',
+            'amount' => 8990000.00,
+            'transacted_at' => Carbon::now()->subDay(),
+        ]);
+
+        // 4. Excluded: reversed & void CASH transactions
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'transaction_code' => 'TX-STRICT-REV',
+            'receipt_number' => 'REC-STRICT-REV',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'settlement',
+            'status' => 'reversed',
+            'direction' => 'inflow',
+            'amount' => 500000.00,
+            'transacted_at' => Carbon::now()->subMinutes(5),
+        ]);
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'transaction_code' => 'TX-STRICT-VOID',
+            'receipt_number' => 'REC-STRICT-VOID',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $this->cashMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'settlement',
+            'status' => 'void',
+            'direction' => 'inflow',
+            'amount' => 400000.00,
+            'transacted_at' => Carbon::now()->subMinutes(5),
+        ]);
+
+        // 5. Excluded from physical drawer cash: QRIS transaction (even if name contains "Tunai")
+        PaymentTransaction::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'transaction_code' => 'TX-STRICT-QRIS',
+            'receipt_number' => 'REC-STRICT-QRIS',
+            'booking_id' => $booking->id,
+            'payment_method_id' => $qrisMethod->id,
+            'processed_by' => $this->staff->id,
+            'type' => 'settlement',
+            'status' => 'completed',
+            'direction' => 'inflow',
+            'amount' => 300000.00,
+            'transacted_at' => Carbon::now()->subMinutes(5),
+        ]);
+
+        // 6. Disbursed cash_drawer expense on this shift (-50,000)
+        BranchExpense::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'shift_id' => $shift->id,
+            'expense_number' => 'EXP-STRICT-01',
+            'category' => 'operational',
+            'title' => 'Beli Kertas Struk',
+            'amount' => 50000.00,
+            'payment_source' => 'cash_drawer',
+            'status' => 'disbursed',
+            'requested_by' => $this->staff->id,
+            'approved_by' => $this->owner->id,
+            'disbursed_at' => Carbon::now()->subMinutes(3),
+        ]);
+
+        // Expected = 100,000 float + 270,000 cash inflow - 20,000 cash outflow - 50,000 expense = 300,000
+        $this->withHeaders($this->authHeaders($this->staff))
+            ->postJson('/api/v1/cashier/shift/close', [
+                'shift_id' => $shift->id,
+                'actual_cash_counted' => 300000.00,
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.cash_inflow', 270000)
+            ->assertJsonPath('data.cash_refund', 20000)
+            ->assertJsonPath('data.non_cash_inflow', 300000)
+            ->assertJsonPath('data.cash_expenses', 50000)
+            ->assertJsonPath('data.expected_cash_total', 300000)
+            ->assertJsonPath('data.cash_difference', 0);
+    }
 }

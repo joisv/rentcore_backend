@@ -341,24 +341,68 @@ class NotificationService
             return null;
         }
 
+        $resignation->loadMissing(['user.affiliate', 'businessMember.branchMembers.branch']);
         $staffName = $resignation->user?->name ?? 'Staf';
-        $reasonSnippet = $resignation->reason ? " Catatan: \"{$resignation->reason}\"" : '';
+        $branchModels = $resignation->businessMember?->branchMembers
+            ?->pluck('branch')
+            ->filter()
+            ->values();
+        $branchName = ($branchModels && $branchModels->isNotEmpty())
+            ? $branchModels->pluck('name')->implode(', ')
+            : ($resignation->user?->affiliate?->name ?? 'Semua Cabang');
+        $affiliateId = $branchModels?->first()?->id ?? $resignation->user?->affiliate_id;
+        $reasonSnippet = $resignation->reason ? " Alasan: \"{$resignation->reason}\"" : '';
 
         return $this->notify(
             $resignation->business_id,
-            null,
+            $affiliateId ? (int)$affiliateId : null,
             $business->owner_id,
             'membership',
             'staff.resignation_submitted',
-            'Permohonan Resign Staf',
-            "{$staffName} mengajukan permohonan pengunduran diri dari bisnis rental Anda.{$reasonSnippet}",
+            'Pengajuan Resign Staf',
+            "{$staffName} ({$branchName}) mengajukan pengunduran diri dari {$business->name}.{$reasonSnippet}",
             '/organization',
             [
                 'resignation_id' => $resignation->id,
+                'resignation_request_id' => $resignation->id,
+                'business_id' => $resignation->business_id,
+                'staff_id' => $resignation->user_id,
+                'staff_name' => $staffName,
+                'branch_name' => $branchName,
+                'reason' => $resignation->reason,
+                'status' => 'pending',
                 'action' => 'review_resignation',
             ],
             "resignation.submitted:{$resignation->id}"
         );
+    }
+
+    /**
+     * Update owner's resignation notification payload status and mark read once reviewed.
+     */
+    public function markResignationNotificationDecided(StaffResignationRequest $resignation): void
+    {
+        $notifications = TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $resignation->business_id)
+            ->whereIn('type', ['staff.resignation_submitted', 'resignation_request'])
+            ->get();
+
+        foreach ($notifications as $notification) {
+            $payload = is_array($notification->action_payload) ? $notification->action_payload : [];
+            $targetId = $payload['resignation_request_id'] ?? $payload['resignation_id'] ?? null;
+            if ((int)$targetId !== (int)$resignation->id) {
+                continue;
+            }
+
+            $payload['status'] = $resignation->status;
+            $payload['decision_notes'] = $resignation->decision_notes;
+            $payload['rejection_reason'] = $resignation->decision_notes;
+
+            $notification->update([
+                'action_payload' => $payload,
+                'read_at' => $notification->read_at ?? Carbon::now(),
+            ]);
+        }
     }
 
     /**
@@ -367,11 +411,12 @@ class NotificationService
     public function notifyResignationDecided(StaffResignationRequest $resignation): ?TenantNotification
     {
         $isApproved = $resignation->status === 'approved';
-        $title = $isApproved ? 'Permohonan Resign Disetujui' : 'Permohonan Resign Ditolak';
-        $notesText = $resignation->decision_notes ? " Catatan Owner: {$resignation->decision_notes}." : '';
+        $businessName = $resignation->business?->name ?? 'bisnis rental';
+        $title = $isApproved ? 'Pengajuan Resign Disetujui' : 'Pengajuan Resign Ditolak';
+        $notesText = $resignation->decision_notes ? " Alasan: {$resignation->decision_notes}." : '';
         $body = $isApproved
-            ? "Permohonan pengunduran diri Anda telah disetujui oleh Owner. Akses ke cabang telah dinonaktifkan.{$notesText}"
-            : "Permohonan pengunduran diri Anda ditolak oleh Owner. Anda tetap aktif sebagai staf.{$notesText}";
+            ? "Pengajuan resign Anda dari {$businessName} telah disetujui oleh Owner.{$notesText}"
+            : "Pengajuan resign Anda dari {$businessName} ditolak oleh Owner.{$notesText}";
 
         return $this->notify(
             $resignation->business_id,
@@ -384,7 +429,11 @@ class NotificationService
             '/organization',
             [
                 'resignation_id' => $resignation->id,
+                'resignation_request_id' => $resignation->id,
+                'business_id' => $resignation->business_id,
                 'status' => $resignation->status,
+                'decision_notes' => $resignation->decision_notes,
+                'rejection_reason' => $resignation->decision_notes,
             ],
             "resignation.decided:{$resignation->id}:{$resignation->status}"
         );

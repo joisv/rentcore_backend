@@ -376,8 +376,16 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         $this->assertTrue($qrisMethod['is_dynamic_qris_enabled']);
         $this->assertStringContainsString('storage/qris/', $qrisMethod['qris_image_url']);
 
-        // 3. Public static image endpoint can be streamed without token
-        $streamResp = $this->get('/api/v1/payment-settings/qris-image?business_id=' . $this->business->id . '&branch_id=' . $this->branch->id);
+        // 3. Static image endpoint requires authentication and returns 200 for authorized tenant member
+        $this->flushHeaders();
+        $this->app['auth']->forgetGuards();
+        $unauthResp = $this->getJson('/api/v1/payment-settings/qris-image?business_id=' . $this->business->id . '&branch_id=' . $this->branch->id);
+        $unauthResp->assertStatus(401);
+
+        $streamResp = $this->withHeader('Authorization', "Bearer {$staffToken}")
+            ->withHeader('X-Business-Id', (string)$this->business->id)
+            ->withHeader('X-Branch-Id', (string)$this->branch->id)
+            ->get('/api/v1/payment-settings/qris-image?business_id=' . $this->business->id . '&branch_id=' . $this->branch->id);
         $streamResp->assertStatus(200);
     }
 

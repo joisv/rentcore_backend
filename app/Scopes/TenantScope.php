@@ -44,14 +44,25 @@ class TenantScope implements Scope
             return;
         }
 
-        // Backwards compatibility for legacy affiliate scoping
+        // Backwards compatibility for legacy affiliate scoping when TenantContext is not bound
         if ($user && $user->affiliate_id) {
+            $legacyBusinessId = \App\Models\Affiliate::withoutGlobalScopes()
+                ->where('id', $user->affiliate_id)
+                ->value('business_id');
+
+            $appliedScope = false;
+
+            if ($legacyBusinessId && in_array('business_id', $model->getFillable())) {
+                $builder->where($table . '.business_id', $legacyBusinessId);
+                $appliedScope = true;
+            }
+
             if ($model instanceof \App\Models\InventoryTransfer) {
                 $builder->where(function ($q) use ($user) {
                     $q->where('from_affiliate_id', $user->affiliate_id)
                       ->orWhere('to_affiliate_id', $user->affiliate_id);
                 });
-                return;
+                $appliedScope = true;
             } elseif (in_array('affiliate_id', $model->getFillable())) {
                 if ($model instanceof \App\Models\Voucher) {
                     $builder->where(function ($q) use ($table, $user) {
@@ -61,8 +72,10 @@ class TenantScope implements Scope
                 } else {
                     $builder->where($table . '.affiliate_id', $user->affiliate_id);
                 }
-                return;
-            } else {
+                $appliedScope = true;
+            }
+
+            if ($appliedScope) {
                 return;
             }
         }

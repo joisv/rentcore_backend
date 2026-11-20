@@ -51,14 +51,28 @@ class TenantContextMiddleware
             if ($userMemberships->count() === 1) {
                 $businessId = $userMemberships->first()->business_id;
             } elseif ($userMemberships->isEmpty()) {
-                if ($user->isSuperAdmin() || $user->affiliate_id) {
+                if ($user->isSuperAdmin()) {
                     return $next($request);
                 }
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Anda belum terdaftar dalam bisnis rental manapun. Silakan buat bisnis baru terlebih dahulu.',
-                    'code' => 'NO_BUSINESS_MEMBERSHIP',
-                ], 403);
+
+                if ($user->affiliate_id) {
+                    $legacyAffiliate = Affiliate::withoutGlobalScopes()->find($user->affiliate_id);
+                    if ($legacyAffiliate && $legacyAffiliate->business_id) {
+                        $businessId = $legacyAffiliate->business_id;
+                    } else {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Cabang akun Anda tidak terhubung dengan bisnis rental yang valid.',
+                            'code' => 'NO_BUSINESS_MEMBERSHIP',
+                        ], 403);
+                    }
+                } else {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Anda belum terdaftar dalam bisnis rental manapun. Silakan buat bisnis baru terlebih dahulu.',
+                        'code' => 'NO_BUSINESS_MEMBERSHIP',
+                    ], 403);
+                }
             } else {
                 // User has multiple businesses but none specified
                 return response()->json([
@@ -129,6 +143,16 @@ class TenantContextMiddleware
                     'code' => 'NO_BRANCH_ASSIGNMENT',
                 ], 403);
             }
+        } elseif (!$member && $legacyAffiliateMatches && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            $isBranchRestricted = true;
+            if ($branchId && (int)$branchId !== (int)$user->affiliate_id) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Akses cabang ditolak. Anda tidak ditugaskan di cabang ini.',
+                    'code' => 'BRANCH_ACCESS_DENIED',
+                ], 403);
+            }
+            $branchId = (int)$user->affiliate_id;
         }
 
         if ($branchId) {
@@ -151,8 +175,16 @@ class TenantContextMiddleware
             }
         }
 
+        $effectiveMember = $member ?? new BusinessMember([
+            'business_id' => $business->id,
+            'user_id' => $user->id,
+            'role' => ($legacyAffiliateMatches && !$user->isPlatformAdmin() && !$user->isSuperAdmin())
+                ? ($user->role === 'owner' ? 'owner' : 'staff')
+                : 'owner',
+        ]);
+
         // Bind to TenantContext singleton
-        app(TenantContext::class)->set($business, $member ?? new BusinessMember(['role' => 'owner']), $branch, $isBranchRestricted);
+        app(TenantContext::class)->set($business, $effectiveMember, $branch, $isBranchRestricted);
 
         return $next($request);
     }

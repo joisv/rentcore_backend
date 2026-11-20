@@ -300,14 +300,46 @@ class Wave1FinancialIntegrityTest extends TestCase
             ->assertJsonMissingPath('data.shift.current_cash_refund')
             ->assertJsonMissingPath('data.shift.current_cash_expenses');
 
-        // 2. closingSummary must omit expected_cash_in_drawer & active_shift expected cash while open
+        // 2. closingSummary must omit expected_cash_in_drawer, net_cash_revenue, cash_drawer_expenses & cash breakdown subtotal while open
         $this->withHeaders($this->authHeaders($this->staffA1))
             ->getJson('/api/v1/cashier/closing-summary?branch_id=' . $this->branchA1->id)
             ->assertOk()
+            ->assertJsonPath('data.is_blind_close', true)
+            ->assertJsonPath('data.cash_reconciliation.is_blind_close', true)
             ->assertJsonPath('data.cash_reconciliation.active_shift.is_blind_close', true)
+            ->assertJsonMissingPath('data.cash_drawer_expenses')
             ->assertJsonMissingPath('data.cash_reconciliation.expected_cash_in_drawer')
+            ->assertJsonMissingPath('data.cash_reconciliation.net_cash_revenue')
+            ->assertJsonMissingPath('data.cash_reconciliation.cash_drawer_expenses')
             ->assertJsonMissingPath('data.cash_reconciliation.active_shift.expected_cash_now')
-            ->assertJsonMissingPath('data.cash_reconciliation.active_shift.current_cash_inflow');
+            ->assertJsonMissingPath('data.cash_reconciliation.active_shift.current_cash_inflow')
+            ->assertJsonPath('data.breakdown_by_method.Tunai (Cash).total', null)
+            ->assertJsonPath('data.breakdown_by_method.Tunai (Cash).is_blind_close', true);
+
+        // 2b. shift history must redact expected_cash_total & cash_difference while shift is open
+        $this->withHeaders($this->authHeaders($this->staffA1))
+            ->getJson('/api/v1/cashier/shift/history?branch_id=' . $this->branchA1->id)
+            ->assertOk()
+            ->assertJsonPath('data.0.status', 'open')
+            ->assertJsonPath('data.0.is_blind_close', true)
+            ->assertJsonMissingPath('data.0.expected_cash_total')
+            ->assertJsonMissingPath('data.0.actual_cash_counted')
+            ->assertJsonMissingPath('data.0.cash_difference');
+
+        // 2c. closeShift with discrepancy > tolerance & empty reason returns 422 neutral message (no amount leakage)
+        $discrepancyRes = $this->withHeaders($this->authHeaders($this->staffA1))
+            ->postJson('/api/v1/cashier/shift/close', [
+                'shift_id' => $this->shiftA1->id,
+                'actual_cash_counted' => 500000.00,
+            ])
+            ->assertStatus(422)
+            ->assertJsonPath('requires_difference_reason', true)
+            ->assertJsonPath(
+                'message',
+                'Hitungan kas fisik tidak sesuai dengan catatan sistem. Isi keterangan/alasan selisih kas untuk menyelesaikan tutup shift.'
+            );
+        $this->assertStringNotContainsString('225', $discrepancyRes->getContent());
+        $this->assertStringNotContainsString('725', $discrepancyRes->getContent());
 
         // 3. Closing shift reveals authoritative expected_cash_total (500k + 250k - 25k = 725k) & difference
         $this->withHeaders($this->authHeaders($this->staffA1))
@@ -318,6 +350,9 @@ class Wave1FinancialIntegrityTest extends TestCase
             ])
             ->assertOk()
             ->assertJsonPath('data.status', 'closed')
+            ->assertJsonPath('data.cash_inflow', 250000)
+            ->assertJsonPath('data.cash_outflow', 0)
+            ->assertJsonPath('data.cash_expenses', 25000)
             ->assertJsonPath('data.expected_cash_total', 725000)
             ->assertJsonPath('data.actual_cash_counted', 720000)
             ->assertJsonPath('data.cash_difference', -5000);

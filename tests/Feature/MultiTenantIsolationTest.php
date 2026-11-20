@@ -1135,6 +1135,228 @@ class MultiTenantIsolationTest extends TestCase
         $resCrossBranch->assertStatus(422)
             ->assertJsonValidationErrors(['branch_ids']);
     }
+
+    public function test_creating_second_business_never_overwrites_existing_business_and_logs_to_new_business(): void
+    {
+        $this->bizA->update(['has_completed_onboarding' => false]);
+        $tokenA = $this->ownerA->createToken('test')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$tokenA}")
+            ->postJson('/api/v1/businesses', [
+                'name' => 'Bisnis Baru Ekspansi',
+                'city' => 'Surabaya',
+                'initial_branch_name' => 'Surabaya Pusat',
+                'initial_branch_code' => 'SBY',
+            ]);
+
+        $response->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.name', 'Bisnis Baru Ekspansi')
+            ->assertJsonPath('data.has_completed_onboarding', true);
+
+        $newBizId = $response->json('data.id');
+        $this->assertNotEquals($this->bizA->id, $newBizId);
+
+        // Original business must remain completely intact
+        $this->bizA->refresh();
+        $this->assertEquals('Rental Mega Jaya A', $this->bizA->name);
+
+        // AuditLog must be attributed to the newly created business, not bizA
+        $audit = \App\Models\AuditLog::withoutGlobalScopes()
+            ->where('action', 'business.created')
+            ->where('entity_id', $newBizId)
+            ->first();
+        $this->assertNotNull($audit);
+        $this->assertEquals($newBizId, $audit->business_id);
+    }
+
+    public function test_process_payment_blocks_cross_business_idor_and_unauthorized_branch(): void
+    {
+        $customerB = Customer::create([
+            'business_id' => $this->bizB->id,
+            'affiliate_id' => $this->branchB->id,
+            'name' => 'Customer B',
+            'phone' => '081299990001',
+        ]);
+        $bookingB = Booking::create([
+            'business_id' => $this->bizB->id,
+            'affiliate_id' => $this->branchB->id,
+            'customer_id' => $customerB->id,
+            'booking_code' => 'RC-B-001',
+            'status' => 'confirmed',
+            'start_at' => now(),
+            'end_at' => now()->addDay(),
+            'duration_hours' => 24,
+            'subtotal_amount' => 100000,
+            'total_bill' => 100000,
+            'remaining_balance' => 100000,
+            'payment_status' => 'unpaid',
+            'created_by' => $this->ownerB->id,
+        ]);
+
+        // 1. Owner A tries to pay Business B's booking while scoped to Business A
+        $tokenA = $this->ownerA->createToken('test')->plainTextToken;
+        \App\Models\CashDrawerShift::create([
+            'business_id' => $this->bizA->id,
+            'branch_id' => $this->branchA->id,
+            'opened_by' => $this->ownerA->id,
+            'shift_number' => 'SHF-OWN-PAY',
+            'status' => 'open',
+            'opened_at' => now(),
+            'opening_cash_float' => 100000,
+        ]);
+
+        $idorRes = $this->withHeader('Authorization', "Bearer {$tokenA}")
+            ->withHeader('X-Business-Id', (string)$this->bizA->id)
+            ->withHeader('X-Branch-Id', (string)$this->branchA->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $bookingB->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'amount' => 50000,
+                'cash_received' => 50000,
+            ]);
+        $idorRes->assertStatus(404);
+
+        // 2. Branch-restricted staff in Business A tries to pay a booking in Branch A2
+        $branchA2 = Affiliate::create([
+            'business_id' => $this->bizA->id,
+            'code' => 'MGA2',
+            'name' => 'Mega Jaya Cabang 2',
+            'slug' => 'mega-jaya-cabang-2',
+            'is_central' => false,
+            'is_active' => true,
+        ]);
+        $customerA = Customer::create([
+            'business_id' => $this->bizA->id,
+            'affiliate_id' => $branchA2->id,
+            'name' => 'Customer A2',
+            'phone' => '081299990002',
+        ]);
+        $bookingA2 = Booking::create([
+            'business_id' => $this->bizA->id,
+            'affiliate_id' => $branchA2->id,
+            'customer_id' => $customerA->id,
+            'booking_code' => 'RC-A2-001',
+            'status' => 'confirmed',
+            'start_at' => now(),
+            'end_at' => now()->addDay(),
+            'duration_hours' => 24,
+            'subtotal_amount' => 100000,
+            'total_bill' => 100000,
+            'remaining_balance' => 100000,
+            'payment_status' => 'unpaid',
+            'created_by' => $this->ownerA->id,
+        ]);
+
+        $staffA = User::create([
+            'name' => 'Staff A1',
+            'email' => 'staff.a1.pay@tenant.com',
+            'password' => bcrypt('password'),
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+        $memberA = BusinessMember::create([
+            'business_id' => $this->bizA->id,
+            'user_id' => $staffA->id,
+            'role' => 'staff',
+            'is_active' => true,
+        ]);
+        BranchMember::create([
+            'business_member_id' => $memberA->id,
+            'affiliate_id' => $this->branchA->id,
+        ]);
+
+        $this->app['auth']->forgetGuards();
+        $staffToken = $staffA->createToken('test')->plainTextToken;
+        \App\Models\CashDrawerShift::create([
+            'business_id' => $this->bizA->id,
+            'branch_id' => $this->branchA->id,
+            'opened_by' => $staffA->id,
+            'shift_number' => 'SHF-A1-PAY',
+            'status' => 'open',
+            'opened_at' => now(),
+            'opening_cash_float' => 100000,
+        ]);
+
+        $branchRes = $this->withHeader('Authorization', "Bearer {$staffToken}")
+            ->withHeader('X-Business-Id', (string)$this->bizA->id)
+            ->withHeader('X-Branch-Id', (string)$this->branchA->id)
+            ->postJson('/api/v1/cashier/pay', [
+                'booking_id' => $bookingA2->id,
+                'payment_method_id' => $this->cashMethod->id,
+                'amount' => 50000,
+                'cash_received' => 50000,
+            ]);
+        $this->assertTrue(
+            in_array($branchRes->status(), [403, 404], true),
+            'Expected 403 or 404 for cross-branch payment attempt, got ' . $branchRes->status()
+        );
+    }
+
+    public function test_qris_image_requires_auth_and_blocks_cross_business_access(): void
+    {
+        $unauth = $this->getJson('/api/v1/payment-settings/qris-image?business_id=' . $this->bizA->id);
+        $unauth->assertStatus(401);
+
+        $tokenB = $this->ownerB->createToken('test')->plainTextToken;
+        $crossBiz = $this->withHeader('Authorization', "Bearer {$tokenB}")
+            ->withHeader('X-Business-Id', (string)$this->bizB->id)
+            ->getJson('/api/v1/payment-settings/qris-image?business_id=' . $this->bizA->id);
+        $crossBiz->assertStatus(403);
+    }
+
+    public function test_legacy_affiliate_user_and_shift_branch_isolation(): void
+    {
+        $branchA2 = Affiliate::create([
+            'business_id' => $this->bizA->id,
+            'code' => 'MGA2S',
+            'name' => 'Mega Jaya Shift 2',
+            'slug' => 'mega-jaya-shift-2',
+            'is_central' => false,
+            'is_active' => true,
+        ]);
+
+        $shiftA2 = \App\Models\CashDrawerShift::create([
+            'business_id' => $this->bizA->id,
+            'branch_id' => $branchA2->id,
+            'opened_by' => $this->ownerA->id,
+            'shift_number' => 'SHF-A2-001',
+            'status' => 'open',
+            'opened_at' => now(),
+            'opening_cash_float' => 100000,
+        ]);
+
+        // Legacy user with affiliate_id = branchA and NO BusinessMember row
+        $legacyStaff = User::create([
+            'name' => 'Legacy Staff',
+            'email' => 'legacy.staff@tenant.com',
+            'password' => bcrypt('password'),
+            'role' => 'staff',
+            'affiliate_id' => $this->branchA->id,
+            'is_active' => true,
+        ]);
+
+        $token = $legacyStaff->createToken('test')->plainTextToken;
+
+        // Cannot inspect another branch's current shift
+        $viewOtherBranch = $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson('/api/v1/cashier/shift/current?branch_id=' . $branchA2->id);
+        $viewOtherBranch->assertStatus(403);
+
+        // Cannot close another branch's shift via shift_id
+        $closeOtherShift = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/cashier/shift/close', [
+                'shift_id' => $shiftA2->id,
+                'actual_cash_counted' => 100000,
+            ]);
+        $closeOtherShift->assertStatus(403);
+
+        // Still allowed to check own branch shift (bound to bizA TenantContext)
+        $viewOwnBranch = $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson('/api/v1/cashier/shift/current');
+        $viewOwnBranch->assertStatus(200)
+            ->assertJsonPath('success', true);
+    }
 }
 
 

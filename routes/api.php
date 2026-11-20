@@ -37,9 +37,6 @@ Route::prefix('v1')->group(function () {
         Route::post('/auth/google-sign-in', [AuthController::class, 'googleSignIn']);
     });
 
-    // --- Public Assets / Static QRIS Streaming ---
-    Route::get('/payment-settings/qris-image', [PaymentSettingsController::class, 'getQrisImage']);
-
     // --- Protected Routes (Sanctum Authenticated) ---
     Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
 
@@ -77,10 +74,14 @@ Route::prefix('v1')->group(function () {
 
             // Staff Resignation Lifecycle
             Route::get('/businesses/{id}/resignation-requests', [ResignationController::class, 'index']);
+            Route::get('/businesses/{id}/resign-status', [ResignationController::class, 'status']);
             Route::post('/businesses/{id}/resignation-requests', [ResignationController::class, 'store']);
+            Route::post('/businesses/{id}/resign', [ResignationController::class, 'store']);
             Route::post('/businesses/{id}/resignation-requests/{requestId}/cancel', [ResignationController::class, 'cancel']);
             Route::post('/businesses/{id}/resignation-requests/{requestId}/approve', [ResignationController::class, 'approve']);
             Route::post('/businesses/{id}/resignation-requests/{requestId}/reject', [ResignationController::class, 'reject']);
+            Route::post('/resignation-requests/{requestId}/approve', [ResignationController::class, 'approveById']);
+            Route::post('/resignation-requests/{requestId}/reject', [ResignationController::class, 'rejectById']);
 
             // Dashboard KPI & Overdue Alerts
             Route::get('/dashboard/kpi', [DashboardController::class, 'kpi']);

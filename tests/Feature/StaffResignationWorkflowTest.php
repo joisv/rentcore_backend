@@ -441,4 +441,144 @@ class StaffResignationWorkflowTest extends TestCase
         $this->assertEquals($this->staff->id, $booking->fresh()->created_by);
         $this->assertEquals($this->staff->id, $payment->fresh()->processed_by);
     }
+
+    public function test_staff_resign_alias_blocks_open_shift_and_owner_notification_review_updates_status(): void
+    {
+        $this->staff->update(['affiliate_id' => $this->branch->id]);
+
+        // Open shift blocks resign submission
+        $shift = CashDrawerShift::create([
+            'business_id' => $this->business->id,
+            'branch_id' => $this->branch->id,
+            'opened_by' => $this->staff->id,
+            'shift_number' => 'SHF-RESIGN-001',
+            'status' => 'open',
+            'opened_at' => Carbon::now(),
+            'opening_cash_float' => 100000,
+        ]);
+
+        $staffToken = $this->staff->createToken('staff')->plainTextToken;
+
+        $statusEmpty = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->getJson("/api/v1/businesses/{$this->business->id}/resign-status");
+        $statusEmpty->assertStatus(200)->assertJsonPath('data', null);
+
+        $blockedResign = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/businesses/{$this->business->id}/resign", [
+            'reason' => 'Ingin fokus usaha sendiri',
+        ]);
+        $blockedResign->assertStatus(422)
+            ->assertJsonPath('message', 'Tutup shift kasir aktif Anda terlebih dahulu sebelum mengajukan resign.');
+
+        // Close shift -> resign succeeds & dispatches Owner notification
+        $shift->update(['status' => 'closed', 'closed_at' => Carbon::now()]);
+
+        $resignResp = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/businesses/{$this->business->id}/resign", [
+            'reason' => 'Ingin fokus usaha sendiri',
+        ]);
+        $resignResp->assertStatus(201);
+        $requestId = $resignResp->json('data.id');
+
+        // Verify resign-status reflects pending
+        $statusPending = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->getJson("/api/v1/businesses/{$this->business->id}/resign-status");
+        $statusPending->assertStatus(200)
+            ->assertJsonPath('data.status', 'pending')
+            ->assertJsonPath('data.reason', 'Ingin fokus usaha sendiri');
+
+        // Verify Owner notification payload created cleanly
+        $ownerNotif = \App\Models\TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $this->business->id)
+            ->where('user_id', $this->owner->id)
+            ->where('type', 'staff.resignation_submitted')
+            ->first();
+        $this->assertNotNull($ownerNotif);
+        $this->assertEquals($requestId, $ownerNotif->action_payload['resignation_request_id']);
+        $this->assertEquals('pending', $ownerNotif->action_payload['status']);
+        $this->assertEquals($this->branch->name, $ownerNotif->action_payload['branch_name']);
+
+        // Owner approves via /api/v1/resignation-requests/{id}/approve
+        $this->flushHeaders();
+        app('auth')->forgetGuards();
+        $ownerToken = $this->owner->createToken('owner')->plainTextToken;
+
+        $approveResp = $this->withHeaders([
+            'Authorization' => "Bearer $ownerToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/resignation-requests/{$requestId}/approve");
+        $approveResp->assertStatus(200)
+            ->assertJsonPath('data.status', 'approved');
+
+        // Staff membership deactivated, left_at set, legacy affiliate_id cleared
+        $freshMember = $this->staffMembership->fresh();
+        $this->assertFalse($freshMember->is_active);
+        $this->assertNotNull($freshMember->left_at);
+        $this->assertNull($this->staff->fresh()->affiliate_id);
+
+        // Owner notification updated to approved and marked read
+        $freshOwnerNotif = $ownerNotif->fresh();
+        $this->assertEquals('approved', $freshOwnerNotif->action_payload['status']);
+        $this->assertNotNull($freshOwnerNotif->read_at);
+
+        // Staff notification created with approved decision
+        $staffNotif = \App\Models\TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $this->business->id)
+            ->where('user_id', $this->staff->id)
+            ->where('type', 'staff.resignation_approved')
+            ->first();
+        $this->assertNotNull($staffNotif);
+        $this->assertEquals('approved', $staffNotif->action_payload['status']);
+    }
+
+    public function test_owner_reject_by_id_accepts_rejection_reason_and_updates_notifications(): void
+    {
+        $staffToken = $this->staff->createToken('staff')->plainTextToken;
+        $resignResp = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/businesses/{$this->business->id}/resign", [
+            'reason' => 'Butuh libur panjang',
+        ]);
+        $requestId = $resignResp->json('data.id');
+
+        $this->flushHeaders();
+        app('auth')->forgetGuards();
+        $ownerToken = $this->owner->createToken('owner')->plainTextToken;
+
+        $rejectResp = $this->withHeaders([
+            'Authorization' => "Bearer $ownerToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/resignation-requests/{$requestId}/reject", [
+            'rejection_reason' => 'Periode high season akhir bulan',
+        ]);
+        $rejectResp->assertStatus(200)
+            ->assertJsonPath('data.status', 'rejected')
+            ->assertJsonPath('data.decision_notes', 'Periode high season akhir bulan');
+
+        $ownerNotif = \App\Models\TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $this->business->id)
+            ->where('user_id', $this->owner->id)
+            ->where('type', 'staff.resignation_submitted')
+            ->first();
+        $this->assertEquals('rejected', $ownerNotif->action_payload['status']);
+        $this->assertNotNull($ownerNotif->read_at);
+
+        $staffNotif = \App\Models\TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $this->business->id)
+            ->where('user_id', $this->staff->id)
+            ->where('type', 'staff.resignation_rejected')
+            ->first();
+        $this->assertNotNull($staffNotif);
+        $this->assertEquals('rejected', $staffNotif->action_payload['status']);
+        $this->assertStringContainsString('Periode high season akhir bulan', $staffNotif->body);
+    }
 }

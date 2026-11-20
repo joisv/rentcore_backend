@@ -18,11 +18,13 @@ class BusinessMember extends Model
         'is_active',
         'invited_by',
         'joined_at',
+        'left_at',
     ];
 
     protected $casts = [
         'is_active' => 'boolean',
         'joined_at' => 'datetime',
+        'left_at' => 'datetime',
     ];
 
     public function business(): BelongsTo

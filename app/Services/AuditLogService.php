@@ -18,12 +18,10 @@ class AuditLogService
         ?array $newValues = null,
         ?array $oldValues = null,
         ?string $ipAddress = null,
-        ?int $affiliateId = null
+        ?int $affiliateId = null,
+        ?int $businessId = null
     ): AuditLog {
-        $businessId = app(\App\Tenancy\TenantContext::class)->getBusinessId();
-        if (!$businessId && $user) {
-            $businessId = $user->businesses()->first()?->id;
-        }
+        $businessId = $businessId ?? app(\App\Tenancy\TenantContext::class)->getBusinessId();
         if (!$businessId && $affiliateId) {
             $businessId = \App\Models\Affiliate::withoutGlobalScopes()->find($affiliateId)?->business_id;
         }

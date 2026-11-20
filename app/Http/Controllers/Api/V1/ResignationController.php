@@ -3,12 +3,14 @@
 namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
+use App\Models\Affiliate;
 use App\Models\BranchMember;
 use App\Models\Business;
 use App\Models\BusinessMember;
 use App\Models\CashDrawerShift;
 use App\Models\InventoryTransfer;
 use App\Models\StaffResignationRequest;
+use App\Models\User;
 use App\Services\AuditLogService;
 use App\Services\NotificationService;
 use App\Tenancy\TenantContext;
@@ -16,6 +18,7 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 
 class ResignationController extends Controller
@@ -66,6 +69,50 @@ class ResignationController extends Controller
         return response()->json([
             'success' => true,
             'data' => $requests,
+        ]);
+    }
+
+    /**
+     * Get the authenticated staff member's latest resignation status for a business.
+     */
+    public function status(Request $request, int $id): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ?: $context->getBusinessId();
+        $user = $request->user();
+
+        $business = Business::findOrFail($businessId);
+
+        $member = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if (!$member && $business->owner_id !== $user->id && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akses ditolak. Anda bukan anggota aktif dari bisnis rental ini.',
+            ], 403);
+        }
+
+        $latest = StaffResignationRequest::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        return response()->json([
+            'success' => true,
+            'data' => $latest ? [
+                'id' => $latest->id,
+                'business_id' => $latest->business_id,
+                'status' => $latest->status,
+                'reason' => $latest->reason,
+                'decision_notes' => $latest->decision_notes,
+                'rejection_reason' => $latest->decision_notes,
+                'created_at' => $latest->created_at,
+                'decided_at' => $latest->decided_at,
+                'reviewed_at' => $latest->decided_at,
+            ] : null,
         ]);
     }
 
@@ -124,6 +171,19 @@ class ResignationController extends Controller
             ], 422);
         }
 
+        // Prevent resign submission while user still has an active open cash drawer shift
+        $hasOpenShift = CashDrawerShift::where('business_id', $businessId)
+            ->where('opened_by', $user->id)
+            ->where('status', 'open')
+            ->exists();
+
+        if ($hasOpenShift) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tutup shift kasir aktif Anda terlebih dahulu sebelum mengajukan resign.',
+            ], 422);
+        }
+
         $resignation = StaffResignationRequest::create([
             'business_id' => $businessId,
             'business_member_id' => $member->id,
@@ -139,10 +199,14 @@ class ResignationController extends Controller
             $resignation->id,
             ['reason' => $resignation->reason],
             null,
-            $request->ip()
+            $request->ip(),
+            null,
+            $businessId
         );
 
-        $this->notificationService->notifyResignationSubmitted($resignation->load('user'));
+        $this->notificationService->notifyResignationSubmitted(
+            $resignation->load(['user.affiliate', 'businessMember.branchMembers.branch'])
+        );
 
         return response()->json([
             'success' => true,
@@ -209,7 +273,7 @@ class ResignationController extends Controller
         $business = Business::findOrFail($businessId);
 
         // Security check: strictly Owner of the business
-        if ($business->owner_id !== $user->id && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+        if (!$this->isAuthorizedOwner($user, $business)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Hanya Owner bisnis yang berwenang menyetujui permohonan resign staf.',
@@ -264,7 +328,22 @@ class ResignationController extends Controller
             ]);
         }
 
-        return DB::transaction(function () use ($resignation, $validated, $user, $request) {
+        return DB::transaction(function () use ($resignation, $validated, $user, $request, $businessId) {
+            $stillOpenShift = CashDrawerShift::where('business_id', $businessId)
+                ->where('opened_by', $resignation->user_id)
+                ->where('status', 'open')
+                ->lockForUpdate()
+                ->exists();
+
+            if ($stillOpenShift) {
+                throw ValidationException::withMessages([
+                    'shift' => [
+                        'Staf masih memiliki shift kasir yang sedang aktif. ' .
+                        'Tutup dan rekonsiliasi shift kasir terlebih dahulu sebelum menyetujui pengunduran diri.'
+                    ],
+                ]);
+            }
+
             $resignation->update([
                 'status' => 'approved',
                 'decision_notes' => $validated['decision_notes'] ?? null,
@@ -276,8 +355,24 @@ class ResignationController extends Controller
             if ($member) {
                 // Remove all branch assignments
                 BranchMember::where('business_member_id', $member->id)->delete();
-                // Deactivate business membership
-                $member->update(['is_active' => false]);
+                // Deactivate business membership cleanly
+                $memberUpdates = ['is_active' => false];
+                if (Schema::hasColumn('business_members', 'left_at')) {
+                    $memberUpdates['left_at'] = Carbon::now();
+                }
+                $member->update($memberUpdates);
+            }
+
+            // Clear legacy affiliate_id if it belonged to this business
+            $staffUser = $resignation->user;
+            if ($staffUser && $staffUser->affiliate_id) {
+                $belongsToBusiness = Affiliate::withoutGlobalScopes()
+                    ->where('id', $staffUser->affiliate_id)
+                    ->where('business_id', $businessId)
+                    ->exists();
+                if ($belongsToBusiness) {
+                    $staffUser->update(['affiliate_id' => null]);
+                }
             }
 
             AuditLogService::log(
@@ -290,9 +385,12 @@ class ResignationController extends Controller
                     'decision_notes' => $resignation->decision_notes,
                 ],
                 null,
-                $request->ip()
+                $request->ip(),
+                null,
+                $businessId
             );
 
+            $this->notificationService->markResignationNotificationDecided($resignation);
             $this->notificationService->notifyResignationDecided($resignation);
 
             return response()->json([
@@ -315,7 +413,7 @@ class ResignationController extends Controller
         $business = Business::findOrFail($businessId);
 
         // Security check: strictly Owner of the business
-        if ($business->owner_id !== $user->id && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+        if (!$this->isAuthorizedOwner($user, $business)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Hanya Owner bisnis yang berwenang menolak permohonan resign staf.',
@@ -335,11 +433,13 @@ class ResignationController extends Controller
 
         $validated = $request->validate([
             'decision_notes' => 'nullable|string|max:1000',
+            'rejection_reason' => 'nullable|string|max:1000',
         ]);
+        $decisionNotes = $validated['decision_notes'] ?? $validated['rejection_reason'] ?? null;
 
         $resignation->update([
             'status' => 'rejected',
-            'decision_notes' => $validated['decision_notes'] ?? null,
+            'decision_notes' => $decisionNotes,
             'decided_by' => $user->id,
             'decided_at' => Carbon::now(),
         ]);
@@ -354,9 +454,12 @@ class ResignationController extends Controller
                 'decision_notes' => $resignation->decision_notes,
             ],
             null,
-            $request->ip()
+            $request->ip(),
+            null,
+            $businessId
         );
 
+        $this->notificationService->markResignationNotificationDecided($resignation);
         $this->notificationService->notifyResignationDecided($resignation);
 
         return response()->json([
@@ -364,5 +467,36 @@ class ResignationController extends Controller
             'message' => 'Permohonan resign ditolak. Keanggotaan staf tetap aktif.',
             'data' => $resignation->fresh(['user', 'businessMember', 'decidedBy']),
         ]);
+    }
+
+    /**
+     * Approve a resignation request directly by ID (used from owner notifications).
+     */
+    public function approveById(Request $request, int $requestId): JsonResponse
+    {
+        $resignation = StaffResignationRequest::findOrFail($requestId);
+        return $this->approve($request, (int)$resignation->business_id, $requestId);
+    }
+
+    /**
+     * Reject a resignation request directly by ID (used from owner notifications).
+     */
+    public function rejectById(Request $request, int $requestId): JsonResponse
+    {
+        $resignation = StaffResignationRequest::findOrFail($requestId);
+        return $this->reject($request, (int)$resignation->business_id, $requestId);
+    }
+
+    private function isAuthorizedOwner(User $user, Business $business): bool
+    {
+        if ($business->owner_id === $user->id || $user->isPlatformAdmin() || $user->isSuperAdmin()) {
+            return true;
+        }
+
+        return BusinessMember::where('business_id', $business->id)
+            ->where('user_id', $user->id)
+            ->where('role', 'owner')
+            ->where('is_active', true)
+            ->exists();
     }
 }

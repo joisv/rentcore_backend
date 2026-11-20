@@ -105,16 +105,45 @@ class CashierController extends Controller
         ]);
 
         $user = $request->user();
-        $booking = Booking::withoutGlobalScopes()
-            ->with(['customer', 'items.asset.model', 'payments.paymentMethod', 'returnInspection', 'affiliate'])
-            ->findOrFail($request->booking_id);
+        $tenantContext = app(TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
 
-        // Enforce franchise multi-tenant isolation
-        if ($user && $user->affiliate_id && !$user->isSuperAdmin() && $booking->affiliate_id !== $user->affiliate_id) {
+        if (!$businessId && (!$user || !$user->isSuperAdmin())) {
             return response()->json([
                 'success' => false,
-                'message' => 'Anda tidak memiliki hak akses untuk memproses pembayaran cabang lain.',
+                'message' => 'Konteks bisnis tidak valid.',
             ], 403);
+        }
+
+        $bookingQuery = Booking::query()
+            ->with(['customer', 'items.asset.model', 'payments.paymentMethod', 'returnInspection', 'affiliate']);
+
+        if ($businessId) {
+            $bookingQuery->where('business_id', $businessId);
+        }
+
+        $booking = $bookingQuery->findOrFail($request->booking_id);
+
+        // Enforce multi-tenant & branch-level authorization
+        if ($user && !$user->isSuperAdmin()) {
+            $membership = $user->getBusinessMembership($booking->business_id);
+            $allowedBranchIds = $user->getBranchIdsForBusiness($booking->business_id);
+
+            if (!$membership && $user->affiliate_id && (int)$booking->affiliate_id !== (int)$user->affiliate_id) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Anda tidak memiliki hak akses untuk memproses pembayaran cabang lain.',
+                ], 403);
+            }
+
+            if ($membership && !$membership->isOwner() && !empty($allowedBranchIds)
+                && !in_array((int)$booking->affiliate_id, array_map('intval', $allowedBranchIds), true)
+            ) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Anda tidak memiliki hak akses untuk memproses pembayaran cabang lain.',
+                ], 403);
+            }
         }
 
         $type = $request->get('payment_type', 'settlement');
@@ -865,15 +894,30 @@ class CashierController extends Controller
         }
 
         $cashReconciliation = [
+            'is_blind_close' => $hasOpenShift,
             'opening_cash_float' => (float)$openingFloat,
-            'net_cash_revenue' => (float)($drawerCashInflow - $drawerCashOutflow),
-            'cash_drawer_expenses' => (float)$cashDrawerExpenses,
             'active_shift' => $activeShiftData,
         ];
 
-        // Only expose expected_cash_in_drawer when no open shift is enforcing blind close.
-        // Aggregate opening_cash_float across all shifts in the date range + cash inflows - outflows - cash_drawer expenses.
-        if (!$hasOpenShift) {
+        // Full True Blind Close: only expose cash drawer totals when no open shift is active.
+        if ($hasOpenShift) {
+            foreach ($breakdown as $methodKey => &$methodStats) {
+                $lowerKey = strtolower((string)$methodKey);
+                if ($lowerKey === 'cash' || str_contains($lowerKey, 'tunai')) {
+                    $methodStats['total'] = null;
+                    $methodStats['is_blind_close'] = true;
+                }
+            }
+            unset($methodStats);
+
+            foreach ($branchBreakdownList as &$branchItem) {
+                if ((int)$branchItem['branch_id'] === (int)$targetBranchId) {
+                    $branchItem['cash_revenue'] = null;
+                    $branchItem['is_blind_close'] = true;
+                }
+            }
+            unset($branchItem);
+        } else {
             $periodShifts = \App\Models\CashDrawerShift::query()
                 ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
                 ->when($targetBranchId !== null, fn ($q) => $q->where('branch_id', $targetBranchId))
@@ -893,6 +937,7 @@ class CashierController extends Controller
                 : (float)$cashDrawerExpenses;
 
             $cashReconciliation['opening_cash_float'] = $openingFloat;
+            $cashReconciliation['net_cash_revenue'] = (float)($drawerCashInflow - $drawerCashOutflow);
             $cashReconciliation['cash_drawer_expenses'] = $periodDrawerExpenses;
             $cashReconciliation['expected_cash_in_drawer'] = (float)max(
                 0.00,
@@ -960,26 +1005,32 @@ class CashierController extends Controller
             ];
         });
 
+        $responseData = [
+            'branch_id' => $targetBranchId,
+            'is_consolidated' => $targetBranchId === null,
+            'is_blind_close' => $hasOpenShift,
+            'date' => $dateLabel,
+            'start_date' => $bounds['start_date'],
+            'end_date' => $bounds['end_date'],
+            'timezone' => $tz,
+            'total_revenue' => (float)$totalRevenue,
+            'total_transactions' => (int)$totalTransactions,
+            'total_expenses' => (float)$totalExpenses,
+            'expense_breakdown' => (object)$expenseCategoryBreakdown,
+            'cash_reconciliation' => $cashReconciliation,
+            'breakdown_by_type' => (object)$typeBreakdown,
+            'breakdown_by_method' => (object)$breakdown,
+            'breakdown_by_branch' => $branchBreakdownList,
+            'recent_transactions' => $recentTransactions,
+        ];
+
+        if (!$hasOpenShift) {
+            $responseData['cash_drawer_expenses'] = (float)$cashDrawerExpenses;
+        }
+
         return response()->json([
             'success' => true,
-            'data' => [
-                'branch_id' => $targetBranchId,
-                'is_consolidated' => $targetBranchId === null,
-                'date' => $dateLabel,
-                'start_date' => $bounds['start_date'],
-                'end_date' => $bounds['end_date'],
-                'timezone' => $tz,
-                'total_revenue' => (float)$totalRevenue,
-                'total_transactions' => (int)$totalTransactions,
-                'total_expenses' => (float)$totalExpenses,
-                'cash_drawer_expenses' => (float)$cashDrawerExpenses,
-                'expense_breakdown' => (object)$expenseCategoryBreakdown,
-                'cash_reconciliation' => $cashReconciliation,
-                'breakdown_by_type' => (object)$typeBreakdown,
-                'breakdown_by_method' => (object)$breakdown,
-                'breakdown_by_branch' => $branchBreakdownList,
-                'recent_transactions' => $recentTransactions,
-            ],
+            'data' => $responseData,
         ]);
     }
 
