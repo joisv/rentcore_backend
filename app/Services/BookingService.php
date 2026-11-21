@@ -181,6 +181,42 @@ class BookingService
                 }
             }
 
+            // 2a. Resolve Rental Window & Lock Model/Branch Inventory Against Concurrent Double-Booking
+            $durationUnit = $data['duration_unit'] ?? 'hour';
+            $durationValue = (int)($data['duration_value'] ?? $data['duration_hours'] ?? 1);
+            if (!empty($data['duration_hours']) && empty($data['duration_unit'])) {
+                $durationUnit = 'hour';
+                $durationValue = (int)$data['duration_hours'];
+            }
+            $durationHours = $this->pricingService->computeDurationHours($durationUnit, $durationValue);
+            $startAt = !empty($data['start_at']) ? Carbon::parse($data['start_at'])->utc() : Carbon::now()->utc();
+            $endAt = $this->pricingService->computeEndAt($startAt, $durationUnit, $durationValue);
+
+            $involvedModelIds = $assets->pluck('model_id')->filter()->map(fn ($id) => (int)$id)->unique()->values()->all();
+            if (!empty($involvedModelIds)) {
+                AssetModel::withoutGlobalScopes()
+                    ->whereIn('id', $involvedModelIds)
+                    ->lockForUpdate()
+                    ->get(['id']);
+
+                Asset::withoutGlobalScopes()
+                    ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+                    ->where('affiliate_id', $affiliateId)
+                    ->whereIn('model_id', $involvedModelIds)
+                    ->lockForUpdate()
+                    ->get(['id']);
+            }
+
+            $this->availabilityService->assertAssetsAvailableForWindow(
+                $affiliateId,
+                (int)($businessId ?? $affiliate->business_id),
+                $assets,
+                $startAt,
+                $endAt,
+                null,
+                'asset_ids'
+            );
+
             // Classify assets into primary devices and add-on items
             $rawAddonInts = array_map('intval', $rawAddonIds);
             $primaryAssets = [];
@@ -260,16 +296,7 @@ class BookingService
                 }
             }
 
-            // 3. Duration & Time Calculation
-            $durationUnit = $data['duration_unit'] ?? 'hour';
-            $durationValue = (int)($data['duration_value'] ?? $data['duration_hours'] ?? 1);
-            if (!empty($data['duration_hours']) && empty($data['duration_unit'])) {
-                $durationUnit = 'hour';
-                $durationValue = (int)$data['duration_hours'];
-            }
-            $durationHours = $this->pricingService->computeDurationHours($durationUnit, $durationValue);
-            $startAt = !empty($data['start_at']) ? Carbon::parse($data['start_at'])->utc() : Carbon::now()->utc();
-            $endAt = $this->pricingService->computeEndAt($startAt, $durationUnit, $durationValue);
+            // 3. Duration & Time Calculation (already resolved in step 2a for overlap check)
 
             // 4. Subtotal calculation based on Pricing Tiers or default rates
             $primarySubtotal = 0.00;
@@ -562,7 +589,12 @@ class BookingService
                     ]);
                 }
 
-                // Serialize concurrent bookings at the branch level by locking branch assets of this model
+                // Serialize concurrent bookings at the branch level by locking target model & branch assets
+                AssetModel::withoutGlobalScopes()
+                    ->where('id', $model->id)
+                    ->lockForUpdate()
+                    ->get(['id']);
+
                 Asset::withoutGlobalScopes()
                     ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
                     ->where('affiliate_id', $affiliateId)
@@ -586,8 +618,16 @@ class BookingService
                 }
 
                 if ($capacity['available_slots'] < 1) {
+                    $conflict = $this->availabilityService->findEarliestConflictForModel(
+                        $affiliateId,
+                        (int) $model->id,
+                        $startAt,
+                        $endAt,
+                        null,
+                        $businessId ? (int) $businessId : null
+                    );
                     throw ValidationException::withMessages([
-                        'asset_model_id' => ["Slot model {$model->name} untuk jadwal yang dipilih sudah penuh (Tersedia: 0)."],
+                        'asset_model_id' => [$this->availabilityService->buildConflictMessage($model->name, $conflict, $affiliateId)],
                     ]);
                 }
 
@@ -642,36 +682,38 @@ class BookingService
                     }
                 }
 
+                $involvedModelIds = $primaryAssets->pluck('model_id')->filter()->map(fn ($id) => (int) $id)->unique()->values()->all();
+                if (!empty($involvedModelIds)) {
+                    AssetModel::withoutGlobalScopes()
+                        ->whereIn('id', $involvedModelIds)
+                        ->lockForUpdate()
+                        ->get(['id']);
+
+                    Asset::withoutGlobalScopes()
+                        ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+                        ->where('affiliate_id', $affiliateId)
+                        ->whereIn('model_id', $involvedModelIds)
+                        ->lockForUpdate()
+                        ->get(['id']);
+                }
+
                 foreach ($primaryAssets as $asset) {
                     if (!in_array($asset->status, BookingAvailabilityService::RENTABLE_ASSET_STATUSES, true)) {
                         throw ValidationException::withMessages([
                             'asset_ids' => ["Perangkat {$asset->asset_code} tidak dapat dibooking (status: {$asset->status})."],
                         ]);
                     }
-                    if (!$this->pricingService->isAssetAvailable($asset, $startAt, $endAt)) {
-                        throw ValidationException::withMessages([
-                            'asset_ids' => ["Perangkat {$asset->asset_code} sudah memiliki jadwal sewa lain pada waktu tersebut."],
-                        ]);
-                    }
-                    $cap = $this->availabilityService->getBranchModelCapacity(
-                        $affiliateId,
-                        (int) $asset->model_id,
-                        $startAt,
-                        $endAt,
-                        null,
-                        $businessId ? (int) $businessId : null
-                    );
-                    if ($cap['total_units'] < 1) {
-                        throw ValidationException::withMessages([
-                            'asset_ids' => ['Unit atau model tidak tersedia di cabang ini pada jadwal yang dipilih.'],
-                        ]);
-                    }
-                    if ($cap['available_slots'] < 1) {
-                        throw ValidationException::withMessages([
-                            'asset_ids' => ["Kapasitas model {$asset->model?->name} pada jadwal tersebut sudah penuh."],
-                        ]);
-                    }
                 }
+
+                $this->availabilityService->assertAssetsAvailableForWindow(
+                    $affiliateId,
+                    (int) ($businessId ?? $affiliate->business_id),
+                    $primaryAssets,
+                    $startAt,
+                    $endAt,
+                    null,
+                    'asset_ids'
+                );
 
                 $firstPrimary = $primaryAssets->first();
                 $primaryModelId = (int) ($requestedModelId ?? $firstPrimary->model_id);

@@ -141,8 +141,8 @@ class BusinessController extends Controller
                 'slug' => $uniqueSlug,
                 'phone' => $validated['phone'] ?? $user->phone,
                 'email' => $validated['email'] ?? $user->email,
-                'address' => $validated['address'] ?? null,
-                'city' => $validated['city'] ?? null,
+                'address' => filled($validated['address'] ?? null) ? $validated['address'] : null,
+                'city' => filled($validated['city'] ?? null) ? $validated['city'] : null,
                 'business_categories' => $validated['business_categories'] ?? null,
                 'branch_structure' => $validated['branch_structure'] ?? 'single_location',
                 'has_completed_onboarding' => true,
@@ -173,8 +173,8 @@ class BusinessController extends Controller
                 'name' => $branchName,
                 'slug' => Str::slug($business->name . '-' . $branchCode),
                 'phone' => $business->phone,
-                'address' => $business->address,
-                'city' => $business->city,
+                'address' => $business->address ?: null,
+                'city' => $business->city ?: null,
                 'is_central' => true,
                 'is_active' => true,
             ]);
@@ -302,7 +302,36 @@ class BusinessController extends Controller
             'has_completed_onboarding' => 'nullable|boolean',
         ]);
 
-        $business->update(array_filter($validated, fn($v) => $v !== null));
+        $oldName = $business->name;
+
+        $updates = [];
+        if (filled($validated['name'] ?? null)) {
+            $updates['name'] = trim($validated['name']);
+        }
+        foreach (['slogan', 'phone', 'email', 'address', 'city'] as $nullableField) {
+            if ($request->exists($nullableField)) {
+                $updates[$nullableField] = $validated[$nullableField] ?? null;
+            }
+        }
+        foreach (['business_categories', 'branch_structure', 'has_completed_onboarding'] as $optField) {
+            if (array_key_exists($optField, $validated) && $validated[$optField] !== null) {
+                $updates[$optField] = $validated[$optField];
+            }
+        }
+
+        if (!empty($updates)) {
+            $business->update($updates);
+        }
+
+        if (isset($updates['name']) && $updates['name'] !== $oldName) {
+            Affiliate::withoutGlobalScopes()
+                ->where('business_id', $business->id)
+                ->where('is_central', true)
+                ->where('name', $oldName . ' Pusat')
+                ->update(['name' => $updates['name'] . ' Pusat']);
+        }
+
+        $business = $business->fresh(['branches']);
 
         return response()->json([
             'success' => true,
@@ -625,9 +654,9 @@ class BusinessController extends Controller
             'code' => $code,
             'name' => $validated['name'],
             'slug' => Str::slug($business->name . '-' . $code),
-            'phone' => $validated['phone'] ?? $business->phone,
-            'address' => $validated['address'] ?? $business->address,
-            'city' => $validated['city'] ?? $business->city,
+            'phone' => filled($validated['phone'] ?? null) ? $validated['phone'] : $business->phone,
+            'address' => filled($validated['address'] ?? null) ? $validated['address'] : null,
+            'city' => filled($validated['city'] ?? null) ? $validated['city'] : null,
             'is_central' => false,
             'royalty_percentage' => $validated['royalty_percentage'] ?? 0.00,
             'is_active' => true,
@@ -638,6 +667,67 @@ class BusinessController extends Controller
             'message' => 'Cabang baru berhasil ditambahkan.',
             'data' => $branch,
         ], 201);
+    }
+
+    /**
+     * Update branch details (Owner or Admin only).
+     */
+    public function updateBranch(Request $request, int $id, int $branchId): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ?: $context->getBusinessId();
+        $user = $request->user();
+
+        $currentMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$currentMember || !$currentMember->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berwenang mengubah data cabang.',
+            ], 403);
+        }
+
+        $branch = Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+            ->where('business_id', $businessId)
+            ->findOrFail($branchId);
+
+        $validated = $request->validate([
+            'name' => 'required|string|max:150',
+            'code' => 'required|string|max:10',
+            'phone' => 'nullable|string|max:30',
+            'address' => 'nullable|string',
+            'city' => 'nullable|string|max:100',
+        ]);
+
+        $code = strtoupper(trim($validated['code']));
+        $duplicateExists = Affiliate::withoutGlobalScope(\App\Scopes\TenantScope::class)
+            ->where('business_id', $businessId)
+            ->where('code', $code)
+            ->where('id', '!=', $branch->id)
+            ->exists();
+
+        if ($duplicateExists) {
+            throw ValidationException::withMessages([
+                'code' => ['Kode cabang sudah digunakan di bisnis Anda.'],
+            ]);
+        }
+
+        $branch->update([
+            'name' => trim($validated['name']),
+            'code' => $code,
+            'phone' => filled($validated['phone'] ?? null) ? trim($validated['phone']) : null,
+            'address' => filled($validated['address'] ?? null) ? trim($validated['address']) : null,
+            'city' => filled($validated['city'] ?? null) ? trim($validated['city']) : null,
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Informasi cabang berhasil diperbarui.',
+            'data' => $branch->fresh(),
+        ]);
     }
 
     /**

@@ -39,4 +39,10 @@ return [
         'client_id' => env('GOOGLE_CLIENT_ID'),
     ],
 
+    'telegram_alerts' => [
+        'enabled' => filter_var(env('TELEGRAM_ERROR_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+        'bot_token' => env('TELEGRAM_ERROR_BOT_TOKEN'),
+        'chat_id' => env('TELEGRAM_ERROR_CHAT_ID'),
+    ],
+
 ];

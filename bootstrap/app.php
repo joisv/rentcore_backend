@@ -17,6 +17,17 @@ return Application::configure(basePath: dirname(__DIR__))
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->report(function (\Throwable $e): void {
+            try {
+                app(\App\Services\TelegramAlertService::class)->reportException(
+                    $e,
+                    app()->bound('request') ? request() : null,
+                );
+            } catch (\Throwable) {
+                // Never let alerting errors interrupt API responses
+            }
+        });
+
         $exceptions->shouldRenderJsonWhen(function (\Illuminate\Http\Request $request, Throwable $e) {
             return $request->is('api/*') || $request->expectsJson();
         });

@@ -113,6 +113,8 @@ class BusinessMember extends Model
             'code' => $b->code,
             'name' => $b->name,
             'city' => $b->city,
+            'address' => $b->address,
+            'phone' => $b->phone,
             'is_central' => (bool) $b->is_central,
             'payment_methods_config_override' => $b->payment_methods_config_override,
             'qris_raw_payload' => $b->qris_raw_payload,

@@ -182,15 +182,20 @@ class AssetController extends Controller
               ->orderBy('assets.id', 'desc');
 
         if ($hasScheduleWindow) {
-            $startAt = \Carbon\Carbon::parse($request->start_at);
-            $endAt = \Carbon\Carbon::parse($request->end_at);
-            $pricingService = app(\App\Services\PricingService::class);
-            $collection = $query->get()->unique('id')->values()->map(function (Asset $asset) use ($pricingService, $startAt, $endAt) {
-                $asset->setAttribute('is_available_for_schedule', $pricingService->isAssetAvailable($asset, $startAt, $endAt));
+            $startAt = \Carbon\Carbon::parse($request->start_at)->utc();
+            $endAt = \Carbon\Carbon::parse($request->end_at)->utc();
+            $availabilityService = app(\App\Services\BookingAvailabilityService::class);
+            $collection = $query->get()->unique('id')->values()->map(function (Asset $asset) use ($availabilityService, $startAt, $endAt) {
+                $eval = $availabilityService->evaluateAssetWindowAvailability($asset, $startAt, $endAt);
+                $asset->setAttribute('is_available_for_schedule', $eval['is_available']);
+                $asset->setAttribute('is_available_for_window', $eval['is_available']);
+                $asset->setAttribute('conflict_reason', $eval['conflict_reason']);
+                $asset->setAttribute('conflict_start', $eval['conflict_start']);
+                $asset->setAttribute('conflict_end', $eval['conflict_end']);
                 return $asset;
             });
             if ($request->boolean('available_only', false)) {
-                $collection = $collection->filter(fn (Asset $a) => (bool) $a->getAttribute('is_available_for_schedule'))->values();
+                $collection = $collection->filter(fn (Asset $a) => (bool) $a->getAttribute('is_available_for_window'))->values();
             }
             return response()->json([
                 'success' => true,
@@ -654,7 +659,7 @@ class AssetController extends Controller
 
         $startAt = \Carbon\Carbon::parse($request->start_at)->utc();
         $endAt = \Carbon\Carbon::parse($request->end_at)->utc();
-        $pricingService = app(\App\Services\PricingService::class);
+        $availabilityService = app(\App\Services\BookingAvailabilityService::class);
 
         $results = [];
         $allAvailable = true;
@@ -677,9 +682,12 @@ class AssetController extends Controller
             ->whereIn('id', $request->asset_ids)
             ->get();
         foreach ($assets as $asset) {
-            $isAvailable = $pricingService->isAssetAvailable($asset, $startAt, $endAt);
+            $eval = $availabilityService->evaluateAssetWindowAvailability($asset, $startAt, $endAt);
+            $isAvailable = $eval['is_available'];
+            $conflictReason = $eval['conflict_reason'];
             if ($branchId && (int)$asset->affiliate_id !== (int)$branchId) {
                 $isAvailable = false;
+                $conflictReason = 'Unit tidak berada di cabang yang dipilih.';
             }
             if (!$isAvailable) {
                 $allAvailable = false;
@@ -691,6 +699,10 @@ class AssetController extends Controller
                 'status' => $asset->status,
                 'affiliate_id' => $asset->affiliate_id,
                 'is_available' => $isAvailable,
+                'is_available_for_window' => $isAvailable,
+                'conflict_reason' => $conflictReason,
+                'conflict_start' => $eval['conflict_start'],
+                'conflict_end' => $eval['conflict_end'],
             ];
         }
 

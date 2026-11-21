@@ -159,44 +159,8 @@ class PricingService
      */
     public function isAssetAvailable(Asset $asset, Carbon $startAt, Carbon $endAt, ?int $excludeBookingId = null): bool
     {
-        if (!in_array($asset->status, ['ready', 'reserved', 'rented'])) {
-            return false;
-        }
-
-        // Assets with an active stock transfer (pending approval or in transit) are unavailable
-        $hasActiveTransfer = \App\Models\InventoryTransfer::withoutGlobalScopes()
-            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
-            ->where('asset_id', $asset->id)
-            ->whereIn('status', ['pending', 'in_transit'])
-            ->exists();
-
-        if ($hasActiveTransfer) {
-            return false;
-        }
-
-        $collisionQuery = Booking::withoutGlobalScopes()
-            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
-            ->when($asset->affiliate_id, fn ($q) => $q->where('affiliate_id', $asset->affiliate_id))
-            ->whereIn('status', ['reserved', 'booked', 'confirmed', 'rented', 'active'])
-            ->where(function ($bq) use ($asset) {
-                $bq->where('asset_unit_id', $asset->id)
-                   ->orWhereHas('items', function ($iq) use ($asset) {
-                       $iq->where('asset_id', $asset->id)
-                          ->where(function ($sq) {
-                              $sq->whereNull('status')->orWhere('status', 'active');
-                          });
-                   });
-            })
-            ->where(function ($tq) use ($startAt, $endAt) {
-                $tq->where('start_at', '<', $endAt)
-                   ->where('end_at', '>', $startAt);
-            });
-
-        if ($excludeBookingId) {
-            $collisionQuery->where('id', '!=', $excludeBookingId);
-        }
-
-        return !$collisionQuery->exists();
+        return app(BookingAvailabilityService::class)
+            ->isAssetAvailableForWindow($asset, $startAt, $endAt, $excludeBookingId);
     }
 
     /**

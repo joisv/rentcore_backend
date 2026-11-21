@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\V1\AppConfigController;
 use App\Http\Controllers\Api\V1\AssetController;
 use App\Http\Controllers\Api\V1\AuditLogController;
 use App\Http\Controllers\Api\V1\AuthController;
@@ -29,6 +30,9 @@ use Illuminate\Support\Facades\Route;
 */
 
 Route::prefix('v1')->group(function () {
+
+    // --- Public App Version & Maintenance Gate ---
+    Route::get('/app-config', [AppConfigController::class, 'show']);
 
     // --- Authentication (Public) ---
     Route::middleware('throttle:auth')->group(function () {
@@ -71,6 +75,8 @@ Route::prefix('v1')->group(function () {
             Route::put('/businesses/{id}/members/{memberId}/pin', [BusinessController::class, 'setManagerPin']);
             Route::delete('/businesses/{id}/members/{memberId}/pin', [BusinessController::class, 'revokeManagerPin']);
             Route::post('/businesses/{id}/branches', [BusinessController::class, 'addBranch']);
+            Route::put('/businesses/{id}/branches/{branchId}', [BusinessController::class, 'updateBranch']);
+            Route::patch('/businesses/{id}/branches/{branchId}', [BusinessController::class, 'updateBranch']);
 
             // Staff Resignation Lifecycle
             Route::get('/businesses/{id}/resignation-requests', [ResignationController::class, 'index']);

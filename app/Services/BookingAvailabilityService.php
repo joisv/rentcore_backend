@@ -13,6 +13,7 @@ use Illuminate\Support\Collection;
 class BookingAvailabilityService
 {
     public const ACTIVE_RESERVATION_STATUSES = [
+        'pending',
         'booked',
         'reserved',
         'confirmed',
@@ -21,6 +22,7 @@ class BookingAvailabilityService
     ];
 
     public const FLOATING_RESERVATION_STATUSES = [
+        'pending',
         'booked',
         'reserved',
         'confirmed',
@@ -317,6 +319,302 @@ class BookingAvailabilityService
     }
 
     /**
+     * Check whether a specific physical asset has zero active transfers and zero
+     * pinned overlapping bookings/rentals over [startAt, endAt).
+     */
+    public function isAssetAvailableForWindow(
+        Asset $asset,
+        Carbon $startAt,
+        Carbon $endAt,
+        ?int $excludeBookingId = null
+    ): bool {
+        if (!in_array($asset->status, self::RENTABLE_ASSET_STATUSES, true)) {
+            return false;
+        }
+
+        $hasActiveTransfer = InventoryTransfer::withoutGlobalScopes()
+            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
+            ->where('asset_id', $asset->id)
+            ->whereIn('status', ['pending', 'in_transit'])
+            ->exists();
+
+        if ($hasActiveTransfer) {
+            return false;
+        }
+
+        return $this->findEarliestConflictForAsset($asset, $startAt, $endAt, $excludeBookingId) === null;
+    }
+
+    /**
+     * Evaluate full window availability for a physical unit, accounting for
+     * active transfers, pinned unit bookings, and model-level floating bookings.
+     */
+    public function evaluateAssetWindowAvailability(
+        Asset $asset,
+        Carbon $startAt,
+        Carbon $endAt,
+        ?int $excludeBookingId = null
+    ): array {
+        $modelName = $asset->model?->name ?? 'Unit';
+
+        if (!in_array($asset->status, self::RENTABLE_ASSET_STATUSES, true)) {
+            return [
+                'is_available' => false,
+                'conflict_reason' => "Perangkat {$asset->asset_code} ({$modelName}) sedang tidak siap (status: {$asset->status}).",
+                'conflict_start' => null,
+                'conflict_end' => null,
+            ];
+        }
+
+        $hasActiveTransfer = InventoryTransfer::withoutGlobalScopes()
+            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
+            ->where('asset_id', $asset->id)
+            ->whereIn('status', ['pending', 'in_transit'])
+            ->exists();
+
+        if ($hasActiveTransfer) {
+            return [
+                'is_available' => false,
+                'conflict_reason' => "Perangkat {$asset->asset_code} ({$modelName}) sedang dalam proses mutasi antar cabang.",
+                'conflict_start' => null,
+                'conflict_end' => null,
+            ];
+        }
+
+        $pinnedConflict = $this->findEarliestConflictForAsset($asset, $startAt, $endAt, $excludeBookingId);
+        if ($pinnedConflict) {
+            [$cStart, $cEnd] = $this->formatConflictWindow($pinnedConflict, (int) $asset->affiliate_id);
+            return [
+                'is_available' => false,
+                'conflict_reason' => $this->buildConflictMessage($modelName, $pinnedConflict, (int) $asset->affiliate_id),
+                'conflict_start' => $cStart,
+                'conflict_end' => $cEnd,
+            ];
+        }
+
+        if ($asset->affiliate_id && $asset->model_id) {
+            $capacity = $this->getBranchModelCapacity(
+                (int) $asset->affiliate_id,
+                (int) $asset->model_id,
+                $startAt,
+                $endAt,
+                $excludeBookingId,
+                $asset->business_id ? (int) $asset->business_id : null
+            );
+
+            if ($capacity['available_slots'] < 1) {
+                $modelConflict = $this->findEarliestConflictForModel(
+                    (int) $asset->affiliate_id,
+                    (int) $asset->model_id,
+                    $startAt,
+                    $endAt,
+                    $excludeBookingId,
+                    $asset->business_id ? (int) $asset->business_id : null
+                );
+                [$cStart, $cEnd] = $modelConflict
+                    ? $this->formatConflictWindow($modelConflict, (int) $asset->affiliate_id)
+                    : [null, null];
+
+                return [
+                    'is_available' => false,
+                    'conflict_reason' => $this->buildConflictMessage($modelName, $modelConflict, (int) $asset->affiliate_id),
+                    'conflict_start' => $cStart,
+                    'conflict_end' => $cEnd,
+                ];
+            }
+        }
+
+        return [
+            'is_available' => true,
+            'conflict_reason' => null,
+            'conflict_start' => null,
+            'conflict_end' => null,
+        ];
+    }
+
+    /**
+     * Assert that every requested asset (plus overall model capacity including
+     * floating bookings) is available over [startAt, endAt). Throws HTTP 422 on conflict.
+     */
+    public function assertAssetsAvailableForWindow(
+        int $branchId,
+        int $businessId,
+        iterable $assets,
+        Carbon $startAt,
+        Carbon $endAt,
+        ?int $excludeBookingId = null,
+        string $errorField = 'asset_ids'
+    ): void {
+        $assetCollection = collect($assets);
+        if ($assetCollection->isEmpty()) {
+            return;
+        }
+
+        $requestedCountByModel = [];
+        $modelNamesById = [];
+
+        foreach ($assetCollection as $asset) {
+            $modelName = $asset->model?->name ?? 'Unit';
+            if ($asset->model_id) {
+                $mId = (int) $asset->model_id;
+                $requestedCountByModel[$mId] = ($requestedCountByModel[$mId] ?? 0) + 1;
+                $modelNamesById[$mId] = $modelName;
+            }
+
+            $hasActiveTransfer = InventoryTransfer::withoutGlobalScopes()
+                ->when($businessId > 0, fn ($q) => $q->where('business_id', $businessId))
+                ->where('asset_id', $asset->id)
+                ->whereIn('status', ['pending', 'in_transit'])
+                ->exists();
+            if ($hasActiveTransfer) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    $errorField => ["Perangkat {$asset->asset_code} ({$modelName}) sedang dalam proses mutasi antar cabang."],
+                ]);
+            }
+
+            $pinnedConflict = $this->findEarliestConflictForAsset($asset, $startAt, $endAt, $excludeBookingId);
+            if ($pinnedConflict) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    $errorField => [$this->buildConflictMessage($modelName, $pinnedConflict, $branchId)],
+                ]);
+            }
+        }
+
+        foreach ($requestedCountByModel as $modelId => $requestedQty) {
+            $capacity = $this->getBranchModelCapacity(
+                $branchId,
+                $modelId,
+                $startAt,
+                $endAt,
+                $excludeBookingId,
+                $businessId > 0 ? $businessId : null
+            );
+
+            if ($capacity['total_units'] < $requestedQty || $capacity['available_slots'] < $requestedQty) {
+                $conflict = $this->findEarliestConflictForModel(
+                    $branchId,
+                    $modelId,
+                    $startAt,
+                    $endAt,
+                    $excludeBookingId,
+                    $businessId > 0 ? $businessId : null
+                );
+                $modelName = $modelNamesById[$modelId] ?? 'Model';
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    $errorField => [$this->buildConflictMessage($modelName, $conflict, $branchId)],
+                ]);
+            }
+        }
+    }
+
+    public function findEarliestConflictForAsset(
+        Asset $asset,
+        Carbon $startAt,
+        Carbon $endAt,
+        ?int $excludeBookingId = null
+    ): ?Booking {
+        $now = Carbon::now()->utc();
+
+        $query = Booking::withoutGlobalScopes()
+            ->when($asset->business_id, fn ($q) => $q->where('business_id', $asset->business_id))
+            ->when($asset->affiliate_id, fn ($q) => $q->where('affiliate_id', $asset->affiliate_id))
+            ->whereIn('status', self::ACTIVE_RESERVATION_STATUSES)
+            ->when($excludeBookingId, fn ($q) => $q->where('id', '!=', $excludeBookingId))
+            ->where(function ($bq) use ($asset) {
+                $bq->where('asset_unit_id', $asset->id)
+                    ->orWhereHas('items', function ($iq) use ($asset) {
+                        $iq->where('asset_id', $asset->id)
+                            ->where(function ($sq) {
+                                $sq->whereNull('status')->orWhere('status', 'active');
+                            });
+                    });
+            })
+            ->where('start_at', '<', $endAt)
+            ->where(function ($q) use ($startAt, $now) {
+                $q->where('end_at', '>', $startAt);
+                if ($now->gte($startAt)) {
+                    $q->orWhere(function ($oq) {
+                        $oq->whereIn('status', ['rented', 'active']);
+                    });
+                }
+            })
+            ->orderBy('start_at', 'asc');
+
+        return $query->first();
+    }
+
+    public function findEarliestConflictForModel(
+        int $branchId,
+        int $modelId,
+        Carbon $startAt,
+        Carbon $endAt,
+        ?int $excludeBookingId = null,
+        ?int $businessId = null
+    ): ?Booking {
+        $effectiveBusinessId = $this->resolveBranchBusinessId($branchId, $businessId);
+        if (!$effectiveBusinessId) {
+            return null;
+        }
+
+        $rentableAssetIds = Asset::withoutGlobalScopes()
+            ->where('business_id', $effectiveBusinessId)
+            ->where('affiliate_id', $branchId)
+            ->where('model_id', $modelId)
+            ->whereIn('status', self::RENTABLE_ASSET_STATUSES)
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $overlapping = $this->queryOverlappingBookings(
+            $branchId,
+            $startAt,
+            $endAt,
+            $excludeBookingId,
+            $effectiveBusinessId
+        );
+
+        foreach ($overlapping as $booking) {
+            if (!empty($this->extractPinnedAssetIdsForModel($booking, $modelId, $rentableAssetIds))) {
+                return $booking;
+            }
+            if ($this->isFloatingReservationForModel($booking, $modelId)) {
+                return $booking;
+            }
+        }
+
+        return null;
+    }
+
+    public function formatConflictWindow(Booking $booking, ?int $branchId = null): array
+    {
+        $tz = config('app.timezone', 'Asia/Jakarta');
+        if ($tz === 'UTC') {
+            $tz = 'Asia/Jakarta';
+        }
+        $startLocal = Carbon::parse($booking->start_at)->setTimezone($tz);
+        $rawEnd = Carbon::parse($booking->end_at);
+        if (in_array($booking->status, ['rented', 'active'], true) && $rawEnd->lt(Carbon::now())) {
+            $rawEnd = Carbon::now();
+        }
+        $endLocal = $rawEnd->setTimezone($tz);
+
+        return [
+            $startLocal->format('d M H:i'),
+            $endLocal->format('d M H:i'),
+        ];
+    }
+
+    public function buildConflictMessage(string $modelName, ?Booking $conflict, ?int $branchId = null): string
+    {
+        if (!$conflict) {
+            return "Stok {$modelName} tidak mencukupi untuk durasi tersebut karena seluruh unit sedang terikat jadwal sewa/booking.";
+        }
+
+        [$startStr, $endStr] = $this->formatConflictWindow($conflict, $branchId);
+        return "Stok {$modelName} tidak mencukupi untuk durasi tersebut karena sudah terikat jadwal sewa/booking pada {$startStr} - {$endStr}.";
+    }
+
+    /**
      * Query active/booked bookings overlapping [startAt, endAt] for a branch.
      */
     protected function queryOverlappingBookings(
@@ -326,7 +624,7 @@ class BookingAvailabilityService
         ?int $excludeBookingId = null,
         ?int $businessId = null
     ): Collection {
-        $now = Carbon::now();
+        $now = Carbon::now()->utc();
 
         return Booking::withoutGlobalScopes()
             ->when($businessId !== null, fn ($q) => $q->where('business_id', $businessId))
@@ -336,7 +634,7 @@ class BookingAvailabilityService
             ->where('start_at', '<', $endAt)
             ->where(function ($q) use ($startAt, $now) {
                 $q->where('end_at', '>', $startAt);
-                if ($startAt->lte($now)) {
+                if ($now->gte($startAt)) {
                     $q->orWhere(function ($oq) use ($now) {
                         $oq->whereIn('status', ['rented', 'active'])
                            ->where('end_at', '<=', $now);
@@ -351,6 +649,7 @@ class BookingAvailabilityService
                 },
                 'items.asset:id,model_id',
             ])
+            ->orderBy('start_at', 'asc')
             ->get();
     }
 
