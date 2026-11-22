@@ -671,4 +671,52 @@ class NotificationService
             $dedupPrefix
         );
     }
+
+    /**
+     * Triggered when an uncollected booking passes start_at + grace_period_minutes
+     * and transitions to `late_pickup` (e.g. DP paid or auto-expire disabled).
+     */
+    public function notifyBookingLatePickup(Booking $booking, ?Carbon $graceDeadline = null): array
+    {
+        $business = Business::find($booking->business_id);
+        if (!$business) {
+            return [];
+        }
+
+        $recipientIds = $this->getBookingNotificationRecipientIds($booking, $business);
+        if (empty($recipientIds)) {
+            return [];
+        }
+
+        $customerName = $booking->customer?->name ?? 'Pelanggan';
+        $effectiveDeadline = $graceDeadline
+            ?? ($booking->grace_extended_until ? Carbon::parse($booking->grace_extended_until) : null)
+            ?? ($booking->grace_expires_at ? Carbon::parse($booking->grace_expires_at) : Carbon::now());
+
+        $title = "Booking Terlambat Ambil (#{$booking->booking_code})";
+        $body = "Booking #{$booking->booking_code} a.n. {$customerName} melewati batas waktu pengambilan";
+
+        $payload = [
+            'booking_id' => $booking->id,
+            'booking_code' => $booking->booking_code,
+            'customer_name' => $customerName,
+            'status' => $booking->status,
+            'grace_deadline' => $effectiveDeadline->toIso8601String(),
+        ];
+
+        $dedupPrefix = "booking.late_pickup:{$booking->id}:{$effectiveDeadline->timestamp}";
+
+        return $this->notifyUsers(
+            $booking->business_id,
+            $booking->affiliate_id,
+            $recipientIds,
+            'rental',
+            'booking.late_pickup',
+            $title,
+            $body,
+            '/bookings',
+            $payload,
+            $dedupPrefix
+        );
+    }
 }

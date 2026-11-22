@@ -51,6 +51,14 @@ class BusinessController extends Controller
                 'business_categories' => $biz->business_categories ?? [],
                 'branch_structure' => $biz->branch_structure ?? 'single_location',
                 'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
+                'booking_grace_period_minutes' => (int) ($biz->booking_grace_period_minutes ?? 60),
+                'auto_expire_unpaid_booking' => $biz->auto_expire_unpaid_booking !== null ? (bool) $biz->auto_expire_unpaid_booking : true,
+                'auto_expire_paid_booking' => $biz->auto_expire_paid_booking !== null ? (bool) $biz->auto_expire_paid_booking : false,
+                'late_pickup_end_time_mode' => $biz->late_pickup_end_time_mode ?: 'keep_original_end',
+                'return_grace_period_minutes' => $biz->return_grace_period_minutes !== null ? (int) $biz->return_grace_period_minutes : 15,
+                'late_fee_rounding_mode' => $biz->late_fee_rounding_mode ?: 'hourly_ceil',
+                'cap_late_fee_at_daily_rate' => $biz->cap_late_fee_at_daily_rate !== null ? (bool) $biz->cap_late_fee_at_daily_rate : true,
+                'default_hourly_late_fee' => $biz->default_hourly_late_fee !== null ? (float) $biz->default_hourly_late_fee : 0.0,
                 'role' => $membership->role,
                 'joined_at' => $membership->joined_at,
                 // Only branches this member is authorized for (central first). Prevents the
@@ -300,6 +308,14 @@ class BusinessController extends Controller
             'business_categories.*' => 'string|max:50',
             'branch_structure' => 'nullable|string|in:single_location,multi_branch,single_scalable',
             'has_completed_onboarding' => 'nullable|boolean',
+            'booking_grace_period_minutes' => 'nullable|integer|min:5|max:1440',
+            'auto_expire_unpaid_booking' => 'nullable|boolean',
+            'auto_expire_paid_booking' => 'nullable|boolean',
+            'late_pickup_end_time_mode' => 'nullable|string|in:keep_original_end,shift_if_available',
+            'return_grace_period_minutes' => 'nullable|integer|min:0|max:1440',
+            'late_fee_rounding_mode' => 'nullable|string|in:hourly_ceil,half_hourly_ceil',
+            'cap_late_fee_at_daily_rate' => 'nullable|boolean',
+            'default_hourly_late_fee' => 'nullable|numeric|min:0',
         ]);
 
         $oldName = $business->name;
@@ -313,14 +329,33 @@ class BusinessController extends Controller
                 $updates[$nullableField] = $validated[$nullableField] ?? null;
             }
         }
-        foreach (['business_categories', 'branch_structure', 'has_completed_onboarding'] as $optField) {
+        foreach ([
+            'business_categories',
+            'branch_structure',
+            'has_completed_onboarding',
+            'booking_grace_period_minutes',
+            'auto_expire_unpaid_booking',
+            'auto_expire_paid_booking',
+            'late_pickup_end_time_mode',
+            'return_grace_period_minutes',
+            'late_fee_rounding_mode',
+            'cap_late_fee_at_daily_rate',
+        ] as $optField) {
             if (array_key_exists($optField, $validated) && $validated[$optField] !== null) {
                 $updates[$optField] = $validated[$optField];
             }
         }
+        if ($request->exists('default_hourly_late_fee')) {
+            $updates['default_hourly_late_fee'] = $validated['default_hourly_late_fee'];
+        }
 
         if (!empty($updates)) {
             $business->update($updates);
+            if (array_key_exists('booking_grace_period_minutes', $updates)) {
+                Affiliate::withoutGlobalScopes()
+                    ->where('business_id', $business->id)
+                    ->update(['booking_grace_period_minutes' => $updates['booking_grace_period_minutes']]);
+            }
         }
 
         if (isset($updates['name']) && $updates['name'] !== $oldName) {

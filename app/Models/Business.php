@@ -39,9 +39,28 @@ class Business extends Model
         'shift_opening_time',
         'shift_closing_time',
         'shift_grace_period_minutes',
+        'booking_grace_period_minutes',
+        'auto_expire_unpaid_booking',
+        'auto_expire_paid_booking',
+        'late_pickup_end_time_mode',
+        'return_grace_period_minutes',
+        'late_fee_rounding_mode',
+        'cap_late_fee_at_daily_rate',
+        'default_hourly_late_fee',
         'payment_methods_config',
         'qris_raw_payload',
         'is_dynamic_qris_enabled',
+    ];
+
+    protected $attributes = [
+        'booking_grace_period_minutes' => 60,
+        'auto_expire_unpaid_booking' => true,
+        'auto_expire_paid_booking' => false,
+        'late_pickup_end_time_mode' => 'keep_original_end',
+        'return_grace_period_minutes' => 15,
+        'late_fee_rounding_mode' => 'hourly_ceil',
+        'cap_late_fee_at_daily_rate' => true,
+        'default_hourly_late_fee' => 0.00,
     ];
 
     protected $casts = [
@@ -56,9 +75,45 @@ class Business extends Model
         'expense_pin_threshold' => 'decimal:2',
         'shift_enforcement_enabled' => 'boolean',
         'shift_grace_period_minutes' => 'integer',
+        'booking_grace_period_minutes' => 'integer',
+        'auto_expire_unpaid_booking' => 'boolean',
+        'auto_expire_paid_booking' => 'boolean',
+        'return_grace_period_minutes' => 'integer',
+        'cap_late_fee_at_daily_rate' => 'boolean',
+        'default_hourly_late_fee' => 'decimal:2',
         'payment_methods_config' => 'array',
         'is_dynamic_qris_enabled' => 'boolean',
     ];
+
+    public function getLateFeePolicy(): array
+    {
+        $roundingMode = $this->late_fee_rounding_mode;
+        if (!in_array($roundingMode, ['hourly_ceil', 'half_hourly_ceil'], true)) {
+            $roundingMode = 'hourly_ceil';
+        }
+
+        return [
+            'return_grace_period_minutes' => max(0, (int) ($this->return_grace_period_minutes ?? 15)),
+            'late_fee_rounding_mode' => $roundingMode,
+            'cap_late_fee_at_daily_rate' => $this->cap_late_fee_at_daily_rate !== null ? (bool) $this->cap_late_fee_at_daily_rate : true,
+            'default_hourly_late_fee' => $this->default_hourly_late_fee !== null ? round((float) $this->default_hourly_late_fee, 2) : 0.0,
+        ];
+    }
+
+    public function getLatePickupPolicy(): array
+    {
+        $mode = $this->late_pickup_end_time_mode;
+        if (!in_array($mode, ['keep_original_end', 'shift_if_available'], true)) {
+            $mode = 'keep_original_end';
+        }
+
+        return [
+            'booking_grace_period_minutes' => max(5, (int) ($this->booking_grace_period_minutes ?? 60)),
+            'auto_expire_unpaid_booking' => $this->auto_expire_unpaid_booking !== null ? (bool) $this->auto_expire_unpaid_booking : true,
+            'auto_expire_paid_booking' => $this->auto_expire_paid_booking !== null ? (bool) $this->auto_expire_paid_booking : false,
+            'late_pickup_end_time_mode' => $mode,
+        ];
+    }
 
     public function getPaymentMethodsConfig(?int $affiliateId = null): array
     {

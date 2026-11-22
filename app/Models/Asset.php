@@ -25,11 +25,13 @@ class Asset extends Model
         'status',
         'condition_grade',
         'battery_health',
+        'hourly_late_fee',
         'notes',
     ];
 
     protected $casts = [
         'battery_health' => 'integer',
+        'hourly_late_fee' => 'decimal:2',
     ];
 
     protected static function booted(): void
@@ -92,5 +94,11 @@ class Asset extends Model
     public function scopeRented(Builder $query): Builder
     {
         return $query->where('status', 'rented');
+    }
+
+    public function resolveEffectiveHourlyLateFee(?Business $business = null): float
+    {
+        return app(\App\Services\LateFeeCalculatorService::class)
+            ->resolveEffectiveHourlyLateFee($this, $this->model ?? $this->assetModel, $business ?? $this->business);
     }
 }

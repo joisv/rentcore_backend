@@ -27,6 +27,7 @@ class AssetModel extends Model
         'specifications',
         'is_addon',
         'is_active',
+        'hourly_late_fee',
     ];
 
     protected $appends = [
@@ -51,6 +52,7 @@ class AssetModel extends Model
         'requires_frp_check' => 'boolean',
         'is_addon' => 'boolean',
         'is_active' => 'boolean',
+        'hourly_late_fee' => 'decimal:2',
     ];
 
     public function isAddon(): bool

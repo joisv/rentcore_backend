@@ -202,6 +202,7 @@ class ProductController extends Controller
             'specifications' => 'nullable|array',
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
+            'hourly_late_fee' => 'nullable|numeric|min:0',
             'image' => 'nullable|image|max:5120',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
@@ -237,6 +238,7 @@ class ProductController extends Controller
             'specifications' => $validated['specifications'] ?? null,
             'is_addon' => $validated['is_addon'] ?? false,
             'is_active' => $validated['is_active'] ?? true,
+            'hourly_late_fee' => $validated['hourly_late_fee'] ?? null,
         ]);
 
         // Process initial rates if provided
@@ -325,6 +327,7 @@ class ProductController extends Controller
             'specifications' => 'nullable|array',
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
+            'hourly_late_fee' => 'nullable|numeric|min:0',
             'image' => 'nullable|image|max:5120',
             'remove_image' => 'nullable|boolean',
             'rates' => 'nullable|array',
@@ -337,6 +340,11 @@ class ProductController extends Controller
 
         return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
             $productFields = collect($validated)->except(['rates', 'image', 'remove_image'])->filter(fn($v) => $v !== null)->toArray();
+            if ($request->exists('hourly_late_fee')) {
+                $productFields['hourly_late_fee'] = $validated['hourly_late_fee'] !== null
+                    ? (float) $validated['hourly_late_fee']
+                    : null;
+            }
 
             if ($request->hasFile('image')) {
                 $productFields['image_path'] = $this->handleModelImageUpload($request, $product->image_path);
@@ -345,7 +353,7 @@ class ProductController extends Controller
                 $productFields['image_path'] = null;
             }
 
-            if (!empty($productFields) || array_key_exists('image_path', $productFields)) {
+            if (!empty($productFields) || array_key_exists('image_path', $productFields) || array_key_exists('hourly_late_fee', $productFields)) {
                 $product->update($productFields);
             }
 

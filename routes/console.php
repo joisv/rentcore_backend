@@ -10,4 +10,5 @@ Artisan::command('inspire', function () {
 
 Schedule::command('rentcore:check-overdue-rentals --grace-minutes=60')->everyFifteenMinutes();
 Schedule::command('bookings:process-no-show')->everyFiveMinutes();
+Schedule::command('bookings:process-late-pickups')->everyFiveMinutes();
 

@@ -170,7 +170,7 @@ class BookingController extends Controller
                 $query->where('bookings.status', 'rented')
                       ->where('bookings.end_at', '<=', Carbon::now());
             } elseif ($request->status === 'booked') {
-                $query->whereIn('bookings.status', ['booked', 'reserved', 'confirmed']);
+                $query->whereIn('bookings.status', ['booked', 'reserved', 'confirmed', 'late_pickup']);
             } elseif ($request->status === 'active') {
                 $query->whereIn('bookings.status', ['rented', 'active']);
             } else {
@@ -1219,6 +1219,9 @@ class BookingController extends Controller
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',
+            'late_fee_discount' => 'nullable|numeric|min:0',
+            'waived_late_fee' => 'nullable|numeric|min:0',
+            'late_fee_waive_reason' => 'nullable|string|max:500',
             'manager_pin' => 'nullable|string',
             'addons_returned' => 'nullable|boolean',
             'returned_addon_ids' => 'nullable|array',
@@ -1336,10 +1339,14 @@ class BookingController extends Controller
 
         $booking = Booking::findOrFail($id);
         $updated = $this->bookingService->checkInBooking($booking, $validated, $request->user());
+        $notice = $updated->getAttribute('late_pickup_notice');
+        $endTimeModeApplied = $updated->getAttribute('end_time_mode_applied');
 
         return response()->json([
             'success' => true,
-            'message' => 'Unit berhasil diserahkan dan sewa kini aktif.',
+            'message' => $notice ?: 'Unit berhasil diserahkan dan sewa kini aktif.',
+            'notice' => $notice,
+            'end_time_mode_applied' => $endTimeModeApplied,
             'data' => $updated,
         ]);
     }
@@ -1376,6 +1383,9 @@ class BookingController extends Controller
     {
         $validated = $request->validate([
             'reason' => 'nullable|string|max:255',
+            'dp_disposition' => 'nullable|string|in:forfeited,refunded',
+            'manager_pin' => 'nullable|string',
+            'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
         ]);
 
         $booking = Booking::findOrFail($id);
@@ -1383,7 +1393,10 @@ class BookingController extends Controller
             $booking,
             $request->user(),
             $validated['reason'] ?? null,
-            false
+            false,
+            $validated['dp_disposition'] ?? null,
+            $validated['manager_pin'] ?? null,
+            isset($validated['payment_method_id']) ? (int) $validated['payment_method_id'] : null
         );
 
         return response()->json([
@@ -1424,18 +1437,20 @@ class BookingController extends Controller
     }
 
     /**
-     * Manually extend the pickup grace period for a scheduled booking.
+     * Manually extend the pickup grace period / wait time for a scheduled or late booking.
      */
     public function extendGrace(Request $request, int $id): JsonResponse
     {
         $validated = $request->validate([
             'additional_minutes' => 'nullable|integer|min:5|max:1440',
             'grace_expires_at' => 'nullable|date|after:now',
+            'grace_extended_until' => 'nullable|date|after:now',
         ]);
 
         $booking = Booking::findOrFail($id);
-        $newGraceAt = !empty($validated['grace_expires_at'])
-            ? Carbon::parse($validated['grace_expires_at'])
+        $rawGrace = $validated['grace_extended_until'] ?? $validated['grace_expires_at'] ?? null;
+        $newGraceAt = !empty($rawGrace)
+            ? Carbon::parse($rawGrace)
             : null;
         $updated = $this->bookingService->extendGracePeriod(
             $booking,

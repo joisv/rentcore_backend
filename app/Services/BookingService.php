@@ -31,8 +31,28 @@ class BookingService
     public function __construct(
         protected VoucherService $voucherService,
         protected PricingService $pricingService,
-        protected BookingAvailabilityService $availabilityService
+        protected BookingAvailabilityService $availabilityService,
+        protected LateFeeCalculatorService $lateFeeCalculator
     ) {}
+
+    protected function buildLateFeeContractColumns(
+        ?Asset $asset,
+        ?AssetModel $model,
+        ?Business $business,
+        ?array $rateSnapshot = null
+    ): array {
+        $tier = !empty($rateSnapshot['tier_id']) ? PricingTier::find($rateSnapshot['tier_id']) : null;
+        $snap = $this->lateFeeCalculator->buildContractSnapshot($asset, $model, $business, $tier);
+        $mergedSnapshot = array_merge($rateSnapshot ?? [], $snap);
+
+        return [
+            'rate_snapshot' => $mergedSnapshot,
+            'applied_hourly_late_fee' => $snap['applied_hourly_late_fee'],
+            'applied_grace_period_minutes' => $snap['applied_grace_period_minutes'],
+            'applied_daily_rate_cap' => $snap['applied_daily_rate_cap'],
+            'applied_late_fee_rounding_mode' => $snap['applied_late_fee_rounding_mode'],
+        ];
+    }
 
     /**
      * Create an atomic counter rental with immediate activation.
@@ -406,9 +426,16 @@ class BookingService
             ]);
 
             // 8. Create Booking Items & transition assets to 'rented'
+            $business = $businessId ? Business::find($businessId) : null;
             foreach ($assets as $asset) {
                 $itemType = in_array((int)$asset->id, $addonAssetIdsList, true) ? 'addon' : 'primary';
-                BookingItem::create([
+                $contractCols = $this->buildLateFeeContractColumns(
+                    $asset,
+                    $asset->model,
+                    $business,
+                    $itemSnapshots[$asset->id] ?? null
+                );
+                BookingItem::create(array_merge([
                     'booking_id' => $booking->id,
                     'asset_id' => $asset->id,
                     'asset_model_id' => $asset->model_id,
@@ -416,8 +443,7 @@ class BookingService
                     'unit_price' => $itemPrices[$asset->id],
                     'duration_unit' => $durationUnit,
                     'duration_value' => $durationValue,
-                    'rate_snapshot' => $itemSnapshots[$asset->id] ?? null,
-                ]);
+                ], $contractCols));
 
                 $asset->update(['status' => 'rented']);
             }
@@ -877,8 +903,11 @@ class BookingService
                 'notes' => $data['notes'] ?? null,
             ]);
 
+            $business = $businessId ? Business::find($businessId) : null;
             if ($isFloating) {
-                BookingItem::create([
+                $primaryModel = $primaryModelId ? AssetModel::withoutGlobalScopes()->find($primaryModelId) : null;
+                $contractCols = $this->buildLateFeeContractColumns(null, $primaryModel, $business, $primarySnapshot);
+                BookingItem::create(array_merge([
                     'booking_id' => $booking->id,
                     'asset_id' => null,
                     'asset_model_id' => $primaryModelId,
@@ -886,12 +915,12 @@ class BookingService
                     'unit_price' => $primaryPrice,
                     'duration_unit' => $durationUnit,
                     'duration_value' => $durationValue,
-                    'rate_snapshot' => $primarySnapshot,
                     'status' => 'active',
-                ]);
+                ], $contractCols));
             } else {
                 foreach ($primaryAssets as $asset) {
-                    BookingItem::create([
+                    $contractCols = $this->buildLateFeeContractColumns($asset, $asset->model, $business, $itemSnapshots[$asset->id] ?? null);
+                    BookingItem::create(array_merge([
                         'booking_id' => $booking->id,
                         'asset_id' => $asset->id,
                         'asset_model_id' => $asset->model_id,
@@ -899,14 +928,14 @@ class BookingService
                         'unit_price' => $itemPrices[$asset->id],
                         'duration_unit' => $durationUnit,
                         'duration_value' => $durationValue,
-                        'rate_snapshot' => $itemSnapshots[$asset->id],
                         'status' => 'active',
-                    ]);
+                    ], $contractCols));
                 }
             }
 
             foreach ($addonAssets as $addon) {
-                BookingItem::create([
+                $contractCols = $this->buildLateFeeContractColumns($addon, $addon->model, $business, $itemSnapshots[$addon->id] ?? null);
+                BookingItem::create(array_merge([
                     'booking_id' => $booking->id,
                     'asset_id' => $addon->id,
                     'asset_model_id' => $addon->model_id,
@@ -914,9 +943,8 @@ class BookingService
                     'unit_price' => $itemPrices[$addon->id],
                     'duration_unit' => $durationUnit,
                     'duration_value' => $durationValue,
-                    'rate_snapshot' => $itemSnapshots[$addon->id],
                     'status' => 'active',
-                ]);
+                ], $contractCols));
             }
 
             if ($voucherId) {
@@ -981,17 +1009,17 @@ class BookingService
     }
 
     /**
-     * Check-in / Handover a scheduled booking (`booked` -> `rented`) and assign a physical unit if floating.
+     * Check-in / Handover a scheduled booking (`booked` / `late_pickup` -> `rented`) and assign a physical unit if floating.
      */
     public function checkInBooking(Booking $booking, array $data, User $staff): Booking
     {
         return DB::transaction(function () use ($booking, $data, $staff) {
             $lockedBooking = Booking::withoutGlobalScopes()
-                ->with(['items.asset.model', 'items.assetModel', 'assetModel', 'assetUnit', 'affiliate', 'payments'])
+                ->with(['business', 'items.asset.model', 'items.assetModel', 'assetModel', 'assetUnit', 'affiliate', 'payments'])
                 ->lockForUpdate()
                 ->findOrFail($booking->id);
 
-            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)) {
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover', 'late_pickup'], true)) {
                 throw ValidationException::withMessages([
                     'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat diserahkan (status saat ini: {$lockedBooking->status})."],
                 ]);
@@ -1003,7 +1031,7 @@ class BookingService
             if ($startNow && Carbon::parse($lockedBooking->start_at)->gt($now)) {
                 $this->shiftBookingSchedule($lockedBooking, $now, $keepOriginalEndAt, true);
                 $lockedBooking->refresh();
-                $lockedBooking->load(['items.asset.model', 'items.assetModel', 'assetModel', 'assetUnit', 'affiliate', 'payments']);
+                $lockedBooking->load(['business', 'items.asset.model', 'items.assetModel', 'assetModel', 'assetUnit', 'affiliate', 'payments']);
             }
 
             $requestedAssetId = $data['asset_unit_id'] ?? $data['asset_id'] ?? null;
@@ -1065,8 +1093,53 @@ class BookingService
                 ]);
             }
 
-            $startAt = Carbon::parse($lockedBooking->start_at);
-            $endAt = Carbon::parse($lockedBooking->end_at);
+            $origStartAt = Carbon::parse($lockedBooking->start_at);
+            $origEndAt = Carbon::parse($lockedBooking->end_at);
+            $startAt = $origStartAt->copy();
+            $endAt = $origEndAt->copy();
+
+            $latePickupNotice = null;
+            $endTimeModeApplied = 'kept_original';
+            $isLateCheckIn = $lockedBooking->status === 'late_pickup'
+                || (bool) $lockedBooking->is_late_pickup
+                || ($now->gt($origStartAt) && !$startNow);
+
+            if ($isLateCheckIn) {
+                $business = $lockedBooking->business ?? ($lockedBooking->business_id ? Business::find($lockedBooking->business_id) : null);
+                $policyMode = $business?->late_pickup_end_time_mode ?? 'keep_original_end';
+
+                if ($policyMode === 'shift_if_available') {
+                    $durationSeconds = max(3600, $origStartAt->diffInSeconds($origEndAt));
+                    $shiftedStart = $now->copy();
+                    $shiftedEnd = $now->copy()->addSeconds($durationSeconds);
+
+                    $assetEval = $this->availabilityService->evaluateAssetWindowAvailability(
+                        $targetAsset,
+                        $shiftedStart,
+                        $shiftedEnd,
+                        (int) $lockedBooking->id
+                    );
+                    $modelCap = $this->availabilityService->getBranchModelCapacity(
+                        (int) $lockedBooking->affiliate_id,
+                        (int) $targetAsset->model_id,
+                        $shiftedStart,
+                        $shiftedEnd,
+                        (int) $lockedBooking->id,
+                        $lockedBooking->business_id ? (int) $lockedBooking->business_id : null
+                    );
+
+                    if (($assetEval['is_available'] ?? false) && ($modelCap['available_slots'] ?? 0) >= 1) {
+                        $startAt = $shiftedStart;
+                        $endAt = $shiftedEnd;
+                        $endTimeModeApplied = 'shifted';
+                        $latePickupNotice = 'Waktu selesai sewa digeser mengikuti waktu serah terima karena unit tersedia.';
+                    } else {
+                        $endTimeModeApplied = 'kept_original_fallback';
+                        $latePickupNotice = 'Jadwal berikutnya penuh pada jendela perpanjangan, sehingga waktu kembali tetap mengikuti jadwal awal.';
+                    }
+                }
+            }
+
             if (!$this->pricingService->isAssetAvailable($targetAsset, $startAt, $endAt, (int) $lockedBooking->id)) {
                 throw ValidationException::withMessages([
                     'asset_unit_id' => ["Unit {$targetAsset->asset_code} memiliki jadwal sewa lain yang bertabrakan."],
@@ -1077,15 +1150,26 @@ class BookingService
 
             $primaryItem = $lockedBooking->items
                 ->first(fn ($item) => $item->item_type === 'primary' || $item->item_type === null);
+            $businessForCheckIn = $lockedBooking->business ?? ($lockedBooking->business_id ? Business::find($lockedBooking->business_id) : null);
+            $targetAsset->loadMissing('model');
+            $checkInRateSnapshot = $primaryItem
+                ? (is_array($primaryItem->rate_snapshot) ? $primaryItem->rate_snapshot : json_decode($primaryItem->rate_snapshot ?? '[]', true))
+                : null;
+            $checkInContractCols = $this->buildLateFeeContractColumns(
+                $targetAsset,
+                $targetAsset->model,
+                $businessForCheckIn,
+                is_array($checkInRateSnapshot) ? $checkInRateSnapshot : null
+            );
 
             if ($primaryItem) {
-                $primaryItem->update([
+                $primaryItem->update(array_merge([
                     'asset_id' => $targetAsset->id,
                     'asset_model_id' => $targetAsset->model_id,
                     'status' => 'active',
-                ]);
+                ], $checkInContractCols));
             } else {
-                BookingItem::create([
+                BookingItem::create(array_merge([
                     'booking_id' => $lockedBooking->id,
                     'asset_id' => $targetAsset->id,
                     'asset_model_id' => $targetAsset->model_id,
@@ -1094,19 +1178,27 @@ class BookingService
                     'duration_unit' => $lockedBooking->duration_unit ?? 'hour',
                     'duration_value' => $lockedBooking->duration_value ?? $lockedBooking->duration_hours,
                     'status' => 'active',
-                ]);
+                ], $checkInContractCols));
             }
 
-            $lockedBooking->update([
+            $bookingUpdates = [
                 'status' => 'rented',
-                'picked_up_at' => Carbon::now(),
+                'picked_up_at' => $now,
                 'asset_model_id' => $lockedBooking->asset_model_id ?? $targetAsset->model_id,
                 'asset_unit_id' => $targetAsset->id,
                 'is_overdue_pickup' => false,
+                'is_late_pickup' => false,
                 'collateral_type' => $data['collateral_type'] ?? $lockedBooking->collateral_type ?? 'KTP Asli',
                 'collateral_storage_slot' => $data['collateral_storage_slot'] ?? $lockedBooking->collateral_storage_slot ?? 'Brankas A, Slot 1',
                 'collateral_secured' => true,
-            ]);
+            ];
+
+            if ($endTimeModeApplied === 'shifted') {
+                $bookingUpdates['start_at'] = $startAt;
+                $bookingUpdates['end_at'] = $endAt;
+            }
+
+            $lockedBooking->update($bookingUpdates);
 
             AuditLogService::log(
                 $staff,
@@ -1118,14 +1210,169 @@ class BookingService
                     'assigned_asset_id' => $targetAsset->id,
                     'assigned_asset_code' => $targetAsset->asset_code,
                     'was_floating' => $booking->asset_unit_id === null,
+                    'end_time_mode_applied' => $endTimeModeApplied,
                 ],
                 null,
                 request()?->ip(),
                 $lockedBooking->affiliate_id
             );
 
-            return $lockedBooking->fresh([
+            $fresh = $lockedBooking->fresh([
                 'items.asset.model.category',
+                'items.assetModel',
+                'assetModel',
+                'assetUnit',
+                'customer',
+                'payments.paymentMethod',
+                'affiliate',
+            ]);
+            $fresh->setAttribute('end_time_mode_applied', $endTimeModeApplied);
+            if ($latePickupNotice !== null) {
+                $fresh->setAttribute('late_pickup_notice', $latePickupNotice);
+            }
+
+            return $fresh;
+        });
+    }
+
+    /**
+     * Transition a booked/late_pickup reservation to `no_show`, stamp `no_show_at`,
+     * record DP disposition (`forfeited` or `refunded`), and release pinned units.
+     */
+    public function markNoShow(
+        Booking $booking,
+        ?User $actor = null,
+        ?string $reason = null,
+        bool $isAutomated = false,
+        ?string $dpDisposition = null,
+        ?string $managerPin = null,
+        ?int $paymentMethodId = null
+    ): Booking {
+        return DB::transaction(function () use ($booking, $actor, $reason, $isAutomated, $dpDisposition, $managerPin, $paymentMethodId) {
+            $lockedBooking = Booking::withoutGlobalScopes()
+                ->with(['payments', 'items.asset', 'assetUnit', 'customer', 'assetModel', 'affiliate'])
+                ->lockForUpdate()
+                ->findOrFail($booking->id);
+
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover', 'late_pickup'], true)) {
+                throw ValidationException::withMessages([
+                    'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat ditandai No-Show (status saat ini: {$lockedBooking->status})."],
+                ]);
+            }
+
+            // Release any reserved physical units pinned to this booking
+            $reservedAssetIds = collect();
+            if ($lockedBooking->asset_unit_id) {
+                $reservedAssetIds->push((int) $lockedBooking->asset_unit_id);
+            }
+            foreach ($lockedBooking->items as $item) {
+                if ($item->asset_id) {
+                    $reservedAssetIds->push((int) $item->asset_id);
+                }
+            }
+            if ($reservedAssetIds->isNotEmpty()) {
+                Asset::withoutGlobalScopes()
+                    ->whereIn('id', $reservedAssetIds->unique()->all())
+                    ->where('status', 'reserved')
+                    ->lockForUpdate()
+                    ->update(['status' => 'ready']);
+            }
+
+            $paidAmount = (float) $lockedBooking->paid_amount;
+            $resolvedDisposition = $paidAmount > 0
+                ? ($dpDisposition === 'refunded' ? 'refunded' : 'forfeited')
+                : null;
+            $forfeitedDp = ($resolvedDisposition === 'forfeited') ? $paidAmount : 0.0;
+
+            if ($resolvedDisposition === 'refunded' && $paidAmount > 0 && $actor) {
+                if (!empty($managerPin)) {
+                    ManagerPinVerificationService::verify(
+                        $actor,
+                        $managerPin,
+                        $lockedBooking->business_id ? (int) $lockedBooking->business_id : null,
+                        (int) $lockedBooking->affiliate_id,
+                        'Pengembalian DP saat No-Show memerlukan otorisasi PIN Manager.',
+                        request()?->ip(),
+                        'BookingNoShowRefund'
+                    );
+                }
+
+                $activeShift = ShiftEnforcementService::getActiveShift((int) $lockedBooking->affiliate_id, $actor);
+                $resolvedMethodId = $paymentMethodId
+                    ?? $lockedBooking->payments()->where('direction', 'inflow')->latest('id')->value('payment_method_id')
+                    ?? PaymentMethod::where('code', 'CASH')->value('id')
+                    ?? PaymentMethod::value('id')
+                    ?? 1;
+
+                $datePrefix = Carbon::now()->format('ymd');
+                $countToday = PaymentTransaction::withoutGlobalScopes()
+                    ->where('business_id', $lockedBooking->business_id)
+                    ->whereDate('transacted_at', Carbon::today())
+                    ->count() + 1;
+                $txCode = sprintf('TX-REF-%s-%04d-%s', $datePrefix, $countToday, strtoupper(Str::random(3)));
+                $receiptNumber = sprintf('REC-REF-%s-%s-%s', $lockedBooking->affiliate->code ?? 'PST', $datePrefix, strtoupper(Str::random(4)));
+                $latestInflowId = $lockedBooking->payments()->where('direction', 'inflow')->latest('id')->value('id');
+
+                PaymentTransaction::create([
+                    'business_id' => $lockedBooking->business_id,
+                    'branch_id' => $lockedBooking->affiliate_id,
+                    'shift_id' => $activeShift?->id,
+                    'status' => 'completed',
+                    'transaction_code' => $txCode,
+                    'receipt_number' => $receiptNumber,
+                    'booking_id' => $lockedBooking->id,
+                    'payment_method_id' => $resolvedMethodId,
+                    'processed_by' => $actor->id,
+                    'reversal_of_id' => $latestInflowId,
+                    'type' => 'refund',
+                    'direction' => 'outflow',
+                    'amount' => $paidAmount,
+                    'cash_received' => 0.00,
+                    'cash_change' => 0.00,
+                    'notes' => $reason
+                        ? "Refund DP No-Show ({$reason})"
+                        : 'Refund DP No-Show',
+                    'transacted_at' => Carbon::now(),
+                ]);
+            }
+
+            $lockedBooking->update([
+                'status' => 'no_show',
+                'no_show_at' => Carbon::now(),
+                'forfeited_dp_amount' => $forfeitedDp,
+                'dp_disposition' => $resolvedDisposition,
+                'no_show_reason' => $reason,
+                'is_overdue_pickup' => false,
+                'is_late_pickup' => false,
+                'notes' => $reason
+                    ? trim(($lockedBooking->notes ? $lockedBooking->notes . "\n" : '') . "[No-Show] {$reason}")
+                    : $lockedBooking->notes,
+            ]);
+
+            if ($resolvedDisposition === 'refunded') {
+                $lockedBooking->recalculateFinancials(true);
+            }
+
+            AuditLogService::log(
+                $actor,
+                $isAutomated ? 'booking.auto_noshow' : 'booking.marked_no_show',
+                'Booking',
+                $lockedBooking->booking_code,
+                [
+                    'booking_code' => $lockedBooking->booking_code,
+                    'forfeited_dp_amount' => $forfeitedDp,
+                    'dp_disposition' => $resolvedDisposition,
+                    'reason' => $reason,
+                    'automated' => $isAutomated,
+                ],
+                null,
+                request()?->ip(),
+                $lockedBooking->affiliate_id,
+                $lockedBooking->business_id
+            );
+
+            return $lockedBooking->fresh([
+                'items.asset.model',
                 'items.assetModel',
                 'assetModel',
                 'assetUnit',
@@ -1137,65 +1384,61 @@ class BookingService
     }
 
     /**
-     * Transition a booked reservation to `no_show`, stamp `no_show_at`, and forfeit paid DP.
+     * Transition an uncollected booking past its full end_at window to `expired` and release stock.
      */
-    public function markNoShow(
-        Booking $booking,
-        ?User $actor = null,
-        ?string $reason = null,
-        bool $isAutomated = false
-    ): Booking {
-        return DB::transaction(function () use ($booking, $actor, $reason, $isAutomated) {
+    public function expireUncollectedBooking(Booking $booking, ?string $reason = null): Booking
+    {
+        return DB::transaction(function () use ($booking, $reason) {
             $lockedBooking = Booking::withoutGlobalScopes()
-                ->with(['payments', 'assetUnit', 'customer', 'assetModel', 'affiliate'])
+                ->with(['items.asset', 'assetUnit', 'affiliate'])
                 ->lockForUpdate()
                 ->findOrFail($booking->id);
 
-            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed'], true)) {
-                throw ValidationException::withMessages([
-                    'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat ditandai No-Show (status saat ini: {$lockedBooking->status})."],
-                ]);
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover', 'late_pickup'], true)) {
+                return $lockedBooking;
             }
 
-            $forfeitedDp = $lockedBooking->paid_amount;
-
+            $reservedAssetIds = collect();
             if ($lockedBooking->asset_unit_id) {
-                $pinnedAsset = Asset::withoutGlobalScopes()
-                    ->where('id', $lockedBooking->asset_unit_id)
-                    ->lockForUpdate()
-                    ->first();
-                if ($pinnedAsset && $pinnedAsset->status === 'reserved') {
-                    $pinnedAsset->update(['status' => 'ready']);
+                $reservedAssetIds->push((int) $lockedBooking->asset_unit_id);
+            }
+            foreach ($lockedBooking->items as $item) {
+                if ($item->asset_id) {
+                    $reservedAssetIds->push((int) $item->asset_id);
                 }
             }
+            if ($reservedAssetIds->isNotEmpty()) {
+                Asset::withoutGlobalScopes()
+                    ->whereIn('id', $reservedAssetIds->unique()->all())
+                    ->where('status', 'reserved')
+                    ->lockForUpdate()
+                    ->update(['status' => 'ready']);
+            }
 
+            $sysReason = $reason ?? 'Otomatis kedaluwarsa karena melewati batas akhir jadwal sewa.';
             $lockedBooking->update([
-                'status' => 'no_show',
-                'no_show_at' => Carbon::now(),
-                'forfeited_dp_amount' => $forfeitedDp,
+                'status' => 'expired',
+                'no_show_at' => $lockedBooking->no_show_at ?? Carbon::now(),
+                'no_show_reason' => $sysReason,
                 'is_overdue_pickup' => false,
-                'notes' => $reason
-                    ? trim(($lockedBooking->notes ? $lockedBooking->notes . "\n" : '') . "[No-Show] {$reason}")
-                    : $lockedBooking->notes,
+                'is_late_pickup' => false,
+                'notes' => trim(($lockedBooking->notes ? $lockedBooking->notes . "\n" : '') . "[Expired] {$sysReason}"),
             ]);
 
-            if ($actor) {
-                AuditLogService::log(
-                    $actor,
-                    $isAutomated ? 'booking.auto_noshow' : 'booking.marked_no_show',
-                    'Booking',
-                    $lockedBooking->booking_code,
-                    [
-                        'booking_code' => $lockedBooking->booking_code,
-                        'forfeited_dp_amount' => $forfeitedDp,
-                        'reason' => $reason,
-                        'automated' => $isAutomated,
-                    ],
-                    null,
-                    request()?->ip(),
-                    $lockedBooking->affiliate_id
-                );
-            }
+            AuditLogService::log(
+                null,
+                'booking.auto_expired',
+                'Booking',
+                $lockedBooking->booking_code,
+                [
+                    'booking_code' => $lockedBooking->booking_code,
+                    'reason' => $sysReason,
+                ],
+                null,
+                null,
+                $lockedBooking->affiliate_id,
+                $lockedBooking->business_id
+            );
 
             return $lockedBooking->fresh([
                 'items.asset.model',
@@ -1227,7 +1470,7 @@ class BookingService
                 ->lockForUpdate()
                 ->findOrFail($booking->id);
 
-            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)) {
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover', 'late_pickup'], true)) {
                 throw ValidationException::withMessages([
                     'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat dibatalkan (status saat ini: {$lockedBooking->status})."],
                 ]);
@@ -1313,6 +1556,7 @@ class BookingService
 
             $lockedBooking->status = 'cancelled';
             $lockedBooking->is_overdue_pickup = false;
+            $lockedBooking->is_late_pickup = false;
             if ($reason) {
                 $lockedBooking->notes = trim(($lockedBooking->notes ? $lockedBooking->notes . "\n" : '') . "[Dibatalkan] {$reason}");
             }
@@ -1360,21 +1604,29 @@ class BookingService
                 ->lockForUpdate()
                 ->findOrFail($booking->id);
 
-            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed'], true)) {
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'late_pickup'], true)) {
                 throw ValidationException::withMessages([
                     'booking' => ["Batas ambil hanya dapat diperpanjang untuk booking yang belum check-in."],
                 ]);
             }
 
             $now = Carbon::now();
-            $currentGrace = $lockedBooking->grace_expires_at ? Carbon::parse($lockedBooking->grace_expires_at) : null;
+            $currentGraceRaw = $lockedBooking->grace_extended_until ?? $lockedBooking->grace_expires_at;
+            $currentGrace = $currentGraceRaw ? Carbon::parse($currentGraceRaw) : null;
             $base = ($currentGrace && $currentGrace->gt($now)) ? $currentGrace->copy() : $now->copy();
             $targetGrace = $newGraceExpiresAt ?? $base->addMinutes(max(5, $additionalMinutes ?? 30));
 
-            $lockedBooking->update([
+            $extendUpdates = [
                 'grace_expires_at' => $targetGrace,
+                'grace_extended_until' => $targetGrace,
                 'is_overdue_pickup' => false,
-            ]);
+                'is_late_pickup' => false,
+            ];
+            if ($lockedBooking->status === 'late_pickup') {
+                $extendUpdates['status'] = 'booked';
+            }
+
+            $lockedBooking->update($extendUpdates);
 
             AuditLogService::log(
                 $actor,
@@ -1418,13 +1670,19 @@ class BookingService
                 ->lockForUpdate()
                 ->findOrFail($booking->id);
 
-            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover'], true)) {
+            if (!in_array($lockedBooking->status, ['booked', 'reserved', 'confirmed', 'waiting_handover', 'late_pickup'], true)) {
                 throw ValidationException::withMessages([
                     'booking' => ["Booking {$lockedBooking->booking_code} tidak dapat dijadwalkan ulang (status saat ini: {$lockedBooking->status})."],
                 ]);
             }
 
             $shiftMeta = $this->shiftBookingSchedule($lockedBooking, $newStartAt, $keepOriginalEndAt, true);
+            if ($lockedBooking->status === 'late_pickup' || $lockedBooking->is_late_pickup) {
+                $lockedBooking->update([
+                    'status' => 'booked',
+                    'is_late_pickup' => false,
+                ]);
+            }
 
             if ($actor) {
                 AuditLogService::log(

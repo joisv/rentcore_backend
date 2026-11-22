@@ -17,8 +17,12 @@ use Illuminate\Validation\ValidationException;
 
 class ReturnService
 {
+    public function __construct(
+        protected LateFeeCalculatorService $lateFeeCalculator
+    ) {}
+
     /**
-     * Process return inspection, enforce iCloud guard, compute late penalties with 60-min grace period.
+     * Process return inspection, enforce account guard, compute cascading late fees & waivers.
      */
     public function processReturn(Booking $booking, array $data, User $inspector): ReturnInspection
     {
@@ -229,56 +233,55 @@ class ReturnService
                 $returnedAt = Carbon::now('UTC');
             }
 
-            $expectedEndAt = Carbon::parse($booking->end_at)->setTimezone('UTC');
+            // 2. Centralized Late Fee Policy Engine (Cascading unit -> model -> business, grace, rounding, daily cap)
+            $feeCalc = $this->lateFeeCalculator->calculate($booking, $returnedAt);
+            $lateMinutes = (int) $feeCalc['overdue_minutes'];
+            $calculatedLateFee = (float) $feeCalc['calculated_late_fee'];
+            $waivedLateFee = 0.00;
+            $waiveReason = trim((string) ($data['late_fee_waive_reason'] ?? '')) ?: null;
+            $lateFee = $calculatedLateFee;
 
-            // 2. Late Minutes & Grace Period Penalty Formula
-            // Formula: max(0, ceil((late_minutes - 60) / 60)) * hourly_rate
-            $lateMinutes = 0;
-            $lateFee = 0.00;
-            $hourlyRate = 15000.00;
-
-            // Fetch hourly rate from primary item rate snapshot first, then model pricing tier, or default to 15,000 IDR/hr
-            $firstItem = $booking->items->first();
-            if ($firstItem) {
-                $rateSnapshot = is_array($firstItem->rate_snapshot)
-                    ? $firstItem->rate_snapshot
-                    : json_decode($firstItem->rate_snapshot ?? '[]', true);
-
-                if (!empty($rateSnapshot['extension_hourly_rate']) && (float)$rateSnapshot['extension_hourly_rate'] > 0) {
-                    $hourlyRate = (float)$rateSnapshot['extension_hourly_rate'];
-                } elseif ($firstItem->asset) {
-                    $tier = PricingTier::where('model_id', $firstItem->asset->model_id)
-                        ->where('is_active', true)
-                        ->first();
-                    if ($tier && (float)$tier->extension_hourly_rate > 0) {
-                        $hourlyRate = (float)$tier->extension_hourly_rate;
-                    }
-                }
+            $requestedDiscount = null;
+            if (array_key_exists('late_fee_discount', $data) && $data['late_fee_discount'] !== null && is_numeric($data['late_fee_discount'])) {
+                $requestedDiscount = max(0.0, (float) $data['late_fee_discount']);
+            } elseif (array_key_exists('waived_late_fee', $data) && $data['waived_late_fee'] !== null && is_numeric($data['waived_late_fee'])) {
+                $requestedDiscount = max(0.0, (float) $data['waived_late_fee']);
             }
 
-            if ($returnedAt->gt($expectedEndAt)) {
-                $lateMinutes = (int)floor($expectedEndAt->diffInMinutes($returnedAt));
+            $damageFee = (float) ($data['damage_fee'] ?? 0.00);
+            $hasExplicitDiscount = $requestedDiscount !== null && $requestedDiscount > 0.009;
+            $clientReducedWithReason = isset($data['late_fee'])
+                && is_numeric($data['late_fee'])
+                && (float) $data['late_fee'] < ($calculatedLateFee - 0.01)
+                && $waiveReason !== null;
 
-                if ($lateMinutes > 60) {
-                    $billableHours = (int)ceil(($lateMinutes - 60) / 60);
-                    $lateFee = $billableHours * $hourlyRate;
+            if ($hasExplicitDiscount) {
+                if ($waiveReason === null && $calculatedLateFee > 0) {
+                    throw ValidationException::withMessages([
+                        'late_fee_waive_reason' => ['Alasan keringanan atau pembebasan denda keterlambatan wajib diisi.'],
+                    ]);
                 }
+                $waivedLateFee = round(min($calculatedLateFee, $requestedDiscount), 2);
+                $lateFee = round(max(0.0, $calculatedLateFee - $waivedLateFee), 2);
+            } elseif ($clientReducedWithReason) {
+                $lateFee = round(max(0.0, (float) $data['late_fee']), 2);
+                $waivedLateFee = round(max(0.0, $calculatedLateFee - $lateFee), 2);
             }
-
-            $damageFee = (float)($data['damage_fee'] ?? 0.00);
 
             // Server-side Penalty Authority: require valid Manager PIN if damage_fee > 0
-            // or if client late_fee deviates from server-computed lateFee.
-            $clientLateFeeDeviates = isset($data['late_fee'])
+            // or if client late_fee deviates arbitrarily without an explicit waiver discount + reason.
+            $clientLateFeeDeviates = !$hasExplicitDiscount
+                && !$clientReducedWithReason
+                && isset($data['late_fee'])
                 && is_numeric($data['late_fee'])
-                && abs((float)$data['late_fee'] - $lateFee) > 0.01;
+                && abs((float) $data['late_fee'] - $lateFee) > 0.01;
 
             if ($damageFee > 0 || $clientLateFeeDeviates) {
                 ManagerPinVerificationService::verify(
                     $inspector,
                     $data['manager_pin'] ?? null,
-                    $booking->business_id ? (int)$booking->business_id : null,
-                    (int)($inspector->affiliate_id ?? $booking->affiliate_id ?? $booking->branch_id),
+                    $booking->business_id ? (int) $booking->business_id : null,
+                    (int) ($inspector->affiliate_id ?? $booking->affiliate_id ?? $booking->branch_id),
                     $damageFee > 0
                         ? 'Pengenaan biaya kerusakan unit memerlukan otorisasi PIN Manager.'
                         : 'Perubahan nominal denda keterlambatan dari hitungan sistem memerlukan otorisasi PIN Manager.',
@@ -287,7 +290,10 @@ class ReturnService
                 );
 
                 if ($clientLateFeeDeviates) {
-                    $lateFee = max(0.00, (float)$data['late_fee']);
+                    $lateFee = round(max(0.00, (float) $data['late_fee']), 2);
+                    if ($lateFee < $calculatedLateFee) {
+                        $waivedLateFee = round($calculatedLateFee - $lateFee, 2);
+                    }
                 }
             }
 
@@ -351,6 +357,10 @@ class ReturnService
                 'accessories_returned' => $data['accessories_returned'] ?? ['cable' => true, 'adapter' => true],
                 'late_minutes' => $lateMinutes,
                 'late_fee' => $lateFee,
+                'calculated_late_fee' => $calculatedLateFee,
+                'waived_late_fee' => $waivedLateFee,
+                'final_late_fee' => $lateFee,
+                'late_fee_waive_reason' => $waiveReason,
                 'damage_fee' => $damageFee,
                 'total_penalty' => $totalPenalty,
                 'deposit_refunded' => $depositRefunded,
@@ -500,7 +510,17 @@ class ReturnService
                     'condition_grade' => $conditionGrade,
                     'battery_health_final' => $returnInspection->battery_health_final,
                     'late_minutes' => $lateMinutes,
+                    'grace_period_minutes' => $feeCalc['grace_period_minutes'],
+                    'billable_hours' => $feeCalc['billable_hours'],
+                    'hourly_late_rate' => $feeCalc['hourly_rate'],
+                    'rounding_mode' => $feeCalc['rounding_mode'],
+                    'daily_rate_cap' => $feeCalc['daily_rate_cap'],
+                    'was_capped' => $feeCalc['was_capped'],
+                    'calculated_late_fee' => $calculatedLateFee,
+                    'waived_late_fee' => $waivedLateFee,
+                    'final_late_fee' => $lateFee,
                     'late_fee' => $lateFee,
+                    'late_fee_waive_reason' => $waiveReason,
                     'damage_fee' => $damageFee,
                     'total_penalty' => $totalPenalty,
                     'icloud_removed' => $requiresICloud ? !$isQuarantined : ($requiresAndroidFrp ? !$isQuarantined : null),

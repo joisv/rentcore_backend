@@ -25,10 +25,14 @@ class Booking extends Model
         'start_at',
         'end_at',
         'grace_expires_at',
+        'grace_extended_until',
         'no_show_at',
         'picked_up_at',
         'forfeited_dp_amount',
+        'dp_disposition',
+        'no_show_reason',
         'is_overdue_pickup',
+        'is_late_pickup',
         'duration_hours',
         'duration_unit',
         'duration_value',
@@ -57,10 +61,12 @@ class Booking extends Model
         'start_at' => 'datetime',
         'end_at' => 'datetime',
         'grace_expires_at' => 'datetime',
+        'grace_extended_until' => 'datetime',
         'no_show_at' => 'datetime',
         'picked_up_at' => 'datetime',
         'forfeited_dp_amount' => 'decimal:2',
         'is_overdue_pickup' => 'boolean',
+        'is_late_pickup' => 'boolean',
         'duration_hours' => 'integer',
         'duration_value' => 'integer',
         'subtotal_amount' => 'decimal:2',
@@ -133,7 +139,7 @@ class Booking extends Model
 
     public function getIsFloatingUnitAttribute(): bool
     {
-        return in_array($this->status, ['booked', 'reserved', 'confirmed'], true)
+        return in_array($this->status, ['booked', 'reserved', 'confirmed', 'late_pickup'], true)
             && $this->asset_unit_id === null;
     }
 

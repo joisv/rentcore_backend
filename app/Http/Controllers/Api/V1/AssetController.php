@@ -434,6 +434,7 @@ class AssetController extends Controller
             'imei_2' => 'nullable|string|max:50',
             'condition_grade' => 'nullable|in:A,B,C',
             'battery_health' => 'nullable|integer|min:0|max:100',
+            'hourly_late_fee' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
 
@@ -448,6 +449,9 @@ class AssetController extends Controller
             'status' => 'ready',
             'condition_grade' => $validated['condition_grade'] ?? 'A',
             'battery_health' => (isset($validated['battery_health']) && $validated['battery_health'] !== '') ? (int)$validated['battery_health'] : null,
+            'hourly_late_fee' => ($request->exists('hourly_late_fee') && $validated['hourly_late_fee'] !== null && $validated['hourly_late_fee'] !== '')
+                ? (float) $validated['hourly_late_fee']
+                : null,
             'notes' => $validated['notes'] ?? null,
         ]);
 
@@ -550,6 +554,7 @@ class AssetController extends Controller
             'status' => 'nullable|in:ready,reserved,rented,maintenance,in_transit,retired,lost',
             'condition_grade' => 'nullable|in:A,B,C',
             'battery_health' => 'nullable|integer|min:0|max:100',
+            'hourly_late_fee' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
 
@@ -607,10 +612,17 @@ class AssetController extends Controller
                 'status',
                 'condition_grade',
                 'battery_health',
+                'hourly_late_fee',
                 'notes',
             ]);
 
-            $asset->update(array_filter($validated, fn($v) => $v !== null));
+            $updatePayload = array_filter($validated, fn($v) => $v !== null);
+            if ($request->exists('hourly_late_fee')) {
+                $updatePayload['hourly_late_fee'] = ($validated['hourly_late_fee'] !== null && $validated['hourly_late_fee'] !== '')
+                    ? (float) $validated['hourly_late_fee']
+                    : null;
+            }
+            $asset->update($updatePayload);
 
             AuditLogService::log(
                 $request->user(),
@@ -626,6 +638,7 @@ class AssetController extends Controller
                     'status',
                     'condition_grade',
                     'battery_health',
+                    'hourly_late_fee',
                     'notes',
                 ]),
                 $oldValues,

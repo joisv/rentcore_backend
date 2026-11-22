@@ -17,6 +17,7 @@ class BookingAvailabilityService
         'booked',
         'reserved',
         'confirmed',
+        'late_pickup',
         'rented',
         'active',
     ];
@@ -26,6 +27,7 @@ class BookingAvailabilityService
         'booked',
         'reserved',
         'confirmed',
+        'late_pickup',
     ];
 
     public const RENTABLE_ASSET_STATUSES = [
@@ -35,11 +37,15 @@ class BookingAvailabilityService
     ];
 
     /**
-     * Compute grace_expires_at from scheduled start time and branch grace period setting.
+     * Compute grace_expires_at from scheduled start time and tenant/branch grace period setting.
      */
-    public function computeGraceExpiresAt(Carbon $startAt, Affiliate $branch): Carbon
+    public function computeGraceExpiresAt(Carbon $startAt, Affiliate $branch, ?\App\Models\Business $business = null): Carbon
     {
-        $graceMinutes = max(1, (int) ($branch->booking_grace_period_minutes ?? 60));
+        $resolvedBusiness = $business ?? $branch->business;
+        $graceMinutes = max(
+            1,
+            (int) ($resolvedBusiness?->booking_grace_period_minutes ?? $branch->booking_grace_period_minutes ?? 60)
+        );
         return $startAt->copy()->addMinutes($graceMinutes);
     }
 

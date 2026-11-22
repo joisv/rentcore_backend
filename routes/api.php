@@ -163,6 +163,7 @@ Route::prefix('v1')->group(function () {
             Route::post('/bookings/{id}/no-show', [BookingController::class, 'markNoShow'])->whereNumber('id');
             Route::post('/bookings/{booking}/cancel', [BookingController::class, 'cancel'])->whereNumber('booking');
             Route::post('/bookings/{id}/extend-grace', [BookingController::class, 'extendGrace'])->whereNumber('id');
+            Route::post('/bookings/{booking}/extend-pickup', [BookingController::class, 'extendGrace'])->whereNumber('booking');
             Route::patch('/bookings/{id}/reschedule', [BookingController::class, 'reschedule'])->whereNumber('id');
             Route::post('/bookings/{id}/extend', [BookingController::class, 'extend']);
             Route::post('/bookings/{id}/adjust-duration', [BookingController::class, 'adjustDuration']);
