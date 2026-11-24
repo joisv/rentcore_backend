@@ -293,12 +293,18 @@ class BookingController extends Controller
             'manual_discount_amount' => 'nullable|numeric|min:0',
             'manual_discount_reason' => 'nullable|string',
             'manager_pin' => 'nullable|string',
-            'payment_method_id' => ($isScheduled ? 'nullable' : 'required') . '|integer|exists:payment_methods,id',
+            'payment_method_id' => ($isScheduled ? 'nullable' : 'required_without_all:payment_method,payment_channel') . '|nullable|integer|exists:payment_methods,id',
+            'payment_method' => 'nullable|string|max:50',
+            'payment_channel' => 'nullable|string|max:50',
             'paid_amount' => 'nullable|numeric|min:0',
             'dp_amount' => 'nullable|numeric|min:0',
             'cash_received' => 'nullable|numeric|min:0',
-            'collateral_type' => 'nullable|string|max:50',
+            'collateral_type' => 'nullable|string|max:100',
+            'collateral_type_id' => 'nullable|string|max:64',
+            'collateral_type_name' => 'nullable|string|max:100',
             'collateral_storage_slot' => 'nullable|string|max:100',
+            'collateral_detail' => 'nullable|string|max:150',
+            'collateral_deposit_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
             'external_reference' => 'nullable|string|max:100',
             'unit_prices' => 'nullable|array',
@@ -465,6 +471,8 @@ class BookingController extends Controller
             'additional_hours' => 'required|integer|min:1|max:72',
             'additional_fee' => 'nullable|numeric|min:0',
             'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'payment_method' => 'nullable|string|max:50',
+            'payment_channel' => 'nullable|string|max:50',
             'cash_received' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string|max:255',
             'idempotency_key' => 'nullable|string|max:64',
@@ -569,8 +577,17 @@ class BookingController extends Controller
             $newTotalBill = (float)$booking->total_bill + $additionalFee;
             $paymentTx = null;
 
-            if ($request->filled('payment_method_id')) {
-                $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+            if ($request->filled('payment_method_id') || $request->filled('payment_method') || $request->filled('payment_channel')) {
+                $paymentMethod = PaymentMethod::resolveFromInput(
+                    $request->input('payment_method_id'),
+                    $request->input('payment_method'),
+                    $request->input('payment_channel')
+                );
+                if (!$paymentMethod) {
+                    throw ValidationException::withMessages([
+                        'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                    ]);
+                }
                 $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
                 $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $request->user()->affiliate_id);
@@ -693,6 +710,8 @@ class BookingController extends Controller
             'direction' => 'required|string|in:increase,decrease',
             'manager_pin' => 'nullable|string',
             'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'payment_method' => 'nullable|string|max:50',
+            'payment_channel' => 'nullable|string|max:50',
             'cash_received' => 'nullable|numeric|min:0',
             'reason' => 'nullable|string|max:255',
             'current_end_at' => 'nullable|date',
@@ -1012,8 +1031,17 @@ class BookingController extends Controller
 
             if ($feeDelta > 0) {
                 // Additional Payment Needed (Price Increased)
-                if ($request->filled('payment_method_id')) {
-                    $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+                if ($request->filled('payment_method_id') || $request->filled('payment_method') || $request->filled('payment_channel')) {
+                    $paymentMethod = PaymentMethod::resolveFromInput(
+                        $request->input('payment_method_id'),
+                        $request->input('payment_method'),
+                        $request->input('payment_channel')
+                    );
+                    if (!$paymentMethod) {
+                        throw ValidationException::withMessages([
+                            'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                        ]);
+                    }
                     $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
                     $branchId = (int)($booking->affiliate_id ?? $request->header('X-Branch-Id') ?? $user->affiliate_id);
@@ -1282,6 +1310,8 @@ class BookingController extends Controller
             'waiver_reason' => 'nullable|string|max:255',
             'manager_pin' => 'nullable|string',
             'payment_method_id' => 'nullable|integer|exists:payment_methods,id',
+            'payment_method' => 'nullable|string|max:50',
+            'payment_channel' => 'nullable|string|max:50',
             'cash_received' => 'nullable|numeric|min:0',
             'idempotency_key' => 'nullable|string|max:64',
         ]);
@@ -1331,8 +1361,12 @@ class BookingController extends Controller
         $validated = $request->validate([
             'asset_unit_id' => 'nullable|integer|exists:assets,id',
             'asset_id' => 'nullable|integer|exists:assets,id',
-            'collateral_type' => 'nullable|string|max:50',
+            'collateral_type' => 'nullable|string|max:100',
+            'collateral_type_id' => 'nullable|string|max:64',
+            'collateral_type_name' => 'nullable|string|max:100',
             'collateral_storage_slot' => 'nullable|string|max:100',
+            'collateral_detail' => 'nullable|string|max:150',
+            'collateral_deposit_amount' => 'nullable|numeric|min:0',
             'start_now' => 'nullable|boolean',
             'keep_original_end_at' => 'nullable|boolean',
         ]);

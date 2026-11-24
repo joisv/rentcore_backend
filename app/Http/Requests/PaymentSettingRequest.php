@@ -72,19 +72,24 @@ class PaymentSettingRequest extends FormRequest
         }
 
         $rawQris = $this->input('qris_statis_enabled')
+            ?? $this->input('static_qris')
             ?? $this->input('is_qris_enabled')
             ?? $this->input('qris_enabled');
         if ($rawQris !== null) {
             $parsed = $toBool($rawQris);
             $mergeData['qris_statis_enabled'] = $parsed;
+            $mergeData['static_qris'] = $parsed;
             $mergeData['is_qris_enabled'] = $parsed;
+            $mergeData['qris_enabled'] = $parsed;
         }
 
         $rawDynQris = $this->input('is_dynamic_qris_enabled')
-            ?? $this->input('dynamic_qris_enabled');
+            ?? $this->input('dynamic_qris_enabled')
+            ?? $this->input('dynamic_qris');
         if ($rawDynQris !== null) {
             $parsed = $toBool($rawDynQris);
             $mergeData['is_dynamic_qris_enabled'] = $parsed;
+            $mergeData['dynamic_qris'] = $parsed;
         }
 
         $rawCash = $this->input('cash_enabled')
@@ -138,10 +143,12 @@ class PaymentSettingRequest extends FormRequest
             'ewallet_providers.linkaja' => 'sometimes|nullable|boolean',
             'ewallet_providers.ovo' => 'sometimes|nullable|boolean',
             'qris_statis_enabled' => 'sometimes|nullable|boolean',
+            'static_qris' => 'sometimes|nullable|boolean',
             'is_qris_enabled' => 'sometimes|nullable|boolean',
             'qris_enabled' => 'sometimes|nullable|boolean',
             'is_dynamic_qris_enabled' => 'sometimes|nullable|boolean',
             'dynamic_qris_enabled' => 'sometimes|nullable|boolean',
+            'dynamic_qris' => 'sometimes|nullable|boolean',
             'cash_enabled' => 'sometimes|nullable|boolean',
             'is_cash_enabled' => 'sometimes|nullable|boolean',
             'bank_transfer_enabled' => 'sometimes|nullable|boolean',
@@ -160,27 +167,55 @@ class PaymentSettingRequest extends FormRequest
     public function withValidator($validator): void
     {
         $validator->after(function ($validator) {
-            // Guard: is_dynamic_qris_enabled cannot be true unless qris_raw_payload is present
-            if ($this->boolean('is_dynamic_qris_enabled')) {
-                $branchId = $this->input('branch_id');
-                $tenantContext = app(TenantContext::class);
-                $businessId = $tenantContext->getBusinessId();
-                $business = $businessId ? Business::find($businessId) : null;
+            $wantsStaticQris = $this->boolean('qris_statis_enabled')
+                || $this->boolean('qris_enabled')
+                || $this->boolean('static_qris')
+                || $this->boolean('is_qris_enabled');
+            $wantsDynamicQris = $this->boolean('is_dynamic_qris_enabled')
+                || $this->boolean('dynamic_qris_enabled')
+                || $this->boolean('dynamic_qris');
 
+            if (!$wantsStaticQris && !$wantsDynamicQris) {
+                return;
+            }
+
+            $branchId = $this->input('branch_id');
+            $tenantContext = app(TenantContext::class);
+            $businessId = $tenantContext->getBusinessId();
+            $business = $businessId ? Business::find($businessId) : null;
+
+            $removingImage = $this->boolean('remove_qris_image');
+            $hasIncomingImage = $this->hasFile('qris_image')
+                || !empty($this->input('qris_image_base64'));
+            $hasIncomingPayload = $hasIncomingImage
+                || !empty($this->input('qris_raw_payload'));
+
+            $existingConfig = $business ? $business->getPaymentMethodsConfig($branchId ? (int) $branchId : null) : [];
+            $existingImagePath = $removingImage ? null : ($existingConfig['qris_image_path'] ?? null);
+            $hasEffectiveImage = !empty($existingImagePath) || $hasIncomingImage;
+
+            if ($wantsStaticQris && !$hasEffectiveImage) {
+                $validator->errors()->add(
+                    'qris_statis_enabled',
+                    'Unggah gambar barcode QRIS terlebih dahulu untuk mengaktifkan pembayaran QRIS.'
+                );
+            }
+
+            if ($wantsDynamicQris) {
                 $currentRawPayload = null;
-                if ($branchId) {
-                    $branch = Affiliate::find($branchId);
-                    $currentRawPayload = $branch?->qris_raw_payload
-                        ?? $branch?->payment_methods_config_override['qris_raw_payload'] ?? null;
-                }
-                if (!$currentRawPayload && $business) {
-                    $currentRawPayload = $business->qris_raw_payload
-                        ?? $business->payment_methods_config['qris_raw_payload'] ?? null;
+                if (!$removingImage) {
+                    if ($branchId) {
+                        $branch = Affiliate::find($branchId);
+                        $currentRawPayload = $branch?->qris_raw_payload
+                            ?? $branch?->payment_methods_config_override['qris_raw_payload'] ?? null;
+                    }
+                    if (!$currentRawPayload && $business) {
+                        $currentRawPayload = $business->qris_raw_payload
+                            ?? $business->payment_methods_config['qris_raw_payload'] ?? null;
+                    }
                 }
 
-                $hasIncomingPayload = !empty($this->input('qris_raw_payload')) || $this->hasFile('qris_image') || !empty($this->input('qris_image_base64'));
-
-                if (empty($currentRawPayload) && !$hasIncomingPayload) {
+                if (!$hasEffectiveImage || (empty($currentRawPayload) && !$hasIncomingPayload)) {
                     $validator->errors()->add(
                         'is_dynamic_qris_enabled',
                         'Unggah gambar QRIS statis terlebih dahulu untuk mengaktifkan QRIS Dinamis.'

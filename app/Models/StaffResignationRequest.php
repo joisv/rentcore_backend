@@ -64,4 +64,25 @@ class StaffResignationRequest extends Model
     {
         return $this->status === 'cancelled';
     }
+
+    /**
+     * Fetch the latest resignation request per business for a given user in one query.
+     *
+     * @param  array<int>  $businessIds
+     * @return array<int, self>
+     */
+    public static function latestByBusinessForUser(string $userId, array $businessIds): array
+    {
+        if (empty($businessIds)) {
+            return [];
+        }
+
+        return static::where('user_id', $userId)
+            ->whereIn('business_id', $businessIds)
+            ->orderByDesc('id')
+            ->get()
+            ->unique('business_id')
+            ->keyBy('business_id')
+            ->all();
+    }
 }

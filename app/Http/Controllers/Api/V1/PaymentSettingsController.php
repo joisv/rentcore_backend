@@ -72,6 +72,7 @@ class PaymentSettingsController extends Controller
     {
         $config = $business->getPaymentMethodsConfig($branchId);
         $qrisImageUrl = $business->getQrisImageUrl($branchId);
+        $hasQrisImage = !empty($config['qris_image_path']);
 
         $isBranchOverride = false;
         if ($branchId) {
@@ -92,8 +93,11 @@ class PaymentSettingsController extends Controller
                     'linkaja' => (bool)($config['ewallet_providers']['linkaja'] ?? true),
                     'ovo' => (bool)($config['ewallet_providers']['ovo'] ?? true),
                 ],
-                'qris_statis_enabled' => (bool)($config['qris_statis_enabled'] ?? true),
-                'is_dynamic_qris_enabled' => (bool)($config['is_dynamic_qris_enabled'] ?? false),
+                'has_qris_image' => $hasQrisImage,
+                'qris_statis_enabled' => $hasQrisImage && (bool)($config['qris_statis_enabled'] ?? false),
+                'is_dynamic_qris_enabled' => $hasQrisImage
+                    && !empty($config['qris_raw_payload'])
+                    && (bool)($config['is_dynamic_qris_enabled'] ?? false),
                 'qris_raw_payload' => $config['qris_raw_payload'] ?? null,
                 'qris_image_path' => $config['qris_image_path'] ?? null,
                 'qris_image_url' => $qrisImageUrl,
@@ -233,11 +237,12 @@ class PaymentSettingsController extends Controller
             $newConfig['ewallet_providers'] = $normalizedProviders;
         }
 
-        if ($request->hasAny(['qris_statis_enabled', 'is_qris_enabled', 'qris_enabled'])) {
+        if ($request->hasAny(['qris_statis_enabled', 'static_qris', 'is_qris_enabled', 'qris_enabled'])) {
             $rawVal = $request->input('qris_statis_enabled')
+                ?? $request->input('static_qris')
                 ?? $request->input('is_qris_enabled')
                 ?? $request->input('qris_enabled');
-            $newConfig['qris_statis_enabled'] = $toBool($rawVal, true);
+            $newConfig['qris_statis_enabled'] = $toBool($rawVal, false);
         }
 
         if ($request->hasAny(['cash_enabled', 'is_cash_enabled'])) {
@@ -264,6 +269,7 @@ class PaymentSettingsController extends Controller
             }
             $newConfig['qris_image_path'] = null;
             $newConfig['qris_raw_payload'] = null;
+            $newConfig['qris_statis_enabled'] = false;
             $newConfig['is_dynamic_qris_enabled'] = false;
         }
 
@@ -355,10 +361,27 @@ class PaymentSettingsController extends Controller
             }
         }
 
+        // Handle static & dynamic QRIS guards after upload / removal
+        $hasImageAfterMutation = !empty($newConfig['qris_image_path']);
+        if (!empty($newConfig['qris_statis_enabled']) && !$hasImageAfterMutation) {
+            if ($request->hasAny(['qris_statis_enabled', 'static_qris', 'is_qris_enabled', 'qris_enabled'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unggah gambar barcode QRIS terlebih dahulu untuk mengaktifkan pembayaran QRIS.',
+                    'errors' => [
+                        'qris_statis_enabled' => ['Unggah gambar barcode QRIS terlebih dahulu untuk mengaktifkan pembayaran QRIS.'],
+                    ],
+                ], 422);
+            }
+            $newConfig['qris_statis_enabled'] = false;
+        }
+
         // Handle is_dynamic_qris_enabled toggle guard
-        if (isset($validated['is_dynamic_qris_enabled'])) {
-            $isDyn = (bool)$validated['is_dynamic_qris_enabled'];
-            if ($isDyn && empty($newConfig['qris_raw_payload'])) {
+        if (isset($validated['is_dynamic_qris_enabled']) || $request->hasAny(['dynamic_qris', 'dynamic_qris_enabled'])) {
+            $isDyn = (bool) ($validated['is_dynamic_qris_enabled']
+                ?? $request->input('dynamic_qris_enabled')
+                ?? $request->input('dynamic_qris'));
+            if ($isDyn && (!$hasImageAfterMutation || empty($newConfig['qris_raw_payload']))) {
                 return response()->json([
                     'success' => false,
                     'message' => 'Unggah gambar QRIS statis terlebih dahulu untuk mengaktifkan QRIS Dinamis.',
@@ -368,6 +391,8 @@ class PaymentSettingsController extends Controller
                 ], 422);
             }
             $newConfig['is_dynamic_qris_enabled'] = $isDyn;
+        } elseif (!$hasImageAfterMutation) {
+            $newConfig['is_dynamic_qris_enabled'] = false;
         }
 
         // Persist to database

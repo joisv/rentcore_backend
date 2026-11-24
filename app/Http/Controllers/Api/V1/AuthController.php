@@ -48,8 +48,14 @@ class AuthController extends Controller
             ->where('is_active', true)
             ->get();
 
-        $businesses = $memberships->map(function ($m) {
+        $latestResignations = \App\Models\StaffResignationRequest::latestByBusinessForUser(
+            $user->id,
+            $memberships->pluck('business_id')->all()
+        );
+
+        $businesses = $memberships->map(function ($m) use ($latestResignations) {
             $biz = $m->business;
+            $latestResign = $latestResignations[$biz->id] ?? null;
             return [
                 'id' => $biz->id,
                 'uuid' => $biz->uuid,
@@ -62,11 +68,19 @@ class AuthController extends Controller
                 'currency' => $biz->currency,
                 'payment_methods_config' => $biz->payment_methods_config,
                 'qris_raw_payload' => $biz->qris_raw_payload,
+                'qris_image_url' => $biz->getQrisImageUrl(),
                 'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
                 'business_categories' => $biz->business_categories ?? [],
                 'branch_structure' => $biz->branch_structure ?? 'single_location',
                 'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
+                'enable_collateral' => $biz->isCollateralEnabled(),
+                'require_collateral' => $biz->isCollateralRequired(),
+                'collateral_types' => $biz->getResolvedCollateralTypes(),
                 'role' => $m->role,
+                'resign_status' => $latestResign?->status,
+                'resign_reason' => $latestResign?->reason,
+                'resign_rejection_reason' => $latestResign?->decision_notes,
+                'resign_requested_at' => $latestResign?->created_at,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
         });
@@ -234,8 +248,14 @@ class AuthController extends Controller
             ->where('is_active', true)
             ->get();
 
-        $businesses = $memberships->map(function ($m) {
+        $latestResignations = \App\Models\StaffResignationRequest::latestByBusinessForUser(
+            $user->id,
+            $memberships->pluck('business_id')->all()
+        );
+
+        $businesses = $memberships->map(function ($m) use ($latestResignations) {
             $biz = $m->business;
+            $latestResign = $latestResignations[$biz->id] ?? null;
             return [
                 'id' => $biz->id,
                 'uuid' => $biz->uuid,
@@ -248,11 +268,19 @@ class AuthController extends Controller
                 'currency' => $biz->currency,
                 'payment_methods_config' => $biz->payment_methods_config,
                 'qris_raw_payload' => $biz->qris_raw_payload,
+                'qris_image_url' => $biz->getQrisImageUrl(),
                 'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
                 'business_categories' => $biz->business_categories ?? [],
                 'branch_structure' => $biz->branch_structure ?? 'single_location',
                 'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
+                'enable_collateral' => $biz->isCollateralEnabled(),
+                'require_collateral' => $biz->isCollateralRequired(),
+                'collateral_types' => $biz->getResolvedCollateralTypes(),
                 'role' => $m->role,
+                'resign_status' => $latestResign?->status,
+                'resign_reason' => $latestResign?->reason,
+                'resign_rejection_reason' => $latestResign?->decision_notes,
+                'resign_requested_at' => $latestResign?->created_at,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
         });
@@ -290,8 +318,14 @@ class AuthController extends Controller
             ->where('is_active', true)
             ->get();
 
-        $businesses = $memberships->map(function ($m) {
+        $latestResignations = \App\Models\StaffResignationRequest::latestByBusinessForUser(
+            $user->id,
+            $memberships->pluck('business_id')->all()
+        );
+
+        $businesses = $memberships->map(function ($m) use ($latestResignations) {
             $biz = $m->business;
+            $latestResign = $latestResignations[$biz->id] ?? null;
             return [
                 'id' => $biz->id,
                 'uuid' => $biz->uuid,
@@ -304,11 +338,19 @@ class AuthController extends Controller
                 'currency' => $biz->currency,
                 'payment_methods_config' => $biz->payment_methods_config,
                 'qris_raw_payload' => $biz->qris_raw_payload,
+                'qris_image_url' => $biz->getQrisImageUrl(),
                 'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
                 'business_categories' => $biz->business_categories ?? [],
                 'branch_structure' => $biz->branch_structure ?? 'single_location',
                 'has_completed_onboarding' => (bool) ($biz->has_completed_onboarding ?? false),
+                'enable_collateral' => $biz->isCollateralEnabled(),
+                'require_collateral' => $biz->isCollateralRequired(),
+                'collateral_types' => $biz->getResolvedCollateralTypes(),
                 'role' => $m->role,
+                'resign_status' => $latestResign?->status,
+                'resign_reason' => $latestResign?->reason,
+                'resign_rejection_reason' => $latestResign?->decision_notes,
+                'resign_requested_at' => $latestResign?->created_at,
                 'branches' => $m->serializeAccessibleBranches(),
             ];
         });

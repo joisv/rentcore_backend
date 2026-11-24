@@ -8,8 +8,10 @@ use App\Models\Business;
 use App\Models\BusinessMember;
 use App\Models\BranchMember;
 use App\Models\CashDrawerShift;
+use App\Models\StaffResignationRequest;
 use App\Models\User;
 use App\Services\AuditLogService;
+use App\Services\BusinessPresetService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
@@ -33,8 +35,14 @@ class BusinessController extends Controller
             ->where('is_active', true)
             ->get();
 
-        $businesses = $memberships->map(function ($membership) {
+        $latestResignations = StaffResignationRequest::latestByBusinessForUser(
+            $user->id,
+            $memberships->pluck('business_id')->all()
+        );
+
+        $businesses = $memberships->map(function ($membership) use ($latestResignations) {
             $biz = $membership->business;
+            $latestResign = $latestResignations[$biz->id] ?? null;
             return [
                 'id' => $biz->id,
                 'uuid' => $biz->uuid,
@@ -47,6 +55,7 @@ class BusinessController extends Controller
                 'currency' => $biz->currency,
                 'payment_methods_config' => $biz->payment_methods_config,
                 'qris_raw_payload' => $biz->qris_raw_payload,
+                'qris_image_url' => $biz->getQrisImageUrl(),
                 'is_dynamic_qris_enabled' => (bool) ($biz->is_dynamic_qris_enabled ?? false),
                 'business_categories' => $biz->business_categories ?? [],
                 'branch_structure' => $biz->branch_structure ?? 'single_location',
@@ -59,8 +68,15 @@ class BusinessController extends Controller
                 'late_fee_rounding_mode' => $biz->late_fee_rounding_mode ?: 'hourly_ceil',
                 'cap_late_fee_at_daily_rate' => $biz->cap_late_fee_at_daily_rate !== null ? (bool) $biz->cap_late_fee_at_daily_rate : true,
                 'default_hourly_late_fee' => $biz->default_hourly_late_fee !== null ? (float) $biz->default_hourly_late_fee : 0.0,
+                'enable_collateral' => $biz->isCollateralEnabled(),
+                'require_collateral' => $biz->isCollateralRequired(),
+                'collateral_types' => $biz->getResolvedCollateralTypes(),
                 'role' => $membership->role,
                 'joined_at' => $membership->joined_at,
+                'resign_status' => $latestResign?->status,
+                'resign_reason' => $latestResign?->reason,
+                'resign_rejection_reason' => $latestResign?->decision_notes,
+                'resign_requested_at' => $latestResign?->created_at,
                 // Only branches this member is authorized for (central first). Prevents the
                 // client from defaulting to a branch the tenant middleware will reject.
                 'branches' => $membership->serializeAccessibleBranches(),
@@ -86,6 +102,7 @@ class BusinessController extends Controller
             'address' => 'nullable|string',
             'city' => 'nullable|string|max:100',
             'currency' => 'nullable|string|max:10',
+            'niche_preset' => 'nullable|string|in:iphone_gadget,playstation_console,camera_lens,custom',
             'business_categories' => 'nullable|array',
             'business_categories.*' => 'string|max:50',
             'branch_structure' => 'nullable|string|in:single_location,multi_branch,single_scalable',
@@ -95,6 +112,11 @@ class BusinessController extends Controller
         ]);
 
         $user = $request->user();
+        $nichePreset = $validated['niche_preset'] ?? null;
+        $resolvedCategories = BusinessPresetService::resolveBusinessCategories(
+            $nichePreset,
+            $validated['business_categories'] ?? null
+        );
 
         // Only reuse an explicitly referenced pending business that belongs to this user,
         // has not completed onboarding, and has zero branches and zero bookings.
@@ -131,10 +153,14 @@ class BusinessController extends Controller
                 'email' => $validated['email'] ?? $existingBusiness->email,
                 'address' => $validated['address'] ?? $existingBusiness->address,
                 'city' => $validated['city'] ?? $existingBusiness->city,
-                'business_categories' => $validated['business_categories'] ?? $existingBusiness->business_categories,
+                'business_categories' => $resolvedCategories ?? $existingBusiness->business_categories,
                 'branch_structure' => $validated['branch_structure'] ?? $existingBusiness->branch_structure ?? 'single_location',
+                'booking_grace_period_minutes' => $existingBusiness->booking_grace_period_minutes ?? 60,
+                'return_grace_period_minutes' => $existingBusiness->return_grace_period_minutes ?? 15,
                 'has_completed_onboarding' => true,
             ], fn($v) => $v !== null));
+
+            BusinessPresetService::seedStarterCategories($existingBusiness->id, $nichePreset);
 
             return response()->json([
                 'success' => true,
@@ -143,7 +169,7 @@ class BusinessController extends Controller
             ], 200);
         }
 
-        $business = DB::transaction(function () use ($validated, $user, $request, $uniqueSlug) {
+        $business = DB::transaction(function () use ($validated, $user, $request, $uniqueSlug, $nichePreset, $resolvedCategories) {
             $business = Business::create([
                 'name' => $validated['name'],
                 'slug' => $uniqueSlug,
@@ -151,8 +177,10 @@ class BusinessController extends Controller
                 'email' => $validated['email'] ?? $user->email,
                 'address' => filled($validated['address'] ?? null) ? $validated['address'] : null,
                 'city' => filled($validated['city'] ?? null) ? $validated['city'] : null,
-                'business_categories' => $validated['business_categories'] ?? null,
+                'business_categories' => $resolvedCategories,
                 'branch_structure' => $validated['branch_structure'] ?? 'single_location',
+                'booking_grace_period_minutes' => 60,
+                'return_grace_period_minutes' => 15,
                 'has_completed_onboarding' => true,
                 'currency' => $validated['currency'] ?? 'IDR',
                 'owner_id' => $user->id,
@@ -173,7 +201,9 @@ class BusinessController extends Controller
                 ? strtoupper(trim($validated['initial_branch_code']))
                 : strtoupper(substr(preg_replace('/[^a-zA-Z]/', '', $business->name), 0, 3) ?: 'PST');
 
-            $branchName = $validated['initial_branch_name'] ?? ($business->name . ' Pusat');
+            $branchName = !empty($validated['initial_branch_name'])
+                ? trim($validated['initial_branch_name'])
+                : ($business->name . ' Pusat');
 
             $branch = Affiliate::create([
                 'business_id' => $business->id,
@@ -183,6 +213,7 @@ class BusinessController extends Controller
                 'phone' => $business->phone,
                 'address' => $business->address ?: null,
                 'city' => $business->city ?: null,
+                'booking_grace_period_minutes' => 60,
                 'is_central' => true,
                 'is_active' => true,
             ]);
@@ -193,12 +224,18 @@ class BusinessController extends Controller
                 'affiliate_id' => $branch->id,
             ]);
 
+            BusinessPresetService::seedStarterCategories($business->id, $nichePreset);
+
             AuditLogService::log(
                 $user,
                 'business.created',
                 'Business',
                 $business->id,
-                ['name' => $business->name, 'branch' => $branch->name],
+                [
+                    'name' => $business->name,
+                    'branch' => $branch->name,
+                    'niche_preset' => $nichePreset,
+                ],
                 null,
                 $request->ip(),
                 $branch->id,
@@ -316,6 +353,13 @@ class BusinessController extends Controller
             'late_fee_rounding_mode' => 'nullable|string|in:hourly_ceil,half_hourly_ceil',
             'cap_late_fee_at_daily_rate' => 'nullable|boolean',
             'default_hourly_late_fee' => 'nullable|numeric|min:0',
+            'enable_collateral' => 'nullable|boolean',
+            'require_collateral' => 'nullable|boolean',
+            'collateral_types' => 'nullable|array',
+            'collateral_types.*.id' => 'nullable|string|max:64',
+            'collateral_types.*.name' => 'required_with:collateral_types|string|max:100',
+            'collateral_types.*.input_mode' => 'required_with:collateral_types|string|in:vault_slot,cash_deposit,note_only',
+            'collateral_types.*.is_active' => 'required_with:collateral_types|boolean',
         ]);
 
         $oldName = $business->name;
@@ -348,6 +392,12 @@ class BusinessController extends Controller
         if ($request->exists('default_hourly_late_fee')) {
             $updates['default_hourly_late_fee'] = $validated['default_hourly_late_fee'];
         }
+        if (array_key_exists('enable_collateral', $validated) || array_key_exists('require_collateral', $validated) || array_key_exists('collateral_types', $validated)) {
+            $updates = array_merge(
+                $updates,
+                $this->validateAndPrepareCollateralUpdates($business, $validated)
+            );
+        }
 
         if (!empty($updates)) {
             $business->update($updates);
@@ -372,6 +422,132 @@ class BusinessController extends Controller
             'success' => true,
             'message' => 'Informasi bisnis berhasil diperbarui.',
             'data' => $business,
+        ]);
+    }
+
+    /**
+     * Validate and normalize enable_collateral, require_collateral, and collateral_types updates.
+     */
+    protected function validateAndPrepareCollateralUpdates(Business $business, array $validated): array
+    {
+        $nextEnabled = array_key_exists('enable_collateral', $validated) && $validated['enable_collateral'] !== null
+            ? (bool) $validated['enable_collateral']
+            : $business->isCollateralEnabled();
+
+        $nextRequired = array_key_exists('require_collateral', $validated) && $validated['require_collateral'] !== null
+            ? (bool) $validated['require_collateral']
+            : $business->isCollateralRequired();
+
+        $nextTypes = array_key_exists('collateral_types', $validated)
+            ? Business::normalizeCollateralTypes($validated['collateral_types'])
+            : $business->getResolvedCollateralTypes();
+
+        if (array_key_exists('collateral_types', $validated) && empty($validated['collateral_types'])) {
+            $nextTypes = [];
+        }
+
+        $activeCount = collect($nextTypes)->where('is_active', true)->count();
+        if ($nextEnabled && $nextRequired && $activeCount < 1) {
+            throw ValidationException::withMessages([
+                'collateral_types' => ['Minimal 1 tipe jaminan harus aktif saat aturan Wajibkan Jaminan diaktifkan.'],
+            ]);
+        }
+
+        $updates = [];
+        if (array_key_exists('enable_collateral', $validated) && $validated['enable_collateral'] !== null) {
+            $updates['enable_collateral'] = $nextEnabled;
+        }
+        if (array_key_exists('require_collateral', $validated) && $validated['require_collateral'] !== null) {
+            $updates['require_collateral'] = $nextRequired;
+        }
+        if (array_key_exists('collateral_types', $validated)) {
+            $updates['collateral_types'] = array_values($nextTypes);
+        }
+
+        return $updates;
+    }
+
+    /**
+     * Get collateral types and rules for the active business.
+     */
+    public function getCollateralSettings(Request $request, ?int $id = null): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int) $id : $context->getBusinessId();
+        $user = $request->user();
+
+        $isMember = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->exists();
+
+        if (!$isMember && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Akses ditolak. Anda bukan anggota aktif dari bisnis ini.',
+            ], 403);
+        }
+
+        $business = Business::findOrFail($businessId);
+
+        return response()->json([
+            'success' => true,
+            'data' => $business->getCollateralSettings(),
+        ]);
+    }
+
+    /**
+     * Update collateral types and rules for the active business (Owner/Admin only).
+     */
+    public function updateCollateralSettings(Request $request, ?int $id = null): JsonResponse
+    {
+        $context = app(TenantContext::class);
+        $businessId = $id ? (int) $id : $context->getBusinessId();
+        $user = $request->user();
+
+        $member = BusinessMember::where('business_id', $businessId)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->first();
+
+        if ((!$member || !$member->isAdmin()) && !$user->isPlatformAdmin() && !$user->isSuperAdmin()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner atau Admin yang berhak mengubah tipe & aturan jaminan.',
+            ], 403);
+        }
+
+        $business = Business::findOrFail($businessId);
+
+        $validated = $request->validate([
+            'enable_collateral' => 'nullable|boolean',
+            'require_collateral' => 'nullable|boolean',
+            'collateral_types' => 'nullable|array',
+            'collateral_types.*.id' => 'nullable|string|max:64',
+            'collateral_types.*.name' => 'required_with:collateral_types|string|max:100',
+            'collateral_types.*.input_mode' => 'required_with:collateral_types|string|in:vault_slot,cash_deposit,note_only',
+            'collateral_types.*.is_active' => 'required_with:collateral_types|boolean',
+        ]);
+
+        $updates = $this->validateAndPrepareCollateralUpdates($business, $validated);
+        if (!empty($updates)) {
+            $business->update($updates);
+        }
+
+        AuditLogService::log(
+            $user,
+            'business.collateral_settings_updated',
+            'Business',
+            $business->id,
+            $updates,
+            null,
+            $request->ip()
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Tipe & aturan jaminan berhasil disimpan.',
+            'data' => $business->fresh()->getCollateralSettings(),
         ]);
     }
 

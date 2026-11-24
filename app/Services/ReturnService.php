@@ -315,8 +315,21 @@ class ReturnService
                 );
             }
 
-            if ($totalPenalty > 0 && !empty($data['penalty_payment_method_id'])) {
-                $paymentMethod = PaymentMethod::findOrFail($data['penalty_payment_method_id']);
+            $hasPenaltyMethodSpec = !empty($data['penalty_payment_method_id'])
+                || !empty($data['payment_method'])
+                || !empty($data['payment_channel']);
+
+            if ($totalPenalty > 0 && $hasPenaltyMethodSpec) {
+                $paymentMethod = PaymentMethod::resolveFromInput(
+                    $data['penalty_payment_method_id'] ?? null,
+                    $data['payment_method'] ?? null,
+                    $data['payment_channel'] ?? null
+                );
+                if (!$paymentMethod) {
+                    throw ValidationException::withMessages([
+                        'penalty_payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                    ]);
+                }
                 $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
                 // Enforce business & branch payment method availability
@@ -369,7 +382,7 @@ class ReturnService
 
             // 4. Update Booking Status
             $newPaymentStatus = $booking->payment_status;
-            if ($totalPenalty > 0 && empty($data['penalty_payment_method_id'])) {
+            if ($totalPenalty > 0 && !$hasPenaltyMethodSpec) {
                 $newPaymentStatus = 'partial';
             }
 
@@ -402,7 +415,7 @@ class ReturnService
             }
 
             // 6. Record Penalty Payment if applicable
-            if ($totalPenalty > 0 && !empty($data['penalty_payment_method_id'])) {
+            if ($totalPenalty > 0 && $paymentMethod !== null) {
                 $existingPenaltyTx = PaymentTransaction::where('booking_id', $booking->id)
                     ->where('type', 'penalty')
                     ->first();

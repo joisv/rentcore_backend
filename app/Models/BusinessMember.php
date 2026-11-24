@@ -108,6 +108,7 @@ class BusinessMember extends Model
      */
     public function serializeAccessibleBranches(): array
     {
+        $biz = $this->business;
         return $this->accessibleBranches()->map(fn($b) => [
             'id' => $b->id,
             'code' => $b->code,
@@ -118,6 +119,7 @@ class BusinessMember extends Model
             'is_central' => (bool) $b->is_central,
             'payment_methods_config_override' => $b->payment_methods_config_override,
             'qris_raw_payload' => $b->qris_raw_payload,
+            'qris_image_url' => $biz?->getQrisImageUrl($b->id),
             'is_dynamic_qris_enabled' => (bool) ($b->is_dynamic_qris_enabled ?? false),
             'booking_grace_period_minutes' => (int) ($b->booking_grace_period_minutes ?? 60),
             'booking_auto_noshow' => $b->booking_auto_noshow !== null ? (bool) $b->booking_auto_noshow : true,

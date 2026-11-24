@@ -44,6 +44,8 @@ class CashierController extends Controller
         $cacheKey = $branchId ? "branch_{$branchId}_payment_methods" : "business_{$businessId}_payment_methods";
 
         $filteredMethods = Cache::remember($cacheKey, 3600, function () use ($businessId, $branchId) {
+            PaymentMethod::ensureCoreMethodsExist();
+
             $business = $businessId ? \App\Models\Business::find($businessId) : null;
             if (!$business && $branchId) {
                 $branch = \App\Models\Affiliate::find($branchId);
@@ -60,6 +62,7 @@ class CashierController extends Controller
                     return $business->isPaymentMethodEnabled($m, $branchId ? (int)$branchId : null);
                 })->map(function ($m) use ($qrisImageUrl, $config) {
                     $item = $m->toArray();
+                    $item['name'] = $m->displayLabel();
                     if (strtoupper($m->code) === 'QRIS') {
                         $item['qris_image_url'] = $qrisImageUrl;
                         $item['qris_raw_payload'] = $config['qris_raw_payload'] ?? null;
@@ -69,7 +72,11 @@ class CashierController extends Controller
                 })->values()->all();
             }
 
-            return $allMethods->toArray();
+            return $allMethods->map(function ($m) {
+                $item = $m->toArray();
+                $item['name'] = $m->displayLabel();
+                return $item;
+            })->values()->all();
         });
 
         return response()->json([
@@ -88,7 +95,9 @@ class CashierController extends Controller
     {
         $request->validate([
             'booking_id' => 'required|integer|exists:bookings,id',
-            'payment_method_id' => 'required|integer|exists:payment_methods,id',
+            'payment_method_id' => 'required_without_all:payment_method,payment_channel|nullable|integer|exists:payment_methods,id',
+            'payment_method' => 'nullable|string|max:50',
+            'payment_channel' => 'nullable|string|max:50',
             'payment_type' => 'nullable|in:settlement,penalty,dp,extension',
             'amount' => 'nullable|numeric|min:0',
             'cash_received' => 'nullable|numeric|min:0',
@@ -98,8 +107,12 @@ class CashierController extends Controller
             'account_removed' => 'nullable|boolean',
             'is_handover_settlement' => 'nullable|boolean',
             'asset_unit_id' => 'nullable|integer|exists:assets,id',
-            'collateral_type' => 'nullable|string|max:50',
+            'collateral_type' => 'nullable|string|max:100',
+            'collateral_type_id' => 'nullable|string|max:64',
+            'collateral_type_name' => 'nullable|string|max:100',
             'collateral_storage_slot' => 'nullable|string|max:100',
+            'collateral_detail' => 'nullable|string|max:150',
+            'collateral_deposit_amount' => 'nullable|numeric|min:0',
             'start_now' => 'nullable|boolean',
             'keep_original_end_at' => 'nullable|boolean',
         ]);
@@ -147,7 +160,16 @@ class CashierController extends Controller
         }
 
         $type = $request->get('payment_type', 'settlement');
-        $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+        $paymentMethod = PaymentMethod::resolveFromInput(
+            $request->input('payment_method_id'),
+            $request->input('payment_method'),
+            $request->input('payment_channel')
+        );
+        if (!$paymentMethod) {
+            throw ValidationException::withMessages([
+                'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+            ]);
+        }
         $isCash = strtoupper($paymentMethod->code) === 'CASH';
 
         // Enforce business & branch payment method availability
@@ -376,7 +398,11 @@ class CashierController extends Controller
                         [
                             'asset_unit_id' => $request->input('asset_unit_id'),
                             'collateral_type' => $request->input('collateral_type'),
+                            'collateral_type_id' => $request->input('collateral_type_id'),
+                            'collateral_type_name' => $request->input('collateral_type_name'),
                             'collateral_storage_slot' => $request->input('collateral_storage_slot'),
+                            'collateral_detail' => $request->input('collateral_detail'),
+                            'collateral_deposit_amount' => $request->input('collateral_deposit_amount'),
                         ],
                         $user
                     );
@@ -540,7 +566,7 @@ class CashierController extends Controller
                 'discount_amount' => (float)$tx->booking->discount_amount,
                 'voucher_code' => $tx->booking->voucher->code ?? null,
                 'total_amount' => (float)$tx->amount,
-                'payment_method' => $tx->paymentMethod->name ?? 'Tunai',
+                'payment_method' => PaymentMethod::normalizeDisplayName($tx->paymentMethod, 'Tunai'),
                 'type' => $tx->type,
                 'type_label' => $tx->type === 'penalty'
                     ? 'Denda Keterlambatan (Late Return Penalty)'
@@ -731,9 +757,10 @@ class CashierController extends Controller
             }
 
             $amount = (float)$tx->amount;
-            $methodName = $tx->paymentMethod->name ?? 'Lainnya';
+            $rawMethodName = $tx->paymentMethod->name ?? '';
+            $methodName = $tx->paymentMethod ? $tx->paymentMethod->displayLabel() : 'Lainnya';
             $methodCode = strtolower($tx->paymentMethod->code ?? '');
-            $isCash = $methodCode === 'cash' || str_contains(strtolower($methodName), 'tunai');
+            $isCash = $methodCode === 'cash' || ($methodCode === '' && str_contains(strtolower($rawMethodName), 'tunai'));
 
             // Security deposits (`deposit` / `deposit_refund`) affect physical cash drawer balance
             // when settled in cash, but are excluded from net revenue calculations.
@@ -976,7 +1003,7 @@ class CashierController extends Controller
                 'direction' => $tx->direction ?? ($tx->type === 'refund' ? 'outflow' : 'inflow'),
                 'cashier_name' => $tx->processedBy?->name ?? 'Kasir',
                 'amount' => (float)$tx->amount,
-                'payment_method' => $tx->paymentMethod?->name ?? 'Tunai',
+                'payment_method' => PaymentMethod::normalizeDisplayName($tx->paymentMethod, 'Tunai'),
                 'type' => $tx->type,
                 'type_label' => match ($tx->type) {
                     'penalty' => 'Denda Keterlambatan (Late Return Penalty)',

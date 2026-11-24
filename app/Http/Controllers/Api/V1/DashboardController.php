@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Models\Asset;
+use App\Models\AssetModel;
 use App\Models\Booking;
 use App\Models\PaymentTransaction;
 use App\Services\TimezoneService;
@@ -105,6 +106,10 @@ class DashboardController extends Controller
         $unitsMaintenance = (clone $assetQuery)->where('status', 'maintenance')->count();
         $unitsInTransit = (clone $assetQuery)->where('status', 'in_transit')->count();
         $utilizationRate = $unitsTotal > 0 ? round(($unitsRented / $unitsTotal) * 100, 1) : 0.0;
+        $modelsTotal = AssetModel::query()
+            ->when($businessId, fn ($q) => $q->where('business_id', $businessId))
+            ->where('is_active', true)
+            ->count();
 
         // 2. Operational Bookings Metrics (Scoped to target branch or consolidated)
         $bookingQuery = Booking::query();
@@ -156,7 +161,11 @@ class DashboardController extends Controller
                 'late_minutes' => $lateMinutes,
                 'running_penalty' => $runningFee,
                 'end_at' => $endAt->format('d M Y, H:i'),
+                'collateral_type' => $booking->collateral_type,
+                'collateral_type_id' => $booking->collateral_type_id,
+                'collateral_type_name' => $booking->collateral_type_name,
                 'collateral_storage_slot' => $booking->collateral_storage_slot,
+                'collateral_deposit_amount' => $booking->collateral_deposit_amount,
             ];
         });
 
@@ -180,7 +189,11 @@ class DashboardController extends Controller
                     'unit_name' => $unitName,
                     'unit_image_url' => $firstItem?->asset?->model?->image_url,
                     'expected_return_at' => $expectedReturn,
+                    'collateral_type' => $booking->collateral_type,
+                    'collateral_type_id' => $booking->collateral_type_id,
+                    'collateral_type_name' => $booking->collateral_type_name,
                     'collateral_storage_slot' => $booking->collateral_storage_slot,
+                    'collateral_deposit_amount' => $booking->collateral_deposit_amount,
                 ];
             });
 
@@ -227,6 +240,8 @@ class DashboardController extends Controller
                 'is_consolidated' => $targetBranchId === null,
                 'kpi' => [
                     // Inventory overview
+                    'models_total' => $modelsTotal,
+                    'total_models' => $modelsTotal,
                     'units_total' => $unitsTotal,
                     'total_units' => $unitsTotal,
                     'total_units_count' => $unitsTotal,

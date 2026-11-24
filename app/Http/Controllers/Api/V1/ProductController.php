@@ -236,7 +236,7 @@ class ProductController extends Controller
             'has_serial_number' => $validated['has_serial_number'] ?? true,
             'requires_frp_check' => $validated['requires_frp_check'] ?? false,
             'specifications' => $validated['specifications'] ?? null,
-            'is_addon' => $validated['is_addon'] ?? false,
+            'is_addon' => $request->has('is_addon') ? $request->boolean('is_addon') : false,
             'is_active' => $validated['is_active'] ?? true,
             'hourly_late_fee' => $validated['hourly_late_fee'] ?? null,
         ]);
@@ -340,6 +340,9 @@ class ProductController extends Controller
 
         return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
             $productFields = collect($validated)->except(['rates', 'image', 'remove_image'])->filter(fn($v) => $v !== null)->toArray();
+            if ($request->has('is_addon')) {
+                $productFields['is_addon'] = $request->boolean('is_addon');
+            }
             if ($request->exists('hourly_late_fee')) {
                 $productFields['hourly_late_fee'] = $validated['hourly_late_fee'] !== null
                     ? (float) $validated['hourly_late_fee']

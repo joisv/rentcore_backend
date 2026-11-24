@@ -333,16 +333,23 @@ class NotificationService
 
     /**
      * Triggered when a staff member submits a resignation request.
+     * Notifies every active Owner of the exact same business_id.
      */
     public function notifyResignationSubmitted(StaffResignationRequest $resignation): ?TenantNotification
     {
         $business = Business::find($resignation->business_id);
-        if (!$business || !$business->owner_id) {
+        if (!$business) {
             return null;
         }
 
         $resignation->loadMissing(['user.affiliate', 'businessMember.branchMembers.branch']);
         $staffName = $resignation->user?->name ?? 'Staf';
+        $roleRaw = strtolower((string) ($resignation->businessMember?->role ?? $resignation->user?->role ?? 'staff'));
+        $roleLabel = match ($roleRaw) {
+            'admin' => 'Admin',
+            'cashier' => 'Kasir',
+            default => 'Staf',
+        };
         $branchModels = $resignation->businessMember?->branchMembers
             ?->pluck('branch')
             ->filter()
@@ -351,30 +358,56 @@ class NotificationService
             ? $branchModels->pluck('name')->implode(', ')
             : ($resignation->user?->affiliate?->name ?? 'Semua Cabang');
         $affiliateId = $branchModels?->first()?->id ?? $resignation->user?->affiliate_id;
-        $reasonSnippet = $resignation->reason ? " Alasan: \"{$resignation->reason}\"" : '';
+        $reasonSnippet = $resignation->reason ? " Alasan: {$resignation->reason}" : '';
 
-        return $this->notify(
+        $ownerUserIds = \App\Models\BusinessMember::where('business_id', $resignation->business_id)
+            ->where('is_active', true)
+            ->where('role', 'owner')
+            ->pluck('user_id')
+            ->all();
+
+        if ($business->owner_id) {
+            $ownerUserIds[] = $business->owner_id;
+        }
+
+        $recipientIds = array_values(array_unique(array_filter(
+            $ownerUserIds,
+            fn ($uid) => (string) $uid !== (string) $resignation->user_id
+        )));
+
+        if (empty($recipientIds)) {
+            return null;
+        }
+
+        $notifications = $this->notifyUsers(
             $resignation->business_id,
-            $affiliateId ? (int)$affiliateId : null,
-            $business->owner_id,
+            $affiliateId ? (int) $affiliateId : null,
+            $recipientIds,
             'membership',
             'staff.resignation_submitted',
             'Pengajuan Resign Staf',
-            "{$staffName} ({$branchName}) mengajukan pengunduran diri dari {$business->name}.{$reasonSnippet}",
+            "{$staffName} ({$roleLabel} • {$branchName}) mengajukan pengunduran diri dari {$business->name}.{$reasonSnippet}",
             '/organization',
             [
                 'resignation_id' => $resignation->id,
                 'resignation_request_id' => $resignation->id,
                 'business_id' => $resignation->business_id,
+                'business_name' => $business->name,
+                'member_id' => $resignation->business_member_id,
                 'staff_id' => $resignation->user_id,
+                'staff_user_id' => $resignation->user_id,
                 'staff_name' => $staffName,
+                'staff_role' => $roleLabel,
                 'branch_name' => $branchName,
                 'reason' => $resignation->reason,
                 'status' => 'pending',
                 'action' => 'review_resignation',
+                'target_route' => 'manage_team',
             ],
             "resignation.submitted:{$resignation->id}"
         );
+
+        return $notifications[0] ?? null;
     }
 
     /**
@@ -384,7 +417,7 @@ class NotificationService
     {
         $notifications = TenantNotification::withoutGlobalScopes()
             ->where('business_id', $resignation->business_id)
-            ->whereIn('type', ['staff.resignation_submitted', 'resignation_request'])
+            ->whereIn('type', ['staff.resignation_submitted', 'resignation_request', 'resign_requested'])
             ->get();
 
         foreach ($notifications as $notification) {
@@ -410,13 +443,15 @@ class NotificationService
      */
     public function notifyResignationDecided(StaffResignationRequest $resignation): ?TenantNotification
     {
+        $resignation->loadMissing(['business', 'decidedBy']);
         $isApproved = $resignation->status === 'approved';
         $businessName = $resignation->business?->name ?? 'bisnis rental';
+        $ownerName = $resignation->decidedBy?->name ?? 'Owner';
         $title = $isApproved ? 'Pengajuan Resign Disetujui' : 'Pengajuan Resign Ditolak';
-        $notesText = $resignation->decision_notes ? " Alasan: {$resignation->decision_notes}." : '';
+        $notesText = $resignation->decision_notes ? " Catatan: {$resignation->decision_notes}" : '';
         $body = $isApproved
-            ? "Pengajuan resign Anda dari {$businessName} telah disetujui oleh Owner.{$notesText}"
-            : "Pengajuan resign Anda dari {$businessName} ditolak oleh Owner.{$notesText}";
+            ? "Pengajuan resign Anda dari {$businessName} telah disetujui oleh {$ownerName}.{$notesText}"
+            : "Pengajuan resign Anda di {$businessName} ditolak oleh {$ownerName}.{$notesText}";
 
         return $this->notify(
             $resignation->business_id,
@@ -426,14 +461,17 @@ class NotificationService
             $isApproved ? 'staff.resignation_approved' : 'staff.resignation_rejected',
             $title,
             $body,
-            '/organization',
+            '/profile',
             [
                 'resignation_id' => $resignation->id,
                 'resignation_request_id' => $resignation->id,
                 'business_id' => $resignation->business_id,
+                'business_name' => $businessName,
+                'owner_name' => $ownerName,
                 'status' => $resignation->status,
                 'decision_notes' => $resignation->decision_notes,
                 'rejection_reason' => $resignation->decision_notes,
+                'target_route' => 'user_profile',
             ],
             "resignation.decided:{$resignation->id}:{$resignation->status}"
         );

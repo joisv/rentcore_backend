@@ -53,6 +53,7 @@ class PaymentSettingsSyncAndCacheTest extends TestCase
                 ],
                 'qris_statis_enabled' => true,
                 'is_dynamic_qris_enabled' => false,
+                'qris_image_path' => 'qris/initial_qris.png',
                 'cash_enabled' => true,
                 'bank_transfer_enabled' => true,
             ],

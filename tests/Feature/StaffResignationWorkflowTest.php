@@ -580,5 +580,112 @@ class StaffResignationWorkflowTest extends TestCase
         $this->assertNotNull($staffNotif);
         $this->assertEquals('rejected', $staffNotif->action_payload['status']);
         $this->assertStringContainsString('Periode high season akhir bulan', $staffNotif->body);
+        $this->assertEquals($this->owner->name, $staffNotif->action_payload['owner_name']);
+        $this->assertEquals('user_profile', $staffNotif->action_payload['target_route']);
+    }
+
+    public function test_two_way_resignation_notifications_keep_tenant_isolation_and_stay_readable_after_approval(): void
+    {
+        // Create co-owner in same business & unrelated owner in another business
+        $coOwner = User::create([
+            'name' => 'Co Owner Same Biz',
+            'email' => 'coowner@tenant.com',
+            'password' => bcrypt('password'),
+            'role' => 'owner',
+            'is_active' => true,
+        ]);
+        BusinessMember::create([
+            'business_id' => $this->business->id,
+            'user_id' => $coOwner->id,
+            'role' => 'owner',
+            'is_active' => true,
+            'joined_at' => Carbon::now(),
+        ]);
+
+        $otherOwner = User::create([
+            'name' => 'Other Biz Owner',
+            'email' => 'other.owner@other.com',
+            'password' => bcrypt('password'),
+            'role' => 'owner',
+            'is_active' => true,
+        ]);
+        $otherBiz = Business::create([
+            'name' => 'Other Rental',
+            'slug' => 'other-rental',
+            'owner_id' => $otherOwner->id,
+            'is_active' => true,
+        ]);
+        BusinessMember::create([
+            'business_id' => $otherBiz->id,
+            'user_id' => $otherOwner->id,
+            'role' => 'owner',
+            'is_active' => true,
+            'joined_at' => Carbon::now(),
+        ]);
+
+        // 1. Staff submits resignation
+        $staffToken = $this->staff->createToken('staff')->plainTextToken;
+        $submitResp = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/businesses/{$this->business->id}/resignation-requests", [
+            'reason' => 'Relokasi keluarga',
+        ]);
+        $submitResp->assertStatus(201)
+            ->assertJsonPath('membership.resign_status', 'pending')
+            ->assertJsonPath('membership.resign_reason', 'Relokasi keluarga');
+        $requestId = $submitResp->json('data.id');
+
+        // Both owners in same business receive resign notification
+        foreach ([$this->owner->id, $coOwner->id] as $ownerId) {
+            $notif = \App\Models\TenantNotification::withoutGlobalScopes()
+                ->where('business_id', $this->business->id)
+                ->where('user_id', $ownerId)
+                ->where('type', 'staff.resignation_submitted')
+                ->first();
+            $this->assertNotNull($notif);
+            $this->assertEquals('manage_team', $notif->action_payload['target_route']);
+            $this->assertEquals($this->staffMembership->id, $notif->action_payload['member_id']);
+        }
+
+        // Unrelated business owner does NOT receive notification
+        $this->assertDatabaseMissing('tenant_notifications', [
+            'user_id' => $otherOwner->id,
+            'type' => 'staff.resignation_submitted',
+        ]);
+
+        // 2. Primary owner approves resignation (revokes staff membership)
+        $this->flushHeaders();
+        app('auth')->forgetGuards();
+        $ownerToken = $this->owner->createToken('owner')->plainTextToken;
+        $approveResp = $this->withHeaders([
+            'Authorization' => "Bearer $ownerToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->postJson("/api/v1/businesses/{$this->business->id}/resignation-requests/{$requestId}/approve");
+        $approveResp->assertStatus(200);
+        $this->assertFalse($this->staffMembership->fresh()->is_active);
+
+        // 3. Former staff can STILL fetch & mark-read resign_approved notification via API
+        $this->flushHeaders();
+        app('auth')->forgetGuards();
+        $notifFetch = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+            'X-Business-Id' => (string) $this->business->id,
+        ])->getJson('/api/v1/notifications');
+        $notifFetch->assertStatus(200)
+            ->assertJsonPath('unread_count', 1);
+        $items = $notifFetch->json('data.data');
+        $this->assertCount(1, $items);
+        $this->assertEquals('staff.resignation_approved', $items[0]['type']);
+        $this->assertEquals('Pengajuan Resign Disetujui', $items[0]['title']);
+        $this->assertStringContainsString($this->owner->name, $items[0]['body']);
+        $this->assertEquals('user_profile', $items[0]['action_payload']['target_route']);
+
+        // Mark-as-read succeeds even without active membership
+        $notifId = $items[0]['id'];
+        $markResp = $this->withHeaders([
+            'Authorization' => "Bearer $staffToken",
+        ])->patchJson("/api/v1/notifications/{$notifId}/read");
+        $markResp->assertStatus(200)->assertJsonPath('unread_count', 0);
     }
 }

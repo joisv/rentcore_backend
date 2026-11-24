@@ -33,6 +33,9 @@ class Business extends Model
         'max_primary_devices_per_id',
         'addons_enabled',
         'max_addons_per_rental',
+        'enable_collateral',
+        'require_collateral',
+        'collateral_types',
         'expense_pin_threshold',
         'require_expense_pin',
         'shift_enforcement_enabled',
@@ -52,7 +55,23 @@ class Business extends Model
         'is_dynamic_qris_enabled',
     ];
 
+    public const COLLATERAL_INPUT_MODES = [
+        'vault_slot',
+        'cash_deposit',
+        'note_only',
+    ];
+
+    public const DEFAULT_COLLATERAL_TYPES = [
+        ['id' => 'cash_deposit', 'name' => 'Deposit Tunai', 'input_mode' => 'cash_deposit', 'is_active' => true],
+        ['id' => 'ektp', 'name' => 'e-KTP', 'input_mode' => 'vault_slot', 'is_active' => true],
+        ['id' => 'sim', 'name' => 'SIM (A/C)', 'input_mode' => 'vault_slot', 'is_active' => true],
+        ['id' => 'stnk', 'name' => 'STNK / BPKB', 'input_mode' => 'vault_slot', 'is_active' => true],
+        ['id' => 'student_id', 'name' => 'Kartu Pelajar / KTM', 'input_mode' => 'note_only', 'is_active' => true],
+    ];
+
     protected $attributes = [
+        'enable_collateral' => false,
+        'require_collateral' => false,
         'booking_grace_period_minutes' => 60,
         'auto_expire_unpaid_booking' => true,
         'auto_expire_paid_booking' => false,
@@ -69,6 +88,9 @@ class Business extends Model
         'has_completed_onboarding' => 'boolean',
         'id_document_limit_enabled' => 'boolean',
         'addons_enabled' => 'boolean',
+        'enable_collateral' => 'boolean',
+        'require_collateral' => 'boolean',
+        'collateral_types' => 'array',
         'require_expense_pin' => 'boolean',
         'max_primary_devices_per_id' => 'integer',
         'max_addons_per_rental' => 'integer',
@@ -151,7 +173,15 @@ class Business extends Model
             }
         }
 
+        $config['has_qris_image'] = !empty($config['qris_image_path']);
+
         return $config;
+    }
+
+    public function hasQrisImage(?int $affiliateId = null): bool
+    {
+        $config = $this->getPaymentMethodsConfig($affiliateId);
+        return !empty($config['qris_image_path']);
     }
 
     public function getQrisImageUrl(?int $affiliateId = null): ?string
@@ -246,6 +276,84 @@ class Business extends Model
             'shift_grace_period_minutes' => (int)($this->shift_grace_period_minutes ?? 30),
             'timezone' => $this->timezone ?: 'Asia/Jakarta',
             'is_overnight' => $closingTime < $openingTime,
+        ];
+    }
+
+    public function isCollateralEnabled(): bool
+    {
+        return $this->enable_collateral !== null ? (bool) $this->enable_collateral : false;
+    }
+
+    public function isCollateralRequired(): bool
+    {
+        return $this->require_collateral !== null ? (bool) $this->require_collateral : false;
+    }
+
+    /**
+     * Normalize collateral type entries and fall back to default presets when empty.
+     *
+     * @param  mixed  $raw
+     * @return array<int, array{id: string, name: string, input_mode: string, is_active: bool}>
+     */
+    public static function normalizeCollateralTypes(mixed $raw): array
+    {
+        $decoded = is_string($raw) ? json_decode($raw, true) : $raw;
+        if (!is_array($decoded) || empty($decoded)) {
+            return self::DEFAULT_COLLATERAL_TYPES;
+        }
+
+        $normalized = [];
+        foreach ($decoded as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            $name = trim((string) ($entry['name'] ?? ''));
+            $id = trim((string) ($entry['id'] ?? ''));
+            if ($id === '' && $name !== '') {
+                $id = Str::slug($name, '_');
+            }
+            if ($id === '' || $name === '') {
+                continue;
+            }
+            $mode = (string) ($entry['input_mode'] ?? 'vault_slot');
+            if (!in_array($mode, self::COLLATERAL_INPUT_MODES, true)) {
+                $mode = 'vault_slot';
+            }
+            $normalized[] = [
+                'id' => $id,
+                'name' => $name,
+                'input_mode' => $mode,
+                'is_active' => array_key_exists('is_active', $entry) ? (bool) $entry['is_active'] : true,
+            ];
+        }
+
+        return !empty($normalized) ? $normalized : self::DEFAULT_COLLATERAL_TYPES;
+    }
+
+    /**
+     * Resolve configured collateral types with safe default presets when null/empty.
+     *
+     * @return array<int, array{id: string, name: string, input_mode: string, is_active: bool}>
+     */
+    public function getResolvedCollateralTypes(): array
+    {
+        return self::normalizeCollateralTypes($this->collateral_types);
+    }
+
+    /**
+     * Override raw attribute read so null/unconfigured DB column always serializes defaults.
+     */
+    public function getCollateralTypesAttribute($value): array
+    {
+        return self::normalizeCollateralTypes($value);
+    }
+
+    public function getCollateralSettings(): array
+    {
+        return [
+            'enable_collateral' => $this->isCollateralEnabled(),
+            'require_collateral' => $this->isCollateralRequired(),
+            'collateral_types' => $this->getResolvedCollateralTypes(),
         ];
     }
 

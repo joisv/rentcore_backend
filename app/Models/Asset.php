@@ -34,6 +34,19 @@ class Asset extends Model
         'hourly_late_fee' => 'decimal:2',
     ];
 
+    protected $appends = [
+        'is_addon',
+    ];
+
+    public function getIsAddonAttribute(): bool
+    {
+        $model = $this->relationLoaded('model')
+            ? $this->getRelation('model')
+            : ($this->relationLoaded('assetModel') ? $this->getRelation('assetModel') : $this->model);
+
+        return $model ? (bool) $model->is_addon : false;
+    }
+
     protected static function booted(): void
     {
         static::addGlobalScope(new \App\Scopes\TenantScope);

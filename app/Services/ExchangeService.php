@@ -310,13 +310,25 @@ class ExchangeService
             // 9. Process Payment Transaction if differential > 0
             $paymentTx = null;
             if ($payableDifferential > 0) {
-                if (empty($data['payment_method_id'])) {
+                $hasMethodSpec = !empty($data['payment_method_id'])
+                    || !empty($data['payment_method'])
+                    || !empty($data['payment_channel']);
+                if (!$hasMethodSpec) {
                     throw ValidationException::withMessages([
                         'payment_method_id' => ['Metode pembayaran diperlukan untuk melunasi selisih tukar unit (Rp ' . number_format($payableDifferential, 0, ',', '.') . ').'],
                     ]);
                 }
 
-                $paymentMethod = PaymentMethod::findOrFail($data['payment_method_id']);
+                $paymentMethod = PaymentMethod::resolveFromInput(
+                    $data['payment_method_id'] ?? null,
+                    $data['payment_method'] ?? null,
+                    $data['payment_channel'] ?? null
+                );
+                if (!$paymentMethod) {
+                    throw ValidationException::withMessages([
+                        'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                    ]);
+                }
                 $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
                 $branchId = (int)($booking->affiliate_id ?? $cashier->affiliate_id);
@@ -497,7 +509,7 @@ class ExchangeService
                     'old_unit_rate' => $oldUnitRate,
                     'new_unit_rate' => $newUnitRate,
                     'price_differential' => $payableDifferential,
-                    'payment_method' => $paymentTx?->paymentMethod?->name ?? 'Tanpa Biaya (Setara)',
+                    'payment_method' => PaymentMethod::normalizeDisplayName($paymentTx?->paymentMethod, 'Tanpa Biaya (Setara)'),
                     'cash_received' => $paymentTx?->cash_received ?? 0.0,
                     'cash_change' => $paymentTx?->cash_change ?? 0.0,
                     'exchanged_at' => Carbon::now()->format('d M Y, H:i'),

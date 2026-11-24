@@ -56,11 +56,18 @@ Route::prefix('v1')->group(function () {
         Route::post('/businesses', [BusinessController::class, 'store']);
         Route::get('/businesses/{id}', [BusinessController::class, 'show']);
 
+        // User & Tenant Notifications (accessible even right after resignation deactivation)
+        Route::get('/notifications', [NotificationController::class, 'index']);
+        Route::patch('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
+        Route::post('/notifications/read-all', [NotificationController::class, 'markAllAsRead']);
+
         // --- Tenant Scoped Operations (Guarded by TenantContextMiddleware) ---
         Route::middleware('tenant.context')->group(function () {
 
             // Business & Branch Settings
             Route::put('/businesses/{id}', [BusinessController::class, 'update']);
+            Route::get('/businesses/{id}/collateral-settings', [BusinessController::class, 'getCollateralSettings']);
+            Route::put('/businesses/{id}/collateral-settings', [BusinessController::class, 'updateCollateralSettings']);
             Route::get('/businesses/{id}/rental-rules', [BusinessController::class, 'getRentalRules']);
             Route::put('/businesses/{id}/rental-rules', [BusinessController::class, 'updateRentalRules']);
             Route::get('/businesses/{id}/branches', [BusinessController::class, 'branches']);
@@ -91,11 +98,6 @@ Route::prefix('v1')->group(function () {
 
             // Dashboard KPI & Overdue Alerts
             Route::get('/dashboard/kpi', [DashboardController::class, 'kpi']);
-
-            // Tenant Notifications
-            Route::get('/notifications', [NotificationController::class, 'index']);
-            Route::patch('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
-            Route::post('/notifications/read-all', [NotificationController::class, 'markAllAsRead']);
 
             // Security Audit Logs (Owner governance)
             Route::get('/audit-logs', [AuditLogController::class, 'index']);

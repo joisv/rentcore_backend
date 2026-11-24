@@ -50,8 +50,11 @@ class Booking extends Model
         'remaining_balance',
         'payment_status',
         'collateral_type',
+        'collateral_type_id',
+        'collateral_type_name',
         'collateral_secured',
         'collateral_storage_slot',
+        'collateral_deposit_amount',
         'notes',
     ];
 
@@ -77,6 +80,7 @@ class Booking extends Model
         'total_bill' => 'decimal:2',
         'remaining_balance' => 'decimal:2',
         'collateral_secured' => 'boolean',
+        'collateral_deposit_amount' => 'decimal:2',
     ];
 
     protected $appends = [
@@ -89,7 +93,29 @@ class Booking extends Model
         'device_model_id',
         'is_floating_unit',
         'paid_amount',
+        'collateral_display',
     ];
+
+    public function getCollateralDisplayAttribute(): string
+    {
+        if ($this->collateral_type_id === 'none' || $this->collateral_type_name === 'Tanpa Jaminan') {
+            return 'Tanpa Jaminan';
+        }
+        $typeName = trim((string) ($this->collateral_type_name ?? $this->collateral_type ?? ''));
+        $deposit = $this->collateral_deposit_amount !== null ? (float) $this->collateral_deposit_amount : 0.0;
+        if ($deposit > 0) {
+            $formatted = 'Rp ' . number_format($deposit, 0, ',', '.');
+            return $typeName !== '' ? "{$typeName} • {$formatted}" : $formatted;
+        }
+        $slot = trim((string) ($this->collateral_storage_slot ?? ''));
+        if ($typeName !== '' && $slot !== '') {
+            return "{$typeName} • {$slot}";
+        }
+        if ($slot !== '') {
+            return $slot;
+        }
+        return $typeName !== '' ? $typeName : 'Brankas Cabang';
+    }
 
     public function getActiveItemAttribute(): ?BookingItem
     {

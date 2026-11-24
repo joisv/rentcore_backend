@@ -57,28 +57,17 @@ class AssetModel extends Model
 
     public function isAddon(): bool
     {
-        return (bool)($this->is_addon || ($this->category && $this->category->is_addon));
+        return (bool) $this->is_addon;
     }
 
     public function scopeAddons($query)
     {
-        return $query->where(function ($q) {
-            $q->where('asset_models.is_addon', true)
-              ->orWhereHas('category', function ($cq) {
-                  $cq->where('is_addon', true);
-              });
-        });
+        return $query->where('asset_models.is_addon', true);
     }
 
     public function scopeDevices($query)
     {
-        return $query->where('asset_models.is_addon', false)
-            ->where(function ($q) {
-                $q->whereDoesntHave('category')
-                  ->orWhereHas('category', function ($cq) {
-                      $cq->where('is_addon', false);
-                  });
-            });
+        return $query->where('asset_models.is_addon', false);
     }
 
     public function scopeOwnedByBusiness($query, int $businessId)

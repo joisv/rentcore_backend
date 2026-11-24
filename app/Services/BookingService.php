@@ -390,11 +390,12 @@ class BookingService
 
             // 7. Create Booking (Direct activation: status = 'rented')
             $idempotencyKey = !empty($data['idempotency_key']) ? (string)$data['idempotency_key'] : null;
+            $business = $businessId ? Business::find($businessId) : null;
+            $collateral = $this->resolveCollateralData($business, $data, true);
 
             $booking = Booking::withoutGlobalScopes()->create([
                 'business_id' => $businessId,
                 'booking_code' => $bookingCode,
-                'idempotency_key' => $idempotencyKey,
                 'idempotency_key' => $idempotencyKey,
                 'affiliate_id' => $affiliateId,
                 'asset_model_id' => $primaryAssetModelId,
@@ -419,14 +420,16 @@ class BookingService
                 'total_bill' => $totalBill,
                 'remaining_balance' => 0.00,
                 'payment_status' => 'paid',
-                'collateral_type' => $data['collateral_type'] ?? 'KTP Asli',
-                'collateral_secured' => true,
-                'collateral_storage_slot' => $data['collateral_storage_slot'] ?? 'Brankas A, Slot 1',
+                'collateral_type' => $collateral['collateral_type'],
+                'collateral_type_id' => $collateral['collateral_type_id'],
+                'collateral_type_name' => $collateral['collateral_type_name'],
+                'collateral_secured' => $collateral['collateral_secured'],
+                'collateral_storage_slot' => $collateral['collateral_storage_slot'],
+                'collateral_deposit_amount' => $collateral['collateral_deposit_amount'],
                 'notes' => $data['notes'] ?? null,
             ]);
 
             // 8. Create Booking Items & transition assets to 'rented'
-            $business = $businessId ? Business::find($businessId) : null;
             foreach ($assets as $asset) {
                 $itemType = in_array((int)$asset->id, $addonAssetIdsList, true) ? 'addon' : 'primary';
                 $contractCols = $this->buildLateFeeContractColumns(
@@ -463,7 +466,17 @@ class BookingService
             }
 
             // 10. Record Single Source of Truth Payment Transaction
-            $paymentMethod = PaymentMethod::findOrFail($data['payment_method_id']);
+            $paymentMethod = PaymentMethod::resolveFromInput(
+                $data['payment_method_id'] ?? null,
+                $data['payment_method'] ?? null,
+                $data['payment_channel'] ?? null
+            );
+            if (!$paymentMethod) {
+                throw ValidationException::withMessages([
+                    'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                ]);
+            }
+            $data['payment_method_id'] = $paymentMethod->id;
             $isCash = strtoupper($paymentMethod->code) === 'CASH' || stripos($paymentMethod->name, 'tunai') !== false;
 
             // Enforce business & branch payment method availability
@@ -555,10 +568,13 @@ class BookingService
             [$affiliate, $businessId] = $this->resolveAuthorizedBranchAndBusiness($data, $cashier);
             $affiliateId = (int) $affiliate->id;
 
+            $hasPaymentSpec = !empty($data['payment_method_id'])
+                || !empty($data['payment_method'])
+                || !empty($data['payment_channel']);
             $rawPaidInput = $data['paid_amount'] ?? $data['dp_amount'] ?? null;
             $paidAmountRequested = $rawPaidInput !== null
                 ? (float) $rawPaidInput
-                : (!empty($data['payment_method_id']) ? null : 0.0);
+                : ($hasPaymentSpec ? null : 0.0);
 
             if ($paidAmountRequested === null || $paidAmountRequested > 0) {
                 ShiftEnforcementService::requireActiveShift(
@@ -849,10 +865,22 @@ class BookingService
 
             // Determine initial payment amount (supports full settlement, partial DP, or unpaid)
             $amountPaidNow = 0.0;
-            if (!empty($data['payment_method_id'])) {
+            $resolvedScheduledPaymentMethod = $hasPaymentSpec
+                ? PaymentMethod::resolveFromInput(
+                    $data['payment_method_id'] ?? null,
+                    $data['payment_method'] ?? null,
+                    $data['payment_channel'] ?? null
+                )
+                : null;
+            if ($resolvedScheduledPaymentMethod) {
+                $data['payment_method_id'] = $resolvedScheduledPaymentMethod->id;
                 $amountPaidNow = $paidAmountRequested !== null
                     ? min($totalBill, max(0.0, $paidAmountRequested))
                     : $totalBill;
+            } elseif ($hasPaymentSpec) {
+                throw ValidationException::withMessages([
+                    'payment_method_id' => ['Metode pembayaran tidak valid atau tidak ditemukan.'],
+                ]);
             }
             $paymentStatus = $amountPaidNow >= $totalBill && $totalBill > 0
                 ? 'paid'
@@ -867,6 +895,9 @@ class BookingService
             $bookingCode = sprintf('RC-%s-%04d-%s', $datePrefix, $countToday, strtoupper(Str::random(3)));
 
             $idempotencyKey = !empty($data['idempotency_key']) ? (string)$data['idempotency_key'] : null;
+
+            $business = $businessId ? Business::find($businessId) : null;
+            $collateral = $this->resolveCollateralData($business, $data, false);
 
             $booking = Booking::withoutGlobalScopes()->create([
                 'business_id' => $businessId,
@@ -897,13 +928,15 @@ class BookingService
                 'total_bill' => $totalBill,
                 'remaining_balance' => $remainingBalance,
                 'payment_status' => $paymentStatus,
-                'collateral_type' => $data['collateral_type'] ?? 'KTP Asli',
+                'collateral_type' => $collateral['collateral_type'],
+                'collateral_type_id' => $collateral['collateral_type_id'],
+                'collateral_type_name' => $collateral['collateral_type_name'],
                 'collateral_secured' => false,
-                'collateral_storage_slot' => $data['collateral_storage_slot'] ?? null,
+                'collateral_storage_slot' => $collateral['collateral_storage_slot'],
+                'collateral_deposit_amount' => $collateral['collateral_deposit_amount'],
                 'notes' => $data['notes'] ?? null,
             ]);
 
-            $business = $businessId ? Business::find($businessId) : null;
             if ($isFloating) {
                 $primaryModel = $primaryModelId ? AssetModel::withoutGlobalScopes()->find($primaryModelId) : null;
                 $contractCols = $this->buildLateFeeContractColumns(null, $primaryModel, $business, $primarySnapshot);
@@ -1181,6 +1214,9 @@ class BookingService
                 ], $checkInContractCols));
             }
 
+            $collateralBusiness = $lockedBooking->business_id ? Business::find($lockedBooking->business_id) : null;
+            $collateral = $this->resolveCollateralData($collateralBusiness, $data, true, $lockedBooking);
+
             $bookingUpdates = [
                 'status' => 'rented',
                 'picked_up_at' => $now,
@@ -1188,9 +1224,12 @@ class BookingService
                 'asset_unit_id' => $targetAsset->id,
                 'is_overdue_pickup' => false,
                 'is_late_pickup' => false,
-                'collateral_type' => $data['collateral_type'] ?? $lockedBooking->collateral_type ?? 'KTP Asli',
-                'collateral_storage_slot' => $data['collateral_storage_slot'] ?? $lockedBooking->collateral_storage_slot ?? 'Brankas A, Slot 1',
-                'collateral_secured' => true,
+                'collateral_type' => $collateral['collateral_type'],
+                'collateral_type_id' => $collateral['collateral_type_id'],
+                'collateral_type_name' => $collateral['collateral_type_name'],
+                'collateral_storage_slot' => $collateral['collateral_storage_slot'],
+                'collateral_deposit_amount' => $collateral['collateral_deposit_amount'],
+                'collateral_secured' => $collateral['collateral_secured'],
             ];
 
             if ($endTimeModeApplied === 'shifted') {
@@ -2419,5 +2458,144 @@ class BookingService
         }
 
         return $primaryTx;
+    }
+
+    /**
+     * Validate and resolve structured or legacy collateral fields against tenant settings.
+     *
+     * @return array{
+     *   collateral_type: string,
+     *   collateral_type_id: ?string,
+     *   collateral_type_name: ?string,
+     *   collateral_storage_slot: ?string,
+     *   collateral_deposit_amount: ?float,
+     *   collateral_secured: bool
+     * }
+     */
+    protected function resolveCollateralData(
+        ?Business $business,
+        array $data,
+        bool $requireDetail,
+        ?Booking $existingBooking = null
+    ): array {
+        $enableCollateral = $business ? $business->isCollateralEnabled() : false;
+        $rawTypeId = trim((string) ($data['collateral_type_id'] ?? $existingBooking?->collateral_type_id ?? ''));
+        $rawSlotOrDetail = trim((string) ($data['collateral_detail'] ?? $data['collateral_storage_slot'] ?? $existingBooking?->collateral_storage_slot ?? ''));
+        $rawDeposit = $data['collateral_deposit_amount'] ?? $existingBooking?->collateral_deposit_amount ?? null;
+        $depositAmount = ($rawDeposit !== null && $rawDeposit !== '') ? (float) $rawDeposit : null;
+        $rawLegacyType = trim((string) ($data['collateral_type_name'] ?? $data['collateral_type'] ?? $existingBooking?->collateral_type ?? ''));
+
+        if (!$enableCollateral) {
+            $hasExplicitLegacyInput = $rawSlotOrDetail !== '' || ($depositAmount !== null && $depositAmount > 0);
+            if ($rawTypeId === '' && !$hasExplicitLegacyInput) {
+                return [
+                    'collateral_type' => null,
+                    'collateral_type_id' => null,
+                    'collateral_type_name' => null,
+                    'collateral_storage_slot' => null,
+                    'collateral_deposit_amount' => null,
+                    'collateral_secured' => false,
+                ];
+            }
+            if ($rawTypeId === '' && $hasExplicitLegacyInput) {
+                $legacyName = $rawLegacyType !== '' ? $rawLegacyType : 'KTP Asli';
+                return [
+                    'collateral_type' => $legacyName,
+                    'collateral_type_id' => null,
+                    'collateral_type_name' => $legacyName,
+                    'collateral_storage_slot' => $rawSlotOrDetail !== '' ? $rawSlotOrDetail : null,
+                    'collateral_deposit_amount' => $depositAmount,
+                    'collateral_secured' => $requireDetail,
+                ];
+            }
+        }
+
+        // Legacy callers omitting collateral_type_id while collateral feature is enabled keep fallback unless require_collateral=true with empty input
+        if ($rawTypeId === '') {
+            if ($enableCollateral && $business && !$business->isCollateralRequired() && $rawSlotOrDetail === '' && ($depositAmount === null || $depositAmount <= 0)) {
+                return [
+                    'collateral_type' => null,
+                    'collateral_type_id' => null,
+                    'collateral_type_name' => null,
+                    'collateral_storage_slot' => null,
+                    'collateral_deposit_amount' => null,
+                    'collateral_secured' => false,
+                ];
+            }
+            $legacyType = $rawLegacyType !== '' ? $rawLegacyType : 'KTP Asli';
+            return [
+                'collateral_type' => $legacyType,
+                'collateral_type_id' => null,
+                'collateral_type_name' => $legacyType,
+                'collateral_storage_slot' => $rawSlotOrDetail !== '' ? $rawSlotOrDetail : ($requireDetail ? 'Brankas A, Slot 1' : null),
+                'collateral_deposit_amount' => $depositAmount,
+                'collateral_secured' => $requireDetail,
+            ];
+        }
+
+        $requireCollateral = $business ? $business->isCollateralRequired() : false;
+
+        if ($rawTypeId === 'none') {
+            if ($enableCollateral && $requireCollateral) {
+                throw ValidationException::withMessages([
+                    'collateral_type_id' => ['Aturan toko mewajibkan jaminan saat sewa. Pilih tipe jaminan yang aktif.'],
+                ]);
+            }
+            return [
+                'collateral_type' => 'Tanpa Jaminan',
+                'collateral_type_id' => 'none',
+                'collateral_type_name' => 'Tanpa Jaminan',
+                'collateral_storage_slot' => null,
+                'collateral_deposit_amount' => null,
+                'collateral_secured' => false,
+            ];
+        }
+
+        $configured = $business ? $business->getResolvedCollateralTypes() : Business::DEFAULT_COLLATERAL_TYPES;
+        $matched = collect($configured)->firstWhere('id', $rawTypeId);
+
+        if (!$matched || empty($matched['is_active'])) {
+            throw ValidationException::withMessages([
+                'collateral_type_id' => ['Tipe jaminan tidak valid atau sudah dinonaktifkan oleh Owner.'],
+            ]);
+        }
+
+        $mode = $matched['input_mode'];
+        $name = $matched['name'];
+
+        if ($mode === 'cash_deposit') {
+            if ($requireDetail && ($depositAmount === null || $depositAmount <= 0)) {
+                throw ValidationException::withMessages([
+                    'collateral_deposit_amount' => ['Nominal deposit tunai wajib diisi lebih dari Rp 0.'],
+                ]);
+            }
+            return [
+                'collateral_type' => $name,
+                'collateral_type_id' => $matched['id'],
+                'collateral_type_name' => $name,
+                'collateral_storage_slot' => $rawSlotOrDetail !== '' ? $rawSlotOrDetail : null,
+                'collateral_deposit_amount' => $depositAmount,
+                'collateral_secured' => $requireDetail,
+            ];
+        }
+
+        // 'vault_slot' or 'note_only'
+        if ($requireDetail && $rawSlotOrDetail === '') {
+            $errorMsg = $mode === 'vault_slot'
+                ? 'Slot brankas jaminan wajib diisi.'
+                : 'Nomor / keterangan jaminan wajib diisi.';
+            throw ValidationException::withMessages([
+                'collateral_storage_slot' => [$errorMsg],
+            ]);
+        }
+
+        return [
+            'collateral_type' => $name,
+            'collateral_type_id' => $matched['id'],
+            'collateral_type_name' => $name,
+            'collateral_storage_slot' => $rawSlotOrDetail !== '' ? $rawSlotOrDetail : null,
+            'collateral_deposit_amount' => null,
+            'collateral_secured' => $requireDetail,
+        ];
     }
 }

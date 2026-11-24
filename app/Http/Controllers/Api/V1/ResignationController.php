@@ -212,6 +212,15 @@ class ResignationController extends Controller
             'success' => true,
             'message' => 'Permohonan resign berhasil diajukan dan menunggu persetujuan Owner.',
             'data' => $resignation->load(['user', 'businessMember.branchMembers.branch']),
+            'membership' => [
+                'id' => $member->id,
+                'business_id' => $businessId,
+                'role' => $member->role,
+                'is_active' => (bool) $member->is_active,
+                'resign_status' => 'pending',
+                'resign_reason' => $resignation->reason,
+                'resign_requested_at' => $resignation->created_at,
+            ],
         ], 201);
     }
 
@@ -390,13 +399,14 @@ class ResignationController extends Controller
                 $businessId
             );
 
-            $this->notificationService->markResignationNotificationDecided($resignation);
-            $this->notificationService->notifyResignationDecided($resignation);
+            $freshResignation = $resignation->fresh(['user', 'businessMember', 'decidedBy', 'business']);
+            $this->notificationService->markResignationNotificationDecided($freshResignation);
+            $this->notificationService->notifyResignationDecided($freshResignation);
 
             return response()->json([
                 'success' => true,
                 'message' => 'Permohonan resign disetujui. Akses staf ke bisnis rental dan cabang telah dicabut.',
-                'data' => $resignation->fresh(['user', 'businessMember', 'decidedBy']),
+                'data' => $freshResignation,
             ]);
         });
     }
@@ -459,13 +469,14 @@ class ResignationController extends Controller
             $businessId
         );
 
-        $this->notificationService->markResignationNotificationDecided($resignation);
-        $this->notificationService->notifyResignationDecided($resignation);
+        $freshResignation = $resignation->fresh(['user', 'businessMember', 'decidedBy', 'business']);
+        $this->notificationService->markResignationNotificationDecided($freshResignation);
+        $this->notificationService->notifyResignationDecided($freshResignation);
 
         return response()->json([
             'success' => true,
             'message' => 'Permohonan resign ditolak. Keanggotaan staf tetap aktif.',
-            'data' => $resignation->fresh(['user', 'businessMember', 'decidedBy']),
+            'data' => $freshResignation,
         ]);
     }
 

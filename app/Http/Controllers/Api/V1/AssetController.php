@@ -165,6 +165,17 @@ class AssetController extends Controller
             });
         }
 
+        if ($request->has('is_addon') && $request->input('is_addon') !== null && $request->input('is_addon') !== '') {
+            $isAddonFilter = filter_var($request->input('is_addon'), FILTER_VALIDATE_BOOLEAN);
+            $query->whereHas('model', function ($mq) use ($isAddonFilter) {
+                if ($isAddonFilter) {
+                    $mq->addons();
+                } else {
+                    $mq->devices();
+                }
+            });
+        }
+
         if ($request->has('search')) {
             $search = $request->search;
             $query->where(function ($q) use ($search) {
