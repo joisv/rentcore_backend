@@ -32,11 +32,26 @@ class AssetModel extends Model
 
     protected $appends = [
         'image_url',
+        'late_fee_per_hour',
     ];
+
+    public function getLateFeePerHourAttribute(): ?float
+    {
+        return $this->hourly_late_fee !== null ? round((float) $this->hourly_late_fee, 2) : null;
+    }
+
+    public function setLateFeePerHourAttribute($value): void
+    {
+        $this->attributes['hourly_late_fee'] = $value !== null && $value !== '' ? (float) $value : null;
+    }
 
     public function getImageUrlAttribute(): ?string
     {
         if (empty($this->image_path)) {
+            return null;
+        }
+        // Never leak raw base64 blobs into serialized list/detail payloads
+        if (str_starts_with($this->image_path, 'data:image')) {
             return null;
         }
         if (str_starts_with($this->image_path, 'http://') || str_starts_with($this->image_path, 'https://')) {

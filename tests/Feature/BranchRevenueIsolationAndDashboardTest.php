@@ -64,14 +64,14 @@ class BranchRevenueIsolationAndDashboardTest extends TestCase
 
         // 2. Setup Businesses
         $this->businessA = Business::create([
-            'name' => 'RentCore Business A',
+            'name' => 'SewaKasir Business A',
             'slug' => 'rentcore-business-a',
             'owner_id' => $this->ownerA->id,
             'is_active' => true,
         ]);
 
         $this->businessB = Business::create([
-            'name' => 'RentCore Business B',
+            'name' => 'SewaKasir Business B',
             'slug' => 'rentcore-business-b',
             'owner_id' => $this->ownerB->id,
             'is_active' => true,

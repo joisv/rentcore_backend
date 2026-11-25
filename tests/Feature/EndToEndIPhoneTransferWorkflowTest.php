@@ -55,7 +55,7 @@ class EndToEndIPhoneTransferWorkflowTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Business A',
+            'name' => 'SewaKasir Business A',
             'slug' => 'rentcore-business-a',
             'phone' => '081234567890',
             'currency' => 'IDR',

@@ -8,6 +8,7 @@ use App\Models\BranchExpense;
 use App\Models\CashDrawerShift;
 use App\Models\PaymentTransaction;
 use App\Services\AuditLogService;
+use App\Services\IdempotencyService;
 use App\Tenancy\TenantContext;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
@@ -215,6 +216,11 @@ class ShiftController extends Controller
         $tenantContext = app(TenantContext::class);
         $businessId = $tenantContext->getBusinessId();
 
+        return IdempotencyService::execute(
+            $request,
+            $businessId ? (int) $businessId : null,
+            'shift.close',
+            function () use ($request, $validated, $user, $tenantContext, $businessId): JsonResponse {
         $shiftQuery = CashDrawerShift::where('status', 'open')
             ->when($businessId, fn($q) => $q->where('business_id', $businessId));
 
@@ -322,6 +328,8 @@ class ShiftController extends Controller
                 'status' => $shift->status,
             ],
         ]);
+            }
+        );
     }
 
     /**
@@ -416,7 +424,7 @@ class ShiftController extends Controller
             $query->where('status', $request->get('status'));
         }
 
-        $perPage = min(100, max(5, (int)$request->get('per_page', 20)));
+        $perPage = max(1, min(50, (int) $request->get('per_page', 20)));
         $shifts = $query->paginate($perPage);
 
         $formatted = $shifts->getCollection()->map(function ($s) {

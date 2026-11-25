@@ -17,8 +17,8 @@ class LegalController extends Controller
     public function privacyPolicy(): View
     {
         return view('legal.privacy-policy', [
-            'appName' => (string) config('app.name', 'Rentcore'),
-            'contactEmail' => (string) env('LEGAL_CONTACT_EMAIL', 'support@rentcore.id'),
+            'appName' => (string) config('app.name', 'SewaKasir'),
+            'contactEmail' => (string) env('LEGAL_CONTACT_EMAIL', 'support@sewakasir.id'),
             'lastUpdated' => '21 November 2026',
         ]);
     }
@@ -26,8 +26,8 @@ class LegalController extends Controller
     public function showAccountDeletion(): View
     {
         return view('legal.account-deletion', [
-            'appName' => (string) config('app.name', 'Rentcore'),
-            'contactEmail' => (string) env('LEGAL_CONTACT_EMAIL', 'support@rentcore.id'),
+            'appName' => (string) config('app.name', 'SewaKasir'),
+            'contactEmail' => (string) env('LEGAL_CONTACT_EMAIL', 'support@sewakasir.id'),
         ]);
     }
 
@@ -122,7 +122,7 @@ class LegalController extends Controller
             $user->forceFill([
                 'is_active' => false,
                 'name' => 'Deleted User #' . $shortId,
-                'email' => 'deleted_' . $user->id . '@deleted.rentcore.local',
+                'email' => 'deleted_' . $user->id . '@deleted.sewakasir.local',
                 'phone' => null,
                 'avatar_url' => null,
                 'google_id' => null,

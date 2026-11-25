@@ -37,7 +37,7 @@ class MultiCategoryRentalTest extends TestCase
         ]);
 
         $this->business = \App\Models\Business::create([
-            'name' => 'RentCore Central',
+            'name' => 'SewaKasir Central',
             'slug' => 'rentcore-central',
             'owner_id' => $this->superAdmin->id,
             'is_active' => true,

@@ -15,6 +15,8 @@ use App\Services\AuditLogService;
 use App\Services\BookingAvailabilityService;
 use App\Services\BookingService;
 use App\Services\ExchangeService;
+use App\Services\IdempotencyService;
+use App\Services\LateFeeCalculatorService;
 use App\Services\ManagerPinVerificationService;
 use App\Services\PricingService;
 use App\Services\ReturnService;
@@ -32,7 +34,8 @@ class BookingController extends Controller
         protected ReturnService $returnService,
         protected ExchangeService $exchangeService,
         protected PricingService $pricingService,
-        protected BookingAvailabilityService $availabilityService
+        protected BookingAvailabilityService $availabilityService,
+        protected LateFeeCalculatorService $lateFeeCalculator
     ) {}
 
     /**
@@ -205,7 +208,8 @@ class BookingController extends Controller
             });
         }
 
-        $bookings = $query->orderBy('created_at', 'desc')->paginate($request->get('per_page', 15));
+        $perPage = max(1, min(50, (int) $request->get('per_page', 15)));
+        $bookings = $query->orderBy('created_at', 'desc')->paginate($perPage);
 
         return response()->json([
             'success' => true,
@@ -356,15 +360,6 @@ class BookingController extends Controller
             ]);
         };
 
-        if ($existingBooking = $findExistingByIdempotency()) {
-            return response()->json([
-                'success' => true,
-                'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
-                'is_idempotent' => true,
-                'data' => $existingBooking,
-            ], 200);
-        }
-
         $headerBranchId = $request->header('X-Branch-Id') ? (int)$request->header('X-Branch-Id') : null;
         if (!empty($payload['affiliate_id']) && $headerBranchId && (int)$payload['affiliate_id'] !== $headerBranchId) {
             throw \Illuminate\Validation\ValidationException::withMessages([
@@ -375,50 +370,66 @@ class BookingController extends Controller
             $payload['affiliate_id'] = $headerBranchId;
         }
 
-        try {
-            if ($isScheduled) {
-                $booking = $this->bookingService->createScheduledBooking($payload, $request->user());
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Booking terjadwal berhasil dibuat.',
-                    'data' => $booking,
-                ], 201);
-            }
+        return IdempotencyService::execute(
+            $request,
+            $businessId ? (int) $businessId : null,
+            'booking.store',
+            function () use ($isScheduled, $payload, $headerBranchId, $request, $findExistingByIdempotency): JsonResponse {
+                if ($existingBooking = $findExistingByIdempotency()) {
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
+                        'is_idempotent' => true,
+                        'data' => $existingBooking,
+                    ], 200)->header('X-Idempotent-Replay', 'true');
+                }
 
-            // Strict pre-checkout active shift enforcement
-            $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
-            $activeShift = null;
-            if (!empty($payload['shift_id'])) {
-                $activeShift = \App\Models\CashDrawerShift::where('id', $payload['shift_id'])
-                    ->where('branch_id', $targetBranchId)
-                    ->where('status', 'open')
-                    ->first();
-            }
-            $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
-                $targetBranchId,
-                $request->user(),
-                true,
-                'memproses transaksi'
-            );
+                try {
+                    if ($isScheduled) {
+                        $booking = $this->bookingService->createScheduledBooking($payload, $request->user());
+                        return response()->json([
+                            'success' => true,
+                            'message' => 'Booking terjadwal berhasil dibuat.',
+                            'data' => $booking,
+                        ], 201);
+                    }
 
-            $booking = $this->bookingService->createCounterRental($payload, $request->user());
+                    // Strict pre-checkout active shift enforcement
+                    $targetBranchId = (int)($payload['affiliate_id'] ?? $headerBranchId ?? $request->user()->affiliate_id);
+                    $activeShift = null;
+                    if (!empty($payload['shift_id'])) {
+                        $activeShift = \App\Models\CashDrawerShift::where('id', $payload['shift_id'])
+                            ->where('branch_id', $targetBranchId)
+                            ->where('status', 'open')
+                            ->first();
+                    }
+                    $activeShift = $activeShift ?? ShiftEnforcementService::requireActiveShift(
+                        $targetBranchId,
+                        $request->user(),
+                        true,
+                        'memproses transaksi'
+                    );
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Transaksi sewa berhasil dibuat dan unit langsung aktif disewa.',
-                'data' => $booking,
-            ], 201);
-        } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
-            if ($existingBooking = $findExistingByIdempotency()) {
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
-                    'is_idempotent' => true,
-                    'data' => $existingBooking,
-                ], 200);
+                    $booking = $this->bookingService->createCounterRental($payload, $request->user());
+
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Transaksi sewa berhasil dibuat dan unit langsung aktif disewa.',
+                        'data' => $booking,
+                    ], 201);
+                } catch (\Illuminate\Database\UniqueConstraintViolationException | \Illuminate\Database\QueryException $e) {
+                    if ($existingBooking = $findExistingByIdempotency()) {
+                        return response()->json([
+                            'success' => true,
+                            'message' => 'Transaksi booking telah diproses sebelumnya (Idempotent).',
+                            'is_idempotent' => true,
+                            'data' => $existingBooking,
+                        ], 200);
+                    }
+                    throw $e;
+                }
             }
-            throw $e;
-        }
+        );
     }
 
     /**
@@ -456,9 +467,31 @@ class BookingController extends Controller
         })
         ->firstOrFail();
 
+        $payload = $booking->toArray();
+        $payload['late_fee_preview'] = $this->lateFeeCalculator->calculate($booking);
+
         return response()->json([
             'success' => true,
-            'data' => $booking,
+            'data' => $payload,
+        ]);
+    }
+
+    /**
+     * Preview deterministic late fee breakdown for a booking return.
+     */
+    public function lateFeePreview(Request $request, int $id): JsonResponse
+    {
+        $booking = Booking::with(['business', 'items.asset.model', 'items.assetModel'])
+            ->findOrFail($id);
+
+        $returnedAt = null;
+        if ($request->filled('returned_at')) {
+            $returnedAt = Carbon::parse((string) $request->query('returned_at'))->setTimezone('UTC');
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $this->lateFeeCalculator->calculate($booking, $returnedAt),
         ]);
     }
 
@@ -1247,9 +1280,11 @@ class BookingController extends Controller
             'accessories_returned' => 'nullable|array',
             'damage_fee' => 'nullable|numeric|min:0',
             'late_fee' => 'nullable|numeric|min:0',
+            'final_late_fee' => 'nullable|numeric|min:0',
             'late_fee_discount' => 'nullable|numeric|min:0',
             'waived_late_fee' => 'nullable|numeric|min:0',
             'late_fee_waive_reason' => 'nullable|string|max:500',
+            'late_fee_waiver_reason' => 'nullable|string|max:500',
             'manager_pin' => 'nullable|string',
             'addons_returned' => 'nullable|boolean',
             'returned_addon_ids' => 'nullable|array',
@@ -1267,13 +1302,23 @@ class BookingController extends Controller
             $data['idempotency_key'] = $request->header('X-Idempotency-Key');
         }
 
-        $inspection = $this->returnService->processReturn($booking, $data, $request->user());
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId() ?? $booking->business_id;
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Pengembalian unit berhasil diproses dan unit dikembalikan ke status siap/perbaikan.',
-            'data' => $inspection,
-        ]);
+        return IdempotencyService::execute(
+            $request,
+            $businessId ? (int) $businessId : null,
+            "booking.return:{$booking->id}",
+            function () use ($booking, $data, $request): JsonResponse {
+                $inspection = $this->returnService->processReturn($booking, $data, $request->user());
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Pengembalian unit berhasil diproses dan unit dikembalikan ke status siap/perbaikan.',
+                    'data' => $inspection,
+                ]);
+            }
+        );
     }
 
     /**

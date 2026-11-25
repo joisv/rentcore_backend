@@ -233,12 +233,16 @@ class ReturnService
                 $returnedAt = Carbon::now('UTC');
             }
 
-            // 2. Centralized Late Fee Policy Engine (Cascading unit -> model -> business, grace, rounding, daily cap)
+            // 2. Centralized Late Fee Policy Engine (4-step formula + waiver governance)
             $feeCalc = $this->lateFeeCalculator->calculate($booking, $returnedAt);
-            $lateMinutes = (int) $feeCalc['overdue_minutes'];
-            $calculatedLateFee = (float) $feeCalc['calculated_late_fee'];
+            $lateMinutes = (int) $feeCalc['raw_overdue_minutes'];
+            $calculatedLateFee = (float) $feeCalc['calculated_fee'];
             $waivedLateFee = 0.00;
-            $waiveReason = trim((string) ($data['late_fee_waive_reason'] ?? '')) ?: null;
+            $waiveReason = trim((string) (
+                $data['late_fee_waiver_reason']
+                ?? $data['late_fee_waive_reason']
+                ?? ''
+            )) ?: null;
             $lateFee = $calculatedLateFee;
 
             $requestedDiscount = null;
@@ -248,30 +252,62 @@ class ReturnService
                 $requestedDiscount = max(0.0, (float) $data['waived_late_fee']);
             }
 
+            $requestedFinalFee = null;
+            if (array_key_exists('final_late_fee', $data) && $data['final_late_fee'] !== null && is_numeric($data['final_late_fee'])) {
+                $requestedFinalFee = round(max(0.0, (float) $data['final_late_fee']), 2);
+            }
+
             $damageFee = (float) ($data['damage_fee'] ?? 0.00);
             $hasExplicitDiscount = $requestedDiscount !== null && $requestedDiscount > 0.009;
+            $hasExplicitFinalReduction = $requestedFinalFee !== null && $requestedFinalFee < ($calculatedLateFee - 0.01);
             $clientReducedWithReason = isset($data['late_fee'])
                 && is_numeric($data['late_fee'])
                 && (float) $data['late_fee'] < ($calculatedLateFee - 0.01)
                 && $waiveReason !== null;
 
-            if ($hasExplicitDiscount) {
-                if ($waiveReason === null && $calculatedLateFee > 0) {
+            $isWaivingOrReducing = ($hasExplicitDiscount || $hasExplicitFinalReduction || $clientReducedWithReason)
+                && $calculatedLateFee > 0;
+
+            if ($isWaivingOrReducing) {
+                // Role Guard: If cashier waiver is disabled by store policy, only Owner may waive/reduce
+                $allowCashierWaiver = $business ? (bool) ($business->allow_cashier_late_fee_waiver ?? true) : true;
+                if (!$allowCashierWaiver) {
+                    $member = $business ? $inspector->getBusinessMembership($business->id) : null;
+                    $isOwner = ($member && $member->isOwner())
+                        || ($business && (string) $business->owner_id === (string) $inspector->id)
+                        || $inspector->isSuperAdmin()
+                        || $inspector->isPlatformAdmin();
+                    if (!$isOwner) {
+                        throw new \Symfony\Component\HttpKernel\Exception\HttpException(
+                            403,
+                            'Hanya Owner yang diizinkan menyesuaikan atau membebaskan denda keterlambatan.'
+                        );
+                    }
+                }
+
+                // Mandatory Reason Guard (422)
+                if ($waiveReason === null) {
                     throw ValidationException::withMessages([
+                        'late_fee_waiver_reason' => ['Alasan keringanan atau pembebasan denda keterlambatan wajib diisi.'],
                         'late_fee_waive_reason' => ['Alasan keringanan atau pembebasan denda keterlambatan wajib diisi.'],
                     ]);
                 }
-                $waivedLateFee = round(min($calculatedLateFee, $requestedDiscount), 2);
-                $lateFee = round(max(0.0, $calculatedLateFee - $waivedLateFee), 2);
-            } elseif ($clientReducedWithReason) {
-                $lateFee = round(max(0.0, (float) $data['late_fee']), 2);
-                $waivedLateFee = round(max(0.0, $calculatedLateFee - $lateFee), 2);
+
+                if ($hasExplicitFinalReduction) {
+                    $lateFee = $requestedFinalFee;
+                    $waivedLateFee = round(max(0.0, $calculatedLateFee - $lateFee), 2);
+                } elseif ($hasExplicitDiscount) {
+                    $waivedLateFee = round(min($calculatedLateFee, $requestedDiscount), 2);
+                    $lateFee = round(max(0.0, $calculatedLateFee - $waivedLateFee), 2);
+                } elseif ($clientReducedWithReason) {
+                    $lateFee = round(max(0.0, (float) $data['late_fee']), 2);
+                    $waivedLateFee = round(max(0.0, $calculatedLateFee - $lateFee), 2);
+                }
             }
 
             // Server-side Penalty Authority: require valid Manager PIN if damage_fee > 0
             // or if client late_fee deviates arbitrarily without an explicit waiver discount + reason.
-            $clientLateFeeDeviates = !$hasExplicitDiscount
-                && !$clientReducedWithReason
+            $clientLateFeeDeviates = !$isWaivingOrReducing
                 && isset($data['late_fee'])
                 && is_numeric($data['late_fee'])
                 && abs((float) $data['late_fee'] - $lateFee) > 0.01;
@@ -523,17 +559,23 @@ class ReturnService
                     'condition_grade' => $conditionGrade,
                     'battery_health_final' => $returnInspection->battery_health_final,
                     'late_minutes' => $lateMinutes,
-                    'grace_period_minutes' => $feeCalc['grace_period_minutes'],
+                    'grace_period_minutes' => $feeCalc['grace_minutes'],
+                    'grace_mode' => $feeCalc['grace_mode'],
+                    'billable_minutes' => $feeCalc['billable_minutes'],
+                    'billed_units' => $feeCalc['billed_units'],
+                    'unit_label' => $feeCalc['unit_label'],
                     'billable_hours' => $feeCalc['billable_hours'],
-                    'hourly_late_rate' => $feeCalc['hourly_rate'],
+                    'hourly_late_rate' => $feeCalc['applied_rate'],
+                    'rate_source' => $feeCalc['rate_source'],
                     'rounding_mode' => $feeCalc['rounding_mode'],
                     'daily_rate_cap' => $feeCalc['daily_rate_cap'],
-                    'was_capped' => $feeCalc['was_capped'],
+                    'was_capped' => $feeCalc['cap_applied'],
                     'calculated_late_fee' => $calculatedLateFee,
                     'waived_late_fee' => $waivedLateFee,
                     'final_late_fee' => $lateFee,
                     'late_fee' => $lateFee,
                     'late_fee_waive_reason' => $waiveReason,
+                    'late_fee_waiver_reason' => $waiveReason,
                     'damage_fee' => $damageFee,
                     'total_penalty' => $totalPenalty,
                     'icloud_removed' => $requiresICloud ? !$isQuarantined : ($requiresAndroidFrp ? !$isQuarantined : null),

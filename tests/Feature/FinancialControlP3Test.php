@@ -40,7 +40,7 @@ class FinancialControlP3Test extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore P3 Test',
+            'name' => 'SewaKasir P3 Test',
             'slug' => 'rentcore-p3-test',
             'owner_id' => $this->owner->id,
             'is_active' => true,

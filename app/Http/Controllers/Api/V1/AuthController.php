@@ -40,7 +40,7 @@ class AuthController extends Controller
 
         $user->update(['last_login_at' => Carbon::now()]);
 
-        $deviceName = $request->device_name ?? 'RentCore Mobile Terminal';
+        $deviceName = $request->device_name ?? 'SewaKasir Mobile Terminal';
         $token = $user->createToken($deviceName)->plainTextToken;
 
         $memberships = \App\Models\BusinessMember::with('business.branches')
@@ -76,6 +76,7 @@ class AuthController extends Controller
                 'enable_collateral' => $biz->isCollateralEnabled(),
                 'require_collateral' => $biz->isCollateralRequired(),
                 'collateral_types' => $biz->getResolvedCollateralTypes(),
+                'branch_unit_registration_policy' => $biz->getBranchUnitRegistrationPolicy(),
                 'role' => $m->role,
                 'resign_status' => $latestResign?->status,
                 'resign_reason' => $latestResign?->reason,
@@ -240,7 +241,7 @@ class AuthController extends Controller
             ], 403);
         }
 
-        $deviceName = $request->device_name ?? 'RentCore Mobile Terminal (Google)';
+        $deviceName = $request->device_name ?? 'SewaKasir Mobile Terminal (Google)';
         $token = $user->createToken($deviceName)->plainTextToken;
 
         $memberships = \App\Models\BusinessMember::with('business.branches')
@@ -276,6 +277,7 @@ class AuthController extends Controller
                 'enable_collateral' => $biz->isCollateralEnabled(),
                 'require_collateral' => $biz->isCollateralRequired(),
                 'collateral_types' => $biz->getResolvedCollateralTypes(),
+                'branch_unit_registration_policy' => $biz->getBranchUnitRegistrationPolicy(),
                 'role' => $m->role,
                 'resign_status' => $latestResign?->status,
                 'resign_reason' => $latestResign?->reason,
@@ -346,6 +348,7 @@ class AuthController extends Controller
                 'enable_collateral' => $biz->isCollateralEnabled(),
                 'require_collateral' => $biz->isCollateralRequired(),
                 'collateral_types' => $biz->getResolvedCollateralTypes(),
+                'branch_unit_registration_policy' => $biz->getBranchUnitRegistrationPolicy(),
                 'role' => $m->role,
                 'resign_status' => $latestResign?->status,
                 'resign_reason' => $latestResign?->reason,

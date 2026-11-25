@@ -194,7 +194,7 @@
 <body>
     <header class="topbar">
         <div class="topbar-inner">
-            <a class="brand" href="{{ route('legal.privacy-policy') }}">RENTCORE</a>
+            <a class="brand" href="{{ route('legal.privacy-policy') }}">SEWAKASIR</a>
             <nav class="nav-links">
                 <a href="{{ route('legal.privacy-policy') }}">Kebijakan Privasi</a>
                 <a class="active" href="{{ route('legal.account-deletion') }}">Penghapusan Akun</a>
@@ -221,14 +221,14 @@
         @endif
 
         <section class="card">
-            <h1>Permintaan Penghapusan Akun Rentcore</h1>
+            <h1>Permintaan Penghapusan Akun SewaKasir</h1>
             <p>
-                Sesuai Kebijakan Data Pengguna Google Play, Anda dapat meminta penonaktifan permanen dan penghapusan/anonimisasi data akun pribadi Rentcore Anda baik langsung dari dalam aplikasi maupun melalui formulir web publik di halaman ini.
+                Sesuai Kebijakan Data Pengguna Google Play, Anda dapat meminta penonaktifan permanen dan penghapusan/anonimisasi data akun pribadi SewaKasir Anda baik langsung dari dalam aplikasi maupun melalui formulir web publik di halaman ini.
             </p>
 
             <h2>Cara Menghapus Akun</h2>
             <ol>
-                <li><strong>Melalui Aplikasi Rentcore:</strong> Masuk ke aplikasi &rarr; buka tab <em>Pengaturan</em> &rarr; pilih <em>Profil Saya</em> &rarr; gulir ke bagian <em>Privasi &amp; Akun</em> &rarr; ketuk <em>Hapus Akun</em>.</li>
+                <li><strong>Melalui Aplikasi SewaKasir:</strong> Masuk ke aplikasi &rarr; buka tab <em>Pengaturan</em> &rarr; pilih <em>Profil Saya</em> &rarr; gulir ke bagian <em>Privasi &amp; Akun</em> &rarr; ketuk <em>Hapus Akun</em>.</li>
                 <li><strong>Melalui Formulir Web (Tanpa Aplikasi):</strong> Lengkapi formulir verifikasi email dan kata sandi di bawah ini untuk segera menonaktifkan akun dan mencabut seluruh token login Anda.</li>
             </ol>
 
@@ -301,7 +301,7 @@
             </form>
         </section>
 
-        <p class="footer">&copy; {{ date('Y') }} Rentcore &bull; <a href="{{ route('legal.privacy-policy') }}">Kebijakan Privasi</a></p>
+        <p class="footer">&copy; {{ date('Y') }} SewaKasir &bull; <a href="{{ route('legal.privacy-policy') }}">Kebijakan Privasi</a></p>
     </main>
 </body>
 </html>

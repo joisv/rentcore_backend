@@ -43,7 +43,7 @@ class CategoryAwareReturnAndQrisValidationTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Unit Test Store',
+            'name' => 'SewaKasir Unit Test Store',
             'slug' => 'rentcore-unit-test-store',
             'owner_id' => $this->owner->id,
             'is_active' => true,

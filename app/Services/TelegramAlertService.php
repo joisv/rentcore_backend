@@ -84,7 +84,7 @@ class TelegramAlertService
             ];
         }
 
-        $appName = (string) config('app.name', 'RentCore');
+        $appName = (string) config('app.name', 'SewaKasir');
         $appEnv = (string) config('app.env', 'local');
         $timestamp = now('Asia/Jakarta')->format('Y-m-d H:i:s') . ' WIB';
         $enabledLabel = config('services.telegram_alerts.enabled') ? 'true' : 'false';
@@ -126,7 +126,7 @@ class TelegramAlertService
 
     public function formatExceptionMessage(Throwable $e, ?Request $request = null): string
     {
-        $appName = (string) config('app.name', 'RentCore');
+        $appName = (string) config('app.name', 'SewaKasir');
         $appEnv = (string) config('app.env', 'local');
         $exceptionClass = get_class($e);
         $errorMessage = Str::limit(trim($e->getMessage()) !== '' ? $e->getMessage() : '(no message)', 600);

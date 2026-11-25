@@ -13,7 +13,7 @@ return new class extends Migration
             $table->id();
             $table->string('min_android_version')->default('1.0.0');
             $table->string('latest_android_version')->default('1.0.0');
-            $table->string('play_store_url')->default('https://play.google.com/store/apps/details?id=com.rentcore.app');
+            $table->string('play_store_url')->default('https://play.google.com/store/apps/details?id=id.sewakasir.mobile');
             $table->boolean('maintenance_mode')->default(false);
             $table->text('maintenance_message')->nullable();
             $table->text('force_update_message')->nullable();
@@ -23,7 +23,7 @@ return new class extends Migration
         DB::table('app_configs')->insert([
             'min_android_version' => '1.0.0',
             'latest_android_version' => '1.0.0',
-            'play_store_url' => 'https://play.google.com/store/apps/details?id=com.rentcore.app',
+            'play_store_url' => 'https://play.google.com/store/apps/details?id=id.sewakasir.mobile',
             'maintenance_mode' => false,
             'maintenance_message' => null,
             'force_update_message' => null,

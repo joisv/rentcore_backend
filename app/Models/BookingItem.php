@@ -21,6 +21,7 @@ class BookingItem extends Model
         'rate_snapshot',
         'applied_hourly_late_fee',
         'applied_grace_period_minutes',
+        'applied_late_fee_grace_mode',
         'applied_daily_rate_cap',
         'applied_late_fee_rounding_mode',
         'status',

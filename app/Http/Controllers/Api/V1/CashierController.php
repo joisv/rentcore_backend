@@ -7,6 +7,7 @@ use App\Models\Booking;
 use App\Models\PaymentMethod;
 use App\Models\PaymentTransaction;
 use App\Services\AuditLogService;
+use App\Services\IdempotencyService;
 use App\Services\ManagerPinVerificationService;
 use App\Services\ShiftEnforcementService;
 use App\Services\TimezoneService;
@@ -181,6 +182,13 @@ class CashierController extends Controller
         }
 
         $idempotencyKey = $request->header('X-Idempotency-Key') ?? $request->input('idempotency_key');
+        $effectiveBizId = $businessId ?? $booking->business_id ?? $user?->business_id;
+
+        return IdempotencyService::execute(
+            $request,
+            $effectiveBizId ? (int) $effectiveBizId : null,
+            'cashier.pay',
+            function () use ($booking, $paymentMethod, $isCash, $type, $request, $user, $idempotencyKey): JsonResponse {
         if ($idempotencyKey) {
             $existingTx = PaymentTransaction::where('business_id', $booking->business_id ?? $user->business_id)
                 ->where('idempotency_key', $idempotencyKey)
@@ -200,7 +208,7 @@ class CashierController extends Controller
                         'payment' => $existingTx->load('paymentMethod'),
                         'is_idempotent' => true,
                     ],
-                ]);
+                ])->header('X-Idempotent-Replay', 'true');
             }
         }
 
@@ -485,6 +493,8 @@ class CashierController extends Controller
             }
             throw $e;
         }
+            }
+        );
     }
 
     /**
@@ -551,11 +561,11 @@ class CashierController extends Controller
             'data' => [
                 'receipt_number' => $tx->receipt_number,
                 'transaction_code' => $tx->transaction_code,
-                'outlet_name' => $affiliate->name ?? 'RentCore Central Hub',
+                'outlet_name' => $affiliate->name ?? 'SewaKasir Central Hub',
                 'outlet_address' => $affiliate->address ?? 'Pusat Rental Elektronik',
                 'outlet_phone' => $affiliate->phone ?? '0812-3456-7890',
                 'transacted_at' => $tx->transacted_at,
-                'cashier_name' => $tx->processedBy->name ?? 'Kasir RentCore',
+                'cashier_name' => $tx->processedBy->name ?? 'Kasir SewaKasir',
                 'customer_name' => $tx->booking->customer->name ?? 'Pelanggan',
                 'customer_phone' => $tx->booking->customer->phone ?? '',
                 'customer_address' => $tx->booking->customer->address ?? '',
@@ -972,8 +982,8 @@ class CashierController extends Controller
             );
         }
 
-        $limit = max(10, min(500, (int)$request->get('limit', $request->get('per_page', 50))));
-        $recentTransactions = (clone $baseQuery)
+        $perPage = max(1, min(50, (int) $request->get('per_page', $request->get('limit', 50))));
+        $recentTransactionsPaginator = (clone $baseQuery)
             ->with([
                 'paymentMethod',
                 'branch',
@@ -985,9 +995,9 @@ class CashierController extends Controller
                 'voidBy'
             ])
             ->latest('payment_transactions.transacted_at')
-            ->limit($limit)
-            ->get()
-            ->map(function ($tx) {
+            ->paginate($perPage);
+
+        $recentTransactions = $recentTransactionsPaginator->getCollection()->map(function ($tx) {
             return [
                 'id' => $tx->id,
                 'transaction_code' => $tx->transaction_code,
@@ -1049,6 +1059,12 @@ class CashierController extends Controller
             'breakdown_by_method' => (object)$breakdown,
             'breakdown_by_branch' => $branchBreakdownList,
             'recent_transactions' => $recentTransactions,
+            'transactions_pagination' => [
+                'current_page' => $recentTransactionsPaginator->currentPage(),
+                'last_page' => $recentTransactionsPaginator->lastPage(),
+                'per_page' => $recentTransactionsPaginator->perPage(),
+                'total' => $recentTransactionsPaginator->total(),
+            ],
         ];
 
         if (!$hasOpenShift) {

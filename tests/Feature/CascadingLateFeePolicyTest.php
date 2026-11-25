@@ -55,12 +55,13 @@ class CascadingLateFeePolicyTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Penalty SaaS',
+            'name' => 'SewaKasir Penalty SaaS',
             'slug' => 'rentcore-penalty-saas-' . uniqid(),
             'owner_id' => $this->owner->id,
             'is_active' => true,
             'timezone' => 'Asia/Jakarta',
             'return_grace_period_minutes' => 15,
+            'late_fee_grace_mode' => 'deductive',
             'late_fee_rounding_mode' => 'hourly_ceil',
             'cap_late_fee_at_daily_rate' => true,
             'default_hourly_late_fee' => 10000.00,

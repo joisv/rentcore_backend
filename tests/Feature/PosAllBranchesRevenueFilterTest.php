@@ -65,7 +65,7 @@ class PosAllBranchesRevenueFilterTest extends TestCase
 
         // 2. Setup Businesses
         $this->businessA = Business::create([
-            'name' => 'RentCore Central Business',
+            'name' => 'SewaKasir Central Business',
             'slug' => 'rentcore-central-business',
             'owner_id' => $this->ownerA->id,
             'email' => 'owner@rentcore.id',
@@ -86,7 +86,7 @@ class PosAllBranchesRevenueFilterTest extends TestCase
         $this->mainBranchA = Affiliate::create([
             'business_id' => $this->businessA->id,
             'code' => 'PST',
-            'name' => 'RentCore Pusat (Main Store)',
+            'name' => 'SewaKasir Pusat (Main Store)',
             'slug' => 'rentcore-pusat',
             'is_central' => true,
             'is_active' => true,
@@ -95,7 +95,7 @@ class PosAllBranchesRevenueFilterTest extends TestCase
         $this->branchA2 = Affiliate::create([
             'business_id' => $this->businessA->id,
             'code' => 'BRT',
-            'name' => 'RentCore Cabang Barat',
+            'name' => 'SewaKasir Cabang Barat',
             'slug' => 'rentcore-cabang-barat',
             'is_central' => false,
             'is_active' => true,
@@ -104,7 +104,7 @@ class PosAllBranchesRevenueFilterTest extends TestCase
         $this->branchA3 = Affiliate::create([
             'business_id' => $this->businessA->id,
             'code' => 'TMR',
-            'name' => 'RentCore Cabang Timur',
+            'name' => 'SewaKasir Cabang Timur',
             'slug' => 'rentcore-cabang-timur',
             'is_central' => false,
             'is_active' => true,

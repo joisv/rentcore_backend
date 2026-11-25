@@ -47,7 +47,7 @@ class SecurityPolicyAndAuditLogTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Security Test',
+            'name' => 'SewaKasir Security Test',
             'slug' => 'rentcore-sec-test',
             'owner_id' => $this->owner->id,
             'is_active' => true,

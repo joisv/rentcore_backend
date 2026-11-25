@@ -9,7 +9,7 @@ class AppConfig extends Model
 {
     public const CACHE_KEY = 'public_app_config';
 
-    public const DEFAULT_PLAY_STORE_URL = 'https://play.google.com/store/apps/details?id=com.rentcore.app';
+    public const DEFAULT_PLAY_STORE_URL = 'https://play.google.com/store/apps/details?id=id.sewakasir.mobile';
 
     protected $fillable = [
         'min_android_version',

@@ -133,7 +133,7 @@
 <body>
     <header class="topbar">
         <div class="topbar-inner">
-            <a class="brand" href="{{ route('legal.privacy-policy') }}">RENTCORE</a>
+            <a class="brand" href="{{ route('legal.privacy-policy') }}">SEWAKASIR</a>
             <nav class="nav-links">
                 <a class="active" href="{{ route('legal.privacy-policy') }}">Kebijakan Privasi</a>
                 <a href="{{ route('legal.account-deletion') }}">Penghapusan Akun</a>
@@ -147,7 +147,7 @@
             <p class="meta">Terakhir diperbarui: {{ $lastUpdated }} &bull; Berlaku untuk aplikasi mobile &amp; layanan {{ $appName }}</p>
 
             <p>
-                <strong>Rentcore</strong> adalah platform SaaS (Software-as-a-Service) manajemen operasional penyewaan perangkat dan Point-of-Sale (POS) multi-tenant yang membantu pemilik usaha serta staf cabang mengelola inventaris unit, booking sewa, kasir, dan laporan keuangan. Kebijakan Privasi ini menjelaskan bagaimana kami mengumpulkan, menggunakan, melindungi, dan mengelola data Anda.
+                <strong>SewaKasir</strong> adalah platform SaaS (Software-as-a-Service) manajemen operasional penyewaan perangkat dan Point-of-Sale (POS) multi-tenant yang membantu pemilik usaha serta staf cabang mengelola inventaris unit, booking sewa, kasir, dan laporan keuangan. Kebijakan Privasi ini menjelaskan bagaimana kami mengumpulkan, menggunakan, melindungi, dan mengelola data Anda.
             </p>
 
             <h2>1. Data yang Kami Kumpulkan</h2>
@@ -162,7 +162,7 @@
             <div class="callout">
                 <p style="margin:0;">
                     <strong>Transparansi Izin Bluetooth (Android 11 &amp; Android 12–15):</strong>
-                    Izin <code>BLUETOOTH_SCAN</code> (dengan flag <code>neverForLocation</code>) dan <code>BLUETOOTH_CONNECT</code> digunakan <strong>semata-mata untuk menemukan dan menghubungkan perangkat ke printer struk thermal ESC/POS lokal</strong>. Aplikasi Rentcore <strong>tidak pernah</strong> menggunakan izin Bluetooth untuk melacak lokasi fisik pengguna atau mengumpulkan data lokasi latar belakang.
+                    Izin <code>BLUETOOTH_SCAN</code> (dengan flag <code>neverForLocation</code>) dan <code>BLUETOOTH_CONNECT</code> digunakan <strong>semata-mata untuk menemukan dan menghubungkan perangkat ke printer struk thermal ESC/POS lokal</strong>. Aplikasi SewaKasir <strong>tidak pernah</strong> menggunakan izin Bluetooth untuk melacak lokasi fisik pengguna atau mengumpulkan data lokasi latar belakang.
                 </p>
             </div>
             <ul>
@@ -174,7 +174,7 @@
             <ul>
                 <li>Setiap bisnis/tenant diisolasi secara ketat pada tingkat API dan basis data menggunakan konteks tenant (<code>X-Business-Id</code> &amp; <code>X-Branch-Id</code>). Pengguna dari satu bisnis tidak dapat mengakses data bisnis lain.</li>
                 <li>Seluruh lalu lintas komunikasi menggunakan enkripsi HTTPS/TLS, kata sandi di-hash secara kriptografis, dan sesi aplikasi dilindungi oleh token autentikasi Laravel Sanctum.</li>
-                <li>Rentcore tidak menjual, menyewakan, atau memperdagangkan data pribadi maupun data transaksi tenant kepada pihak ketiga untuk tujuan periklanan.</li>
+                <li>SewaKasir tidak menjual, menyewakan, atau memperdagangkan data pribadi maupun data transaksi tenant kepada pihak ketiga untuk tujuan periklanan.</li>
             </ul>
 
             <h2>4. Hak Pengguna &amp; Penghapusan Akun</h2>
@@ -189,7 +189,7 @@
             </p>
         </article>
 
-        <p class="footer">&copy; {{ date('Y') }} Rentcore Multi-Tenant Rental &amp; POS Platform.</p>
+        <p class="footer">&copy; {{ date('Y') }} SewaKasir Multi-Tenant Rental &amp; POS Platform.</p>
     </main>
 </body>
 </html>

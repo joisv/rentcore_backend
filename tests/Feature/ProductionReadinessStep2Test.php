@@ -54,7 +54,7 @@ class ProductionReadinessStep2Test extends TestCase
             'services.telegram_alerts.enabled' => true,
             'services.telegram_alerts.bot_token' => 'bot-token-xyz',
             'services.telegram_alerts.chat_id' => '-100999888',
-            'app.name' => 'RentCore',
+            'app.name' => 'SewaKasir',
             'app.env' => 'production',
         ]);
 
@@ -159,7 +159,7 @@ class ProductionReadinessStep2Test extends TestCase
             '--latest-version' => '1.3.5',
             '--maintenance' => 'on',
             '--message' => 'Sedang upgrade database 10 menit.',
-            '--store-url' => 'https://play.google.com/store/apps/details?id=com.rentcore.rentcore_mobile',
+            '--store-url' => 'https://play.google.com/store/apps/details?id=id.sewakasir.mobile',
         ])->assertExitCode(0);
 
         $this->assertFalse(Cache::has(AppConfig::CACHE_KEY));
@@ -171,7 +171,7 @@ class ProductionReadinessStep2Test extends TestCase
                 'data' => [
                     'min_android_version' => '1.2.0',
                     'latest_android_version' => '1.3.5',
-                    'play_store_url' => 'https://play.google.com/store/apps/details?id=com.rentcore.rentcore_mobile',
+                    'play_store_url' => 'https://play.google.com/store/apps/details?id=id.sewakasir.mobile',
                     'maintenance_mode' => true,
                     'maintenance_message' => 'Sedang upgrade database 10 menit.',
                 ],

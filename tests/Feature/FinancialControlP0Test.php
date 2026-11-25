@@ -46,7 +46,7 @@ class FinancialControlP0Test extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Financial Demo',
+            'name' => 'SewaKasir Financial Demo',
             'slug' => 'rentcore-fin-demo',
             'owner_id' => $this->owner->id,
             'is_active' => true,

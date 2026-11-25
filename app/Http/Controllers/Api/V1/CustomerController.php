@@ -35,7 +35,25 @@ class CustomerController extends Controller
             $query->where('is_blacklisted', filter_var($request->is_blacklisted, FILTER_VALIDATE_BOOLEAN));
         }
 
-        $customers = $query->orderBy('created_at', 'desc')->paginate($request->get('per_page', 20));
+        $perPage = max(1, min(50, (int) $request->get('per_page', 20)));
+        $customers = $query->orderBy('created_at', 'desc')->paginate($perPage);
+
+        // Strip any legacy raw base64 blobs from list payloads; expose URL reference instead
+        $customers->getCollection()->each(function ($customer) {
+            if ($customer->relationLoaded('identities')) {
+                $customer->identities->each(function ($identity) use ($customer) {
+                    if (is_string($identity->file_path) && str_starts_with($identity->file_path, 'data:image')) {
+                        $identity->file_path = null;
+                    }
+                    $identity->setAttribute(
+                        'document_url',
+                        !empty($identity->file_path)
+                            ? url("/api/v1/customers/{$customer->id}/identity-document")
+                            : null
+                    );
+                });
+            }
+        });
 
         return response()->json([
             'success' => true,

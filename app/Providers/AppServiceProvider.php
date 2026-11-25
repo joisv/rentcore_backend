@@ -26,7 +26,22 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         RateLimiter::for('api', function (Request $request) {
-            return Limit::perMinute(120)->by($request->user()?->id ?: $request->ip());
+            $user = $request->user();
+            $tenantContext = app(TenantContext::class);
+            $businessId = $tenantContext->getBusinessId()
+                ?? ($request->header('X-Business-Id') ? (int) $request->header('X-Business-Id') : null)
+                ?? $user?->current_business_id
+                ?? $user?->business_id;
+
+            if ($user) {
+                $rateKey = $businessId
+                    ? "api:biz:{$businessId}:user:{$user->id}"
+                    : "api:user:{$user->id}";
+
+                return Limit::perMinute(120)->by($rateKey);
+            }
+
+            return Limit::perMinute(60)->by('api:ip:' . $request->ip());
         });
 
         RateLimiter::for('auth', function (Request $request) {

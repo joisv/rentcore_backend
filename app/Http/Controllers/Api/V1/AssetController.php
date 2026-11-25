@@ -5,7 +5,10 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Models\Asset;
 use App\Models\AssetModel;
+use App\Models\Business;
 use App\Services\AuditLogService;
+use App\Services\NotificationService;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -153,6 +156,9 @@ class AssetController extends Controller
             $query->whereIn('assets.status', \App\Services\BookingAvailabilityService::RENTABLE_ASSET_STATUSES);
         } elseif ($request->has('status')) {
             $query->where('assets.status', $request->status);
+        } else {
+            // Exclude rejected submissions from default active inventory views
+            $query->where('assets.status', '!=', 'rejected');
         }
 
         if ($request->has('model_id')) {
@@ -222,7 +228,7 @@ class AssetController extends Controller
             ]);
         }
 
-        $perPage = (int) $request->get('per_page', 20);
+        $perPage = max(1, min(50, (int) $request->get('per_page', 20)));
         $assets = $query->paginate($perPage);
 
         if ($assets->currentPage() > $assets->lastPage() && $assets->lastPage() > 0) {
@@ -356,7 +362,21 @@ class AssetController extends Controller
         $businessId = $tenantContext->getBusinessId();
 
         $member = $tenantContext->getMember() ?? ($businessId && $user ? $user->getBusinessMembership($businessId) : null);
-        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+        $business = $businessId ? Business::find($businessId) : null;
+        $isOwner = ($member && $member->isOwner())
+            || ($business && $user && (string) $business->owner_id === (string) $user->id)
+            || ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+        $isOwnerOrAdmin = $member ? ($member->isOwner() || $member->isAdmin()) : $isOwner;
+        $registrationPolicy = $business ? $business->getBranchUnitRegistrationPolicy() : 'self_service';
+
+        // Enforce owner-configured branch unit registration policy for non-owners
+        if (!$isOwner && $registrationPolicy === 'owner_only') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner yang dapat mendaftarkan unit baru.',
+                'code' => 'OWNER_ONLY_UNIT_REGISTRATION',
+            ], 403);
+        }
 
         $affiliateId = $request->get('affiliate_id') 
             ?? $request->header('X-Branch-Id') 
@@ -449,6 +469,9 @@ class AssetController extends Controller
             'notes' => 'nullable|string',
         ]);
 
+        $requiresApproval = !$isOwner && $registrationPolicy === 'require_owner_approval';
+        $initialStatus = $requiresApproval ? 'pending_approval' : 'ready';
+
         $asset = Asset::create([
             'business_id' => $businessId,
             'affiliate_id' => $affiliateId,
@@ -457,24 +480,32 @@ class AssetController extends Controller
             'serial_number' => !empty($validated['serial_number']) ? strtoupper(trim($validated['serial_number'])) : null,
             'imei_1' => $validated['imei_1'] ?? null,
             'imei_2' => $validated['imei_2'] ?? null,
-            'status' => 'ready',
+            'status' => $initialStatus,
             'condition_grade' => $validated['condition_grade'] ?? 'A',
             'battery_health' => (isset($validated['battery_health']) && $validated['battery_health'] !== '') ? (int)$validated['battery_health'] : null,
             'hourly_late_fee' => ($request->exists('hourly_late_fee') && $validated['hourly_late_fee'] !== null && $validated['hourly_late_fee'] !== '')
                 ? (float) $validated['hourly_late_fee']
                 : null,
             'notes' => $validated['notes'] ?? null,
+            'submitted_by' => $user?->id,
+            'approved_by' => $requiresApproval ? null : $user?->id,
+            'approved_at' => $requiresApproval ? null : Carbon::now(),
         ]);
+
+        if ($requiresApproval && $user) {
+            app(NotificationService::class)->notifyUnitApprovalRequested($asset, $user);
+        }
 
         AuditLogService::log(
             $user,
-            'asset.created',
+            $requiresApproval ? 'asset.approval_requested' : 'asset.created',
             'Asset',
             $asset->id,
             [
                 'asset_code' => $asset->asset_code,
                 'serial_number' => $asset->serial_number,
                 'model_id' => $asset->model_id,
+                'status' => $asset->status,
             ],
             null,
             $request->ip(),
@@ -483,9 +514,150 @@ class AssetController extends Controller
 
         return response()->json([
             'success' => true,
-            'message' => 'Perangkat elektronik berhasil didaftarkan ke inventaris.',
-            'data' => $asset->load(['model.category', 'affiliate']),
+            'message' => $requiresApproval
+                ? 'Unit baru berhasil diajukan dan menunggu persetujuan Owner.'
+                : 'Perangkat elektronik berhasil didaftarkan ke inventaris.',
+            'data' => $asset->load(['model.category', 'affiliate', 'submitter:id,name']),
         ], 201);
+    }
+
+    /**
+     * Owner approves a branch-submitted unit (`pending_approval` -> `ready`).
+     */
+    public function approve(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $asset = Asset::with(['model.category', 'affiliate', 'submitter:id,name'])->findOrFail($id);
+        $assetBusinessId = (int) ($asset->business_id ?? $businessId);
+        $business = $assetBusinessId ? Business::find($assetBusinessId) : null;
+        $member = $tenantContext->getMember() ?? ($assetBusinessId && $user ? $user->getBusinessMembership($assetBusinessId) : null);
+
+        $isOwner = ($member && $member->isOwner())
+            || ($business && $user && (string) $business->owner_id === (string) $user->id)
+            || ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+
+        if (!$isOwner) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner yang berwenang menyetujui pengajuan unit baru.',
+                'code' => 'OWNER_REQUIRED',
+            ], 403);
+        }
+
+        if ($asset->status !== 'pending_approval') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unit ini tidak sedang menunggu persetujuan.',
+                'code' => 'INVALID_ASSET_STATUS',
+            ], 422);
+        }
+
+        $asset->update([
+            'status' => 'ready',
+            'approved_by' => $user->id,
+            'approved_at' => Carbon::now(),
+            'rejection_reason' => null,
+        ]);
+
+        app(NotificationService::class)->notifyUnitApproved($asset, $user);
+
+        AuditLogService::log(
+            $user,
+            'asset.approved',
+            'Asset',
+            $asset->id,
+            [
+                'asset_code' => $asset->asset_code,
+                'submitted_by' => $asset->submitted_by,
+                'status' => 'ready',
+            ],
+            ['status' => 'pending_approval'],
+            $request->ip(),
+            $asset->affiliate_id
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Unit baru berhasil disetujui dan kini berstatus Siap Sewa.',
+            'data' => $asset->fresh(['model.category', 'affiliate', 'submitter:id,name']),
+        ]);
+    }
+
+    /**
+     * Owner rejects a branch-submitted unit (`pending_approval` -> `rejected`).
+     */
+    public function reject(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        $tenantContext = app(\App\Tenancy\TenantContext::class);
+        $businessId = $tenantContext->getBusinessId();
+
+        $asset = Asset::with(['model.category', 'affiliate', 'submitter:id,name'])->findOrFail($id);
+        $assetBusinessId = (int) ($asset->business_id ?? $businessId);
+        $business = $assetBusinessId ? Business::find($assetBusinessId) : null;
+        $member = $tenantContext->getMember() ?? ($assetBusinessId && $user ? $user->getBusinessMembership($assetBusinessId) : null);
+
+        $isOwner = ($member && $member->isOwner())
+            || ($business && $user && (string) $business->owner_id === (string) $user->id)
+            || ($user && ($user->isSuperAdmin() || $user->isPlatformAdmin()));
+
+        if (!$isOwner) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Hanya Owner yang berwenang menolak pengajuan unit baru.',
+                'code' => 'OWNER_REQUIRED',
+            ], 403);
+        }
+
+        if ($asset->status !== 'pending_approval') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unit ini tidak sedang menunggu persetujuan.',
+                'code' => 'INVALID_ASSET_STATUS',
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'reason' => 'nullable|string|max:500',
+            'rejection_reason' => 'nullable|string|max:500',
+        ]);
+
+        $reason = trim((string) ($validated['reason'] ?? $validated['rejection_reason'] ?? ''));
+        $reasonOrNull = $reason !== '' ? $reason : null;
+
+        $asset->update([
+            'status' => 'rejected',
+            'rejected_by' => $user->id,
+            'rejected_at' => Carbon::now(),
+            'rejection_reason' => $reasonOrNull,
+        ]);
+
+        app(NotificationService::class)->notifyUnitRejected($asset, $user, $reasonOrNull);
+
+        AuditLogService::log(
+            $user,
+            'asset.rejected',
+            'Asset',
+            $asset->id,
+            [
+                'asset_code' => $asset->asset_code,
+                'submitted_by' => $asset->submitted_by,
+                'status' => 'rejected',
+                'rejection_reason' => $reasonOrNull,
+            ],
+            ['status' => 'pending_approval'],
+            $request->ip(),
+            $asset->affiliate_id
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Pengajuan unit baru telah ditolak.',
+            'data' => $asset->fresh(['model.category', 'affiliate', 'submitter:id,name']),
+        ]);
     }
 
     /**
@@ -601,6 +773,13 @@ class AssetController extends Controller
                     'success' => false,
                     'message' => 'Status unit tidak dapat diubah secara manual saat unit dalam proses mutasi antar cabang. Selesaikan atau batalkan mutasi terlebih dahulu.',
                     'code' => 'IN_TRANSIT_STATUS_LOCKED',
+                ], 422);
+            }
+            if ($asset->status === 'pending_approval') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unit yang menunggu persetujuan hanya dapat diubah statusnya melalui persetujuan Owner.',
+                    'code' => 'PENDING_APPROVAL_LOCKED',
                 ], 422);
             }
         }

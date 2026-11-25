@@ -29,7 +29,7 @@ class ProductImageAndAssetSortTest extends TestCase
         ]);
         $business = Business::create([
             'owner_id' => $user->id,
-            'name' => 'RentCore Studio',
+            'name' => 'SewaKasir Studio',
             'slug' => 'rentcore-studio',
             'is_active' => true,
         ]);

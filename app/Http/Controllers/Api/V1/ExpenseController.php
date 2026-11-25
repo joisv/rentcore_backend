@@ -117,13 +117,13 @@ class ExpenseController extends Controller
             $query->where('branch_id', $targetBranchId);
         }
 
-        $expenses = $query->latest('created_at')->get();
+        $summaryExpenses = (clone $query)->get(['id', 'amount', 'category', 'payment_source', 'status']);
 
         $totalExpenses = 0.00;
         $cashDrawerExpenses = 0.00;
         $categoryBreakdown = [];
 
-        foreach ($expenses as $exp) {
+        foreach ($summaryExpenses as $exp) {
             if ($exp->status === 'rejected' || $exp->status === 'void') {
                 continue;
             }
@@ -141,6 +141,9 @@ class ExpenseController extends Controller
             $categoryBreakdown[$cat]['total'] += $amt;
         }
 
+        $perPage = max(1, min(50, (int) $request->get('per_page', 50)));
+        $expensesPaginator = $query->latest('created_at')->paginate($perPage);
+
         return response()->json([
             'success' => true,
             'data' => [
@@ -153,11 +156,20 @@ class ExpenseController extends Controller
                 'summary' => [
                     'total_expenses' => $totalExpenses,
                     'cash_drawer_expenses' => $cashDrawerExpenses,
-                    'count' => $expenses->count(),
+                    'count' => $summaryExpenses->count(),
                     'by_category' => empty($categoryBreakdown) ? (object)[] : $categoryBreakdown,
                     'categories' => empty($categoryBreakdown) ? (object)[] : $categoryBreakdown,
                 ],
-                'expenses' => $expenses->map(function ($exp) {
+                'pagination' => [
+                    'current_page' => $expensesPaginator->currentPage(),
+                    'last_page' => $expensesPaginator->lastPage(),
+                    'per_page' => $expensesPaginator->perPage(),
+                    'total' => $expensesPaginator->total(),
+                ],
+                'expenses' => $expensesPaginator->getCollection()->map(function ($exp) {
+                    $hasValidReceiptPath = is_string($exp->receipt_image_path)
+                        && $exp->receipt_image_path !== ''
+                        && !str_starts_with($exp->receipt_image_path, 'data:image');
                     return [
                         'id' => $exp->id,
                         'expense_number' => $exp->expense_number,
@@ -173,12 +185,12 @@ class ExpenseController extends Controller
                         'void_by_name' => $exp->voidBy?->name,
                         'void_reason' => $exp->void_reason,
                         'voided_at' => $exp->voided_at?->toIso8601String(),
-                        'receipt_image_url' => $exp->receipt_image_path ? url("/api/v1/cashier/expenses/{$exp->id}/receipt-file") : null,
+                        'receipt_image_url' => $hasValidReceiptPath ? url("/api/v1/cashier/expenses/{$exp->id}/receipt-file") : null,
                         'notes' => $exp->notes,
                         'disbursed_at' => $exp->disbursed_at?->toIso8601String(),
                         'created_at' => $exp->created_at?->toIso8601String(),
                     ];
-                }),
+                })->values(),
             ],
         ]);
     }

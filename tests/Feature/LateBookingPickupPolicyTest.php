@@ -50,7 +50,7 @@ class LateBookingPickupPolicyTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Policy Test',
+            'name' => 'SewaKasir Policy Test',
             'slug' => 'rentcore-policy-test',
             'owner_id' => $this->owner->id,
             'is_active' => true,

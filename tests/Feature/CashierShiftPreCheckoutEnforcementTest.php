@@ -33,7 +33,7 @@ class CashierShiftPreCheckoutEnforcementTest extends TestCase
         parent::setUp();
 
         $owner = User::create([
-            'name' => 'Owner Rentcore',
+            'name' => 'Owner SewaKasir',
             'email' => 'owner@rentcore.id',
             'password' => Hash::make('password'),
             'role' => 'owner',
@@ -41,7 +41,7 @@ class CashierShiftPreCheckoutEnforcementTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Central',
+            'name' => 'SewaKasir Central',
             'slug' => 'rentcore-central',
             'owner_id' => $owner->id,
             'is_active' => true,

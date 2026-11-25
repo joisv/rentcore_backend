@@ -111,7 +111,7 @@ class ProductController extends Controller
             ]);
         }
 
-        $perPage = (int) $request->get('per_page', 20);
+        $perPage = max(1, min(50, (int) $request->get('per_page', 20)));
         $products = $query->orderBy('created_at', 'desc')->paginate($perPage);
 
         if ($products->currentPage() > $products->lastPage() && $products->lastPage() > 0) {
@@ -203,12 +203,12 @@ class ProductController extends Controller
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
             'hourly_late_fee' => 'nullable|numeric|min:0',
+            'late_fee_per_hour' => 'nullable|numeric|min:0',
             'image' => 'nullable|image|max:5120',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
             'rates.*.duration_value' => 'required_with:rates|integer|min:1',
             'rates.*.price' => 'required_with:rates|numeric|min:0',
-            'rates.*.extension_hourly_rate' => 'nullable|numeric|min:0',
         ]);
 
         $slug = !empty($validated['slug']) 
@@ -238,7 +238,7 @@ class ProductController extends Controller
             'specifications' => $validated['specifications'] ?? null,
             'is_addon' => $request->has('is_addon') ? $request->boolean('is_addon') : false,
             'is_active' => $validated['is_active'] ?? true,
-            'hourly_late_fee' => $validated['hourly_late_fee'] ?? null,
+            'hourly_late_fee' => $validated['hourly_late_fee'] ?? $validated['late_fee_per_hour'] ?? null,
         ]);
 
         // Process initial rates if provided
@@ -258,7 +258,7 @@ class ProductController extends Controller
                         'business_id' => $businessId,
                         'duration_hours' => $hours,
                         'price' => $rate['price'],
-                        'extension_hourly_rate' => $rate['extension_hourly_rate'] ?? 15000.00,
+                        'extension_hourly_rate' => 0.00,
                         'is_active' => true,
                     ]
                 );
@@ -328,24 +328,28 @@ class ProductController extends Controller
             'is_addon' => 'nullable|boolean',
             'is_active' => 'nullable|boolean',
             'hourly_late_fee' => 'nullable|numeric|min:0',
+            'late_fee_per_hour' => 'nullable|numeric|min:0',
             'image' => 'nullable|image|max:5120',
             'remove_image' => 'nullable|boolean',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
             'rates.*.duration_value' => 'required_with:rates|integer|min:1',
             'rates.*.price' => 'required_with:rates|numeric|min:0',
-            'rates.*.extension_hourly_rate' => 'nullable|numeric|min:0',
             'rates.*.is_active' => 'nullable|boolean',
         ]);
 
         return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
-            $productFields = collect($validated)->except(['rates', 'image', 'remove_image'])->filter(fn($v) => $v !== null)->toArray();
+            $productFields = collect($validated)->except(['rates', 'image', 'remove_image', 'late_fee_per_hour'])->filter(fn($v) => $v !== null)->toArray();
             if ($request->has('is_addon')) {
                 $productFields['is_addon'] = $request->boolean('is_addon');
             }
             if ($request->exists('hourly_late_fee')) {
                 $productFields['hourly_late_fee'] = $validated['hourly_late_fee'] !== null
                     ? (float) $validated['hourly_late_fee']
+                    : null;
+            } elseif ($request->exists('late_fee_per_hour')) {
+                $productFields['hourly_late_fee'] = $validated['late_fee_per_hour'] !== null
+                    ? (float) $validated['late_fee_per_hour']
                     : null;
             }
 
@@ -378,7 +382,7 @@ class ProductController extends Controller
                             'business_id' => $businessId,
                             'duration_hours' => $hours,
                             'price' => $rate['price'],
-                            'extension_hourly_rate' => $rate['extension_hourly_rate'] ?? 15000.00,
+                            'extension_hourly_rate' => 0.00,
                             'is_active' => $rate['is_active'] ?? true,
                         ]
                     );
@@ -423,7 +427,6 @@ class ProductController extends Controller
             'rates.*.duration_unit' => 'required|in:hour,day,week,month',
             'rates.*.duration_value' => 'required|integer|min:1',
             'rates.*.price' => 'required|numeric|min:0',
-            'rates.*.extension_hourly_rate' => 'nullable|numeric|min:0',
             'rates.*.is_active' => 'nullable|boolean',
         ]);
 
@@ -442,7 +445,7 @@ class ProductController extends Controller
                 [
                     'duration_hours' => $hours,
                     'price' => $rate['price'],
-                    'extension_hourly_rate' => $rate['extension_hourly_rate'] ?? 15000.00,
+                    'extension_hourly_rate' => 0.00,
                     'is_active' => $rate['is_active'] ?? true,
                 ]
             );

@@ -50,7 +50,7 @@ class RentalUnitExchangeTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Test Business',
+            'name' => 'SewaKasir Test Business',
             'slug' => 'rentcore-test-biz',
             'owner_id' => $this->cashier->id,
             'is_active' => true,

@@ -90,7 +90,7 @@ class AuditLogController extends Controller
             });
         }
 
-        $perPage = max(10, min(100, (int)$request->get('per_page', 25)));
+        $perPage = max(1, min(50, (int) $request->get('per_page', 25)));
         $logs = $query->orderBy('created_at', 'desc')->paginate($perPage);
 
         return response()->json([

@@ -30,7 +30,7 @@ RentCore powers high-frequency walk-in counter rentals and field inspections for
 
 A forensic audit of the current Laravel 12 backend and Flutter mobile client was performed without modifying application code or production database data.
 
-### 2.1 Backend Codebase Audit (`rentcore_backend` / `laragon/www/rentcore`)
+### 2.1 Backend Codebase Audit (`sewakasir_backend` / `laragon/www/sewakasir_backend`)
 
 | Component | Current State | Findings & Constraints |
 | :--- | :--- | :--- |
@@ -44,7 +44,7 @@ A forensic audit of the current Laravel 12 backend and Flutter mobile client was
 | **Multi-Tenant Scoping** | `FranchiseTenantScope.php` | Eloquent models `Asset` and `Booking` enforce `affiliate_id` scoping automatically for non-super-admin users. |
 | **Audit Logging** | `AuditLogService.php` | Centralized immutable audit logger writing to `audit_logs` table. |
 
-### 2.2 Mobile Client Audit (`rentcore_mobile`)
+### 2.2 Mobile Client Audit (`sewakasir`)
 
 | Component | Current State | Findings & Constraints |
 | :--- | :--- | :--- |
@@ -356,7 +356,7 @@ To ensure maximum compatibility with Laravel 12 and PHP 8.3:
 ### 6.4 Flutter Mobile Client Component Blueprint
 
 To deliver an exceptional counter experience with zero lag:
-1. **New Package**: Add `image_picker: ^1.1.2` to `rentcore_mobile/pubspec.yaml`.
+1. **New Package**: Add `image_picker: ^1.1.2` to `sewakasir/pubspec.yaml`.
 2. **Reusable Widget: `PhotoAttachmentGrid`**:
    - Renders a horizontal or compact grid of photo cards.
    - "Tambah Foto" tile with modal sheet: **Ambil Foto (Kamera)** vs **Pilih dari Galeri**.
@@ -429,7 +429,7 @@ flowchart LR
   - Wire `ReturnService` and `BookingService` to link uploaded media records.
   - Add feature tests for multi-tenant isolation (verifying 403 on cross-branch access).
 - **Phase 4: Flutter Mobile Client Integration**
-  - Add `image_picker` to `rentcore_mobile/pubspec.yaml`.
+  - Add `image_picker` to `sewakasir/pubspec.yaml`.
   - Create reusable `PhotoAttachmentGrid` widget with live upload progress and sync badges.
   - Integrate photo capture into `ReturnWizardScreen` for physical device condition and damage evidence.
   - Integrate photo capture into `DirectRentalScreen` for real KTP/identity documents.

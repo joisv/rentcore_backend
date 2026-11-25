@@ -36,7 +36,7 @@ class BranchExpensePolicyAndAssignmentTest extends TestCase
         RateLimiter::clear('manager_pin_verify:biz_1:user_1');
 
         $this->owner = User::create([
-            'name' => 'Owner RentCore',
+            'name' => 'Owner SewaKasir',
             'email' => 'owner.policy@rentcore.id',
             'password' => Hash::make('password'),
             'role' => 'owner',
@@ -44,7 +44,7 @@ class BranchExpensePolicyAndAssignmentTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Multi Policy Store',
+            'name' => 'SewaKasir Multi Policy Store',
             'slug' => 'rentcore-multi-policy',
             'owner_id' => $this->owner->id,
             'timezone' => 'Asia/Jakarta',

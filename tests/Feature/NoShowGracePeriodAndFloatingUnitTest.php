@@ -50,7 +50,7 @@ class NoShowGracePeriodAndFloatingUnitTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Floating Test',
+            'name' => 'SewaKasir Floating Test',
             'slug' => 'rentcore-floating-test',
             'owner_id' => $this->owner->id,
             'is_active' => true,

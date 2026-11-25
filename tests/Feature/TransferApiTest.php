@@ -41,7 +41,7 @@ class TransferApiTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Franchise',
+            'name' => 'SewaKasir Franchise',
             'slug' => 'rentcore-franchise',
             'owner_id' => $this->staffA->id,
             'is_active' => true,

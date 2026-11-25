@@ -38,7 +38,7 @@ class PaymentSettingsSyncAndCacheTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Central Business',
+            'name' => 'SewaKasir Central Business',
             'slug' => 'rentcore-central',
             'owner_id' => $this->owner->id,
             'is_active' => true,

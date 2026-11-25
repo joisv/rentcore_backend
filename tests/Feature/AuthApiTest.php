@@ -100,7 +100,7 @@ class AuthApiTest extends TestCase
         ]);
 
         $business = \App\Models\Business::create([
-            'name' => 'RentCore Express',
+            'name' => 'SewaKasir Express',
             'slug' => 'rentcore-express',
             'owner_id' => $user->id,
             'is_active' => true,
@@ -127,7 +127,7 @@ class AuthApiTest extends TestCase
         ]);
 
         $response->assertStatus(200)
-            ->assertJsonPath('data.businesses.0.name', 'RentCore Express')
+            ->assertJsonPath('data.businesses.0.name', 'SewaKasir Express')
             ->assertJsonPath('data.businesses.0.branches.0.code', 'EXP');
     }
 

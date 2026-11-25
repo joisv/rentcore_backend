@@ -48,7 +48,7 @@ class ConfigurableCollateralTest extends TestCase
         ]);
 
         $this->business = Business::create([
-            'name' => 'RentCore Collateral Biz',
+            'name' => 'SewaKasir Collateral Biz',
             'slug' => 'rentcore-collateral-' . uniqid(),
             'owner_id' => $this->owner->id,
             'is_active' => true,

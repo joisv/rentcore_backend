@@ -33,6 +33,7 @@ class Business extends Model
         'max_primary_devices_per_id',
         'addons_enabled',
         'max_addons_per_rental',
+        'branch_unit_registration_policy',
         'enable_collateral',
         'require_collateral',
         'collateral_types',
@@ -47,12 +48,22 @@ class Business extends Model
         'auto_expire_paid_booking',
         'late_pickup_end_time_mode',
         'return_grace_period_minutes',
+        'late_fee_grace_mode',
         'late_fee_rounding_mode',
         'cap_late_fee_at_daily_rate',
         'default_hourly_late_fee',
+        'late_fee_default_type',
+        'late_fee_addon_policy',
+        'allow_cashier_late_fee_waiver',
         'payment_methods_config',
         'qris_raw_payload',
         'is_dynamic_qris_enabled',
+    ];
+
+    public const UNIT_REGISTRATION_POLICIES = [
+        'self_service',
+        'require_owner_approval',
+        'owner_only',
     ];
 
     public const COLLATERAL_INPUT_MODES = [
@@ -70,6 +81,7 @@ class Business extends Model
     ];
 
     protected $attributes = [
+        'branch_unit_registration_policy' => 'self_service',
         'enable_collateral' => false,
         'require_collateral' => false,
         'booking_grace_period_minutes' => 60,
@@ -77,9 +89,13 @@ class Business extends Model
         'auto_expire_paid_booking' => false,
         'late_pickup_end_time_mode' => 'keep_original_end',
         'return_grace_period_minutes' => 15,
+        'late_fee_grace_mode' => 'forfeit',
         'late_fee_rounding_mode' => 'hourly_ceil',
         'cap_late_fee_at_daily_rate' => true,
         'default_hourly_late_fee' => 0.00,
+        'late_fee_default_type' => 'fixed',
+        'late_fee_addon_policy' => 'follow_main_unit',
+        'allow_cashier_late_fee_waiver' => true,
     ];
 
     protected $casts = [
@@ -103,6 +119,7 @@ class Business extends Model
         'return_grace_period_minutes' => 'integer',
         'cap_late_fee_at_daily_rate' => 'boolean',
         'default_hourly_late_fee' => 'decimal:2',
+        'allow_cashier_late_fee_waiver' => 'boolean',
         'payment_methods_config' => 'array',
         'is_dynamic_qris_enabled' => 'boolean',
     ];
@@ -110,15 +127,44 @@ class Business extends Model
     public function getLateFeePolicy(): array
     {
         $roundingMode = $this->late_fee_rounding_mode;
-        if (!in_array($roundingMode, ['hourly_ceil', 'half_hourly_ceil'], true)) {
+        if (!in_array($roundingMode, ['hourly_ceil', 'half_hourly_ceil', 'exact_minute'], true)) {
             $roundingMode = 'hourly_ceil';
         }
 
+        $graceMode = $this->late_fee_grace_mode;
+        if (!in_array($graceMode, ['forfeit', 'deductive'], true)) {
+            $graceMode = 'forfeit';
+        }
+
+        $defaultType = $this->late_fee_default_type;
+        if (!in_array($defaultType, ['fixed', 'percent_daily'], true)) {
+            $defaultType = 'fixed';
+        }
+
+        $addonPolicy = $this->late_fee_addon_policy;
+        if (!in_array($addonPolicy, ['follow_main_unit', 'per_item'], true)) {
+            $addonPolicy = 'follow_main_unit';
+        }
+
+        $graceMinutes = max(0, (int) ($this->return_grace_period_minutes ?? 15));
+        $capDaily = $this->cap_late_fee_at_daily_rate !== null ? (bool) $this->cap_late_fee_at_daily_rate : true;
+        $defaultRate = $this->default_hourly_late_fee !== null ? round((float) $this->default_hourly_late_fee, 2) : 0.0;
+        $allowWaiver = $this->allow_cashier_late_fee_waiver !== null ? (bool) $this->allow_cashier_late_fee_waiver : true;
+
         return [
-            'return_grace_period_minutes' => max(0, (int) ($this->return_grace_period_minutes ?? 15)),
+            // Legacy & canonical keys kept in sync
+            'return_grace_period_minutes' => $graceMinutes,
+            'late_fee_grace_minutes' => $graceMinutes,
+            'late_fee_grace_mode' => $graceMode,
             'late_fee_rounding_mode' => $roundingMode,
-            'cap_late_fee_at_daily_rate' => $this->cap_late_fee_at_daily_rate !== null ? (bool) $this->cap_late_fee_at_daily_rate : true,
-            'default_hourly_late_fee' => $this->default_hourly_late_fee !== null ? round((float) $this->default_hourly_late_fee, 2) : 0.0,
+            'late_fee_rounding' => $roundingMode,
+            'cap_late_fee_at_daily_rate' => $capDaily,
+            'late_fee_cap_daily' => $capDaily,
+            'default_hourly_late_fee' => $defaultRate,
+            'late_fee_default_rate' => $defaultRate,
+            'late_fee_default_type' => $defaultType,
+            'late_fee_addon_policy' => $addonPolicy,
+            'allow_cashier_late_fee_waiver' => $allowWaiver,
         ];
     }
 
@@ -357,6 +403,15 @@ class Business extends Model
         ];
     }
 
+    public function getBranchUnitRegistrationPolicy(): string
+    {
+        $policy = (string) ($this->branch_unit_registration_policy ?? 'self_service');
+
+        return in_array($policy, self::UNIT_REGISTRATION_POLICIES, true)
+            ? $policy
+            : 'self_service';
+    }
+
     public function getRentalRules(): array
     {
         return [
@@ -364,6 +419,7 @@ class Business extends Model
             'max_primary_devices_per_id' => (int)($this->max_primary_devices_per_id ?? 1),
             'addons_enabled' => $this->addons_enabled !== null ? (bool)$this->addons_enabled : true,
             'max_addons_per_rental' => $this->max_addons_per_rental !== null ? (int)$this->max_addons_per_rental : 5,
+            'branch_unit_registration_policy' => $this->getBranchUnitRegistrationPolicy(),
         ];
     }
 

@@ -65,12 +65,21 @@ class BusinessController extends Controller
                 'auto_expire_paid_booking' => $biz->auto_expire_paid_booking !== null ? (bool) $biz->auto_expire_paid_booking : false,
                 'late_pickup_end_time_mode' => $biz->late_pickup_end_time_mode ?: 'keep_original_end',
                 'return_grace_period_minutes' => $biz->return_grace_period_minutes !== null ? (int) $biz->return_grace_period_minutes : 15,
+                'late_fee_grace_minutes' => $biz->return_grace_period_minutes !== null ? (int) $biz->return_grace_period_minutes : 15,
+                'late_fee_grace_mode' => $biz->late_fee_grace_mode ?: 'forfeit',
                 'late_fee_rounding_mode' => $biz->late_fee_rounding_mode ?: 'hourly_ceil',
+                'late_fee_rounding' => $biz->late_fee_rounding_mode ?: 'hourly_ceil',
                 'cap_late_fee_at_daily_rate' => $biz->cap_late_fee_at_daily_rate !== null ? (bool) $biz->cap_late_fee_at_daily_rate : true,
+                'late_fee_cap_daily' => $biz->cap_late_fee_at_daily_rate !== null ? (bool) $biz->cap_late_fee_at_daily_rate : true,
                 'default_hourly_late_fee' => $biz->default_hourly_late_fee !== null ? (float) $biz->default_hourly_late_fee : 0.0,
+                'late_fee_default_rate' => $biz->default_hourly_late_fee !== null ? (float) $biz->default_hourly_late_fee : 0.0,
+                'late_fee_default_type' => $biz->late_fee_default_type ?: 'fixed',
+                'late_fee_addon_policy' => $biz->late_fee_addon_policy ?: 'follow_main_unit',
+                'allow_cashier_late_fee_waiver' => $biz->allow_cashier_late_fee_waiver !== null ? (bool) $biz->allow_cashier_late_fee_waiver : true,
                 'enable_collateral' => $biz->isCollateralEnabled(),
                 'require_collateral' => $biz->isCollateralRequired(),
                 'collateral_types' => $biz->getResolvedCollateralTypes(),
+                'branch_unit_registration_policy' => $biz->getBranchUnitRegistrationPolicy(),
                 'role' => $membership->role,
                 'joined_at' => $membership->joined_at,
                 'resign_status' => $latestResign?->status,
@@ -350,9 +359,18 @@ class BusinessController extends Controller
             'auto_expire_paid_booking' => 'nullable|boolean',
             'late_pickup_end_time_mode' => 'nullable|string|in:keep_original_end,shift_if_available',
             'return_grace_period_minutes' => 'nullable|integer|min:0|max:1440',
-            'late_fee_rounding_mode' => 'nullable|string|in:hourly_ceil,half_hourly_ceil',
+            'late_fee_grace_minutes' => 'nullable|integer|min:0|max:1440',
+            'late_fee_grace_mode' => 'nullable|string|in:forfeit,deductive',
+            'late_fee_rounding_mode' => 'nullable|string|in:hourly_ceil,half_hourly_ceil,exact_minute',
+            'late_fee_rounding' => 'nullable|string|in:hourly_ceil,half_hourly_ceil,exact_minute',
             'cap_late_fee_at_daily_rate' => 'nullable|boolean',
+            'late_fee_cap_daily' => 'nullable|boolean',
             'default_hourly_late_fee' => 'nullable|numeric|min:0',
+            'late_fee_default_rate' => 'nullable|numeric|min:0',
+            'late_fee_default_type' => 'nullable|string|in:fixed,percent_daily',
+            'late_fee_addon_policy' => 'nullable|string|in:follow_main_unit,per_item',
+            'allow_cashier_late_fee_waiver' => 'nullable|boolean',
+            'branch_unit_registration_policy' => 'nullable|string|in:self_service,require_owner_approval,owner_only',
             'enable_collateral' => 'nullable|boolean',
             'require_collateral' => 'nullable|boolean',
             'collateral_types' => 'nullable|array',
@@ -382,15 +400,44 @@ class BusinessController extends Controller
             'auto_expire_paid_booking',
             'late_pickup_end_time_mode',
             'return_grace_period_minutes',
+            'late_fee_grace_mode',
             'late_fee_rounding_mode',
             'cap_late_fee_at_daily_rate',
+            'late_fee_default_type',
+            'late_fee_addon_policy',
+            'allow_cashier_late_fee_waiver',
         ] as $optField) {
             if (array_key_exists($optField, $validated) && $validated[$optField] !== null) {
                 $updates[$optField] = $validated[$optField];
             }
         }
+        // Canonical alias mapping so both naming conventions persist cleanly
+        if (array_key_exists('late_fee_grace_minutes', $validated) && $validated['late_fee_grace_minutes'] !== null) {
+            $updates['return_grace_period_minutes'] = (int) $validated['late_fee_grace_minutes'];
+        }
+        if (array_key_exists('late_fee_rounding', $validated) && $validated['late_fee_rounding'] !== null) {
+            $updates['late_fee_rounding_mode'] = $validated['late_fee_rounding'];
+        }
+        if (array_key_exists('late_fee_cap_daily', $validated) && $validated['late_fee_cap_daily'] !== null) {
+            $updates['cap_late_fee_at_daily_rate'] = (bool) $validated['late_fee_cap_daily'];
+        }
         if ($request->exists('default_hourly_late_fee')) {
             $updates['default_hourly_late_fee'] = $validated['default_hourly_late_fee'];
+        } elseif ($request->exists('late_fee_default_rate')) {
+            $updates['default_hourly_late_fee'] = $validated['late_fee_default_rate'];
+        }
+        if (array_key_exists('branch_unit_registration_policy', $validated) && $validated['branch_unit_registration_policy'] !== null) {
+            $isOwner = ($member && $member->isOwner())
+                || (string) $business->owner_id === (string) $user->id
+                || $user->isPlatformAdmin()
+                || $user->isSuperAdmin();
+            if (!$isOwner) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Hanya Owner yang berhak mengubah kebijakan registrasi unit cabang.',
+                ], 403);
+            }
+            $updates['branch_unit_registration_policy'] = $validated['branch_unit_registration_policy'];
         }
         if (array_key_exists('enable_collateral', $validated) || array_key_exists('require_collateral', $validated) || array_key_exists('collateral_types', $validated)) {
             $updates = array_merge(
@@ -609,7 +656,21 @@ class BusinessController extends Controller
             'addons_enabled' => 'nullable|boolean',
             'max_addons_per_rental' => 'nullable|integer|min:1',
             'allow_unlimited_addons' => 'nullable|boolean',
+            'branch_unit_registration_policy' => 'nullable|string|in:self_service,require_owner_approval,owner_only',
         ]);
+
+        if (array_key_exists('branch_unit_registration_policy', $validated) && $validated['branch_unit_registration_policy'] !== null) {
+            $isOwner = ($member && $member->isOwner())
+                || (string) $business->owner_id === (string) $user->id
+                || $user->isPlatformAdmin()
+                || $user->isSuperAdmin();
+            if (!$isOwner) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Hanya Owner yang berhak mengubah kebijakan registrasi unit cabang.',
+                ], 403);
+            }
+        }
 
         $updates = [];
         if (array_key_exists('id_document_limit_enabled', $validated)) {
@@ -627,6 +688,9 @@ class BusinessController extends Controller
             $updates['max_addons_per_rental'] = $validated['max_addons_per_rental'] !== null
                 ? (int)$validated['max_addons_per_rental']
                 : null;
+        }
+        if (array_key_exists('branch_unit_registration_policy', $validated) && $validated['branch_unit_registration_policy'] !== null) {
+            $updates['branch_unit_registration_policy'] = $validated['branch_unit_registration_policy'];
         }
 
         $business->update($updates);

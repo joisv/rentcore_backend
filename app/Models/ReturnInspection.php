@@ -45,6 +45,20 @@ class ReturnInspection extends Model
         'deposit_refunded' => 'decimal:2',
     ];
 
+    protected $appends = [
+        'late_fee_waiver_reason',
+    ];
+
+    public function getLateFeeWaiverReasonAttribute(): ?string
+    {
+        return $this->late_fee_waive_reason;
+    }
+
+    public function setLateFeeWaiverReasonAttribute($value): void
+    {
+        $this->attributes['late_fee_waive_reason'] = $value;
+    }
+
     public function booking(): BelongsTo
     {
         return $this->belongsTo(Booking::class);

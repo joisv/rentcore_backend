@@ -27,11 +27,19 @@ class Asset extends Model
         'battery_health',
         'hourly_late_fee',
         'notes',
+        'submitted_by',
+        'approved_by',
+        'approved_at',
+        'rejected_by',
+        'rejected_at',
+        'rejection_reason',
     ];
 
     protected $casts = [
         'battery_health' => 'integer',
         'hourly_late_fee' => 'decimal:2',
+        'approved_at' => 'datetime',
+        'rejected_at' => 'datetime',
     ];
 
     protected $appends = [
@@ -65,6 +73,21 @@ class Asset extends Model
     public function branch(): BelongsTo
     {
         return $this->belongsTo(Affiliate::class, 'affiliate_id');
+    }
+
+    public function submitter(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'submitted_by');
+    }
+
+    public function approver(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'approved_by');
+    }
+
+    public function rejecter(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'rejected_by');
     }
 
     public function model(): BelongsTo

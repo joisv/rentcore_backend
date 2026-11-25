@@ -17,13 +17,20 @@ class LegalPagesTest extends TestCase
     {
         $this->get('/privacy-policy')
             ->assertOk()
+            ->assertSee('SEWAKASIR')
+            ->assertSee('SewaKasir')
+            ->assertDontSee('Rentcore')
+            ->assertDontSee('RENTCORE')
             ->assertSee('Kebijakan Privasi')
             ->assertSee('BLUETOOTH_SCAN')
             ->assertSee('neverForLocation');
 
         $this->get('/account-deletion')
             ->assertOk()
-            ->assertSee('Permintaan Penghapusan Akun')
+            ->assertSee('SEWAKASIR')
+            ->assertSee('Permintaan Penghapusan Akun SewaKasir')
+            ->assertDontSee('Rentcore')
+            ->assertDontSee('RENTCORE')
             ->assertSee('7 hari');
     }
 
@@ -117,7 +124,7 @@ class LegalPagesTest extends TestCase
         $fresh = $staff->fresh();
         $this->assertFalse((bool) $fresh->is_active);
         $this->assertStringStartsWith('Deleted User #', $fresh->name);
-        $this->assertSame('deleted_' . $staff->id . '@deleted.rentcore.local', $fresh->email);
+        $this->assertSame('deleted_' . $staff->id . '@deleted.sewakasir.local', $fresh->email);
         $this->assertNull($fresh->phone);
         $this->assertNull($fresh->google_id);
         $this->assertCount(0, $fresh->tokens()->get());

@@ -78,7 +78,8 @@ class TransferController extends Controller
             $query->where('status', $request->status);
         }
 
-        $transfers = $query->orderBy('created_at', 'desc')->paginate($request->get('per_page', 20));
+        $perPage = max(1, min(50, (int) $request->get('per_page', 20)));
+        $transfers = $query->orderBy('created_at', 'desc')->paginate($perPage);
 
         return response()->json([
             'success' => true,

@@ -109,8 +109,8 @@ class VoucherService
      */
     public function generateThermalSlipPayload(Voucher $voucher, ?Affiliate $affiliate = null): array
     {
-        $shopName = 'RENTCORE GADGETS';
-        $branchName = $affiliate ? $affiliate->name : ($voucher->affiliate ? $voucher->affiliate->name : 'Semua Cabang RentCore');
+        $shopName = 'SEWAKASIR';
+        $branchName = $affiliate ? $affiliate->name : ($voucher->affiliate ? $voucher->affiliate->name : 'Semua Cabang SewaKasir');
         $validUntil = $voucher->end_at->format('d M Y');
         $minBelanja = 'Rp ' . number_format((float)$voucher->min_transaction_amount, 0, ',', '.');
         $diskonText = number_format((float)$voucher->discount_percentage, 0) . '% OFF';
@@ -137,7 +137,7 @@ class VoucherService
             ],
             'footer' => [
                 '* Tunjukkan slip voucher fisik ini atau scan QR Code di kasir saat transaksi sewa.',
-                'Terima kasih telah mempercayai RentCore!',
+                'Terima kasih telah mempercayai SewaKasir!',
             ]
         ];
 

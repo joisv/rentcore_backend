@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Asset;
 use App\Models\Booking;
 use App\Models\Business;
 use App\Models\InventoryTransfer;
@@ -707,6 +708,174 @@ class NotificationService
             '/bookings',
             $payload,
             $dedupPrefix
+        );
+    }
+
+    /**
+     * Triggered when a non-owner branch member submits a new physical unit
+     * under `require_owner_approval` policy. Notifies all active Owners of the business.
+     */
+    public function notifyUnitApprovalRequested(Asset $asset, User $staff): array
+    {
+        $business = Business::find($asset->business_id);
+        if (!$business) {
+            return [];
+        }
+
+        $asset->loadMissing(['model', 'affiliate']);
+        $staffName = $staff->name ?? 'Staf';
+        $branchName = $asset->affiliate?->name ?? 'Cabang';
+        $modelName = $asset->model?->name ?? 'Unit';
+        $unitCode = $asset->asset_code ?? '-';
+
+        $ownerUserIds = \App\Models\BusinessMember::where('business_id', $asset->business_id)
+            ->where('is_active', true)
+            ->where('role', 'owner')
+            ->pluck('user_id')
+            ->all();
+
+        if ($business->owner_id) {
+            $ownerUserIds[] = $business->owner_id;
+        }
+
+        $recipientIds = array_values(array_unique(array_filter(
+            $ownerUserIds,
+            fn ($uid) => (string) $uid !== (string) $staff->id
+        )));
+
+        if (empty($recipientIds)) {
+            return [];
+        }
+
+        return $this->notifyUsers(
+            (int) $asset->business_id,
+            $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+            $recipientIds,
+            'inventory',
+            'unit_approval_requested',
+            'Pengajuan Unit Baru Cabang',
+            "{$staffName} di cabang {$branchName} mendaftarkan {$modelName} ({$unitCode}).",
+            '/inventory',
+            [
+                'business_id' => (int) $asset->business_id,
+                'asset_id' => (int) $asset->id,
+                'branch_id' => $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+                'branch_name' => $branchName,
+                'model_name' => $modelName,
+                'asset_code' => $unitCode,
+                'staff_id' => $staff->id,
+                'staff_name' => $staffName,
+                'status' => 'pending_approval',
+                'target_route' => 'inventory',
+            ],
+            "unit.approval_requested:{$asset->id}"
+        );
+    }
+
+    /**
+     * Mark owner unit approval notifications as decided once reviewed.
+     */
+    public function markUnitApprovalNotificationDecided(Asset $asset, string $resolvedStatus, ?string $reason = null): void
+    {
+        $notifications = TenantNotification::withoutGlobalScopes()
+            ->where('business_id', $asset->business_id)
+            ->where('type', 'unit_approval_requested')
+            ->get();
+
+        foreach ($notifications as $notification) {
+            $payload = is_array($notification->action_payload) ? $notification->action_payload : [];
+            if ((int) ($payload['asset_id'] ?? 0) !== (int) $asset->id) {
+                continue;
+            }
+            $payload['status'] = $resolvedStatus;
+            if ($reason !== null && trim($reason) !== '') {
+                $payload['rejection_reason'] = trim($reason);
+            }
+            $notification->update([
+                'action_payload' => $payload,
+                'read_at' => $notification->read_at ?? Carbon::now(),
+            ]);
+        }
+    }
+
+    /**
+     * Triggered when Owner approves a pending branch unit registration.
+     */
+    public function notifyUnitApproved(Asset $asset, User $owner): ?TenantNotification
+    {
+        $this->markUnitApprovalNotificationDecided($asset, 'approved');
+
+        if (!$asset->submitted_by || (string) $asset->submitted_by === (string) $owner->id) {
+            return null;
+        }
+
+        $asset->loadMissing(['model', 'affiliate']);
+        $branchName = $asset->affiliate?->name ?? 'Cabang';
+        $modelName = $asset->model?->name ?? 'Unit';
+        $unitCode = $asset->asset_code ?? '-';
+        $ownerName = $owner->name ?? 'Owner';
+
+        return $this->notify(
+            (int) $asset->business_id,
+            $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+            (string) $asset->submitted_by,
+            'inventory',
+            'unit_approved',
+            'Unit Baru Disetujui',
+            "Pengajuan unit {$modelName} ({$unitCode}) di cabang {$branchName} telah disetujui oleh {$ownerName} dan kini berstatus Siap Sewa.",
+            '/inventory',
+            [
+                'business_id' => (int) $asset->business_id,
+                'asset_id' => (int) $asset->id,
+                'branch_id' => $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+                'asset_code' => $unitCode,
+                'model_name' => $modelName,
+                'status' => 'ready',
+                'target_route' => 'inventory',
+            ],
+            "unit.approved:{$asset->id}:{$asset->submitted_by}"
+        );
+    }
+
+    /**
+     * Triggered when Owner rejects a pending branch unit registration.
+     */
+    public function notifyUnitRejected(Asset $asset, User $owner, ?string $reason = null): ?TenantNotification
+    {
+        $cleanReason = $reason !== null ? trim($reason) : null;
+        $this->markUnitApprovalNotificationDecided($asset, 'rejected', $cleanReason);
+
+        if (!$asset->submitted_by || (string) $asset->submitted_by === (string) $owner->id) {
+            return null;
+        }
+
+        $asset->loadMissing(['model', 'affiliate']);
+        $branchName = $asset->affiliate?->name ?? 'Cabang';
+        $modelName = $asset->model?->name ?? 'Unit';
+        $unitCode = $asset->asset_code ?? '-';
+        $ownerName = $owner->name ?? 'Owner';
+        $reasonText = ($cleanReason !== null && $cleanReason !== '') ? " Alasan: {$cleanReason}" : '';
+
+        return $this->notify(
+            (int) $asset->business_id,
+            $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+            (string) $asset->submitted_by,
+            'inventory',
+            'unit_rejected',
+            'Pengajuan Unit Ditolak',
+            "Pengajuan unit {$modelName} ({$unitCode}) di cabang {$branchName} ditolak oleh {$ownerName}.{$reasonText}",
+            '/inventory',
+            [
+                'business_id' => (int) $asset->business_id,
+                'asset_id' => (int) $asset->id,
+                'branch_id' => $asset->affiliate_id ? (int) $asset->affiliate_id : null,
+                'asset_code' => $unitCode,
+                'model_name' => $modelName,
+                'status' => 'rejected',
+                'rejection_reason' => $cleanReason,
+                'target_route' => 'inventory',
+            ],
+            "unit.rejected:{$asset->id}:{$asset->submitted_by}"
         );
     }
 

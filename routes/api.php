@@ -22,7 +22,7 @@ use Illuminate\Support\Facades\Route;
 
 /*
 |--------------------------------------------------------------------------
-| API Routes — SkyRental (RentCore) Multi-Tenant SaaS Platform
+| API Routes — SewaKasir Multi-Tenant SaaS Platform
 |--------------------------------------------------------------------------
 |
 | Versioned RESTful API endpoints for Flutter mobile clients & web portals.
@@ -126,6 +126,8 @@ Route::prefix('v1')->group(function () {
             Route::put('/assets/{id}', [AssetController::class, 'update']);
             Route::delete('/assets/{id}', [AssetController::class, 'destroy']);
             Route::get('/assets/{id}/availability', [AssetController::class, 'checkAvailability']);
+            Route::post('/assets/{id}/approve', [AssetController::class, 'approve'])->whereNumber('id');
+            Route::post('/assets/{id}/reject', [AssetController::class, 'reject'])->whereNumber('id');
 
             // Mobile Device Catalog Aliases (Compatible with /iphones endpoints)
             Route::get('/iphones', [AssetController::class, 'index']);
@@ -169,6 +171,7 @@ Route::prefix('v1')->group(function () {
             Route::patch('/bookings/{id}/reschedule', [BookingController::class, 'reschedule'])->whereNumber('id');
             Route::post('/bookings/{id}/extend', [BookingController::class, 'extend']);
             Route::post('/bookings/{id}/adjust-duration', [BookingController::class, 'adjustDuration']);
+            Route::get('/bookings/{id}/late-fee-preview', [BookingController::class, 'lateFeePreview'])->whereNumber('id');
             Route::post('/bookings/{id}/return', [BookingController::class, 'processReturn']);
             Route::get('/bookings/{id}/available-replacements', [BookingController::class, 'availableReplacements']);
             Route::post('/bookings/{id}/exchange', [BookingController::class, 'exchange']);
