@@ -204,7 +204,9 @@ class ProductController extends Controller
             'is_active' => 'nullable|boolean',
             'hourly_late_fee' => 'nullable|numeric|min:0',
             'late_fee_per_hour' => 'nullable|numeric|min:0',
-            'image' => 'nullable|image|max:5120',
+            'image' => $request->hasFile('image') ? 'nullable|image|max:5120' : 'nullable|string',
+            'image_base64' => 'nullable|string',
+            'image_data' => 'nullable|string',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
             'rates.*.duration_value' => 'required_with:rates|integer|min:1',
@@ -329,7 +331,9 @@ class ProductController extends Controller
             'is_active' => 'nullable|boolean',
             'hourly_late_fee' => 'nullable|numeric|min:0',
             'late_fee_per_hour' => 'nullable|numeric|min:0',
-            'image' => 'nullable|image|max:5120',
+            'image' => $request->hasFile('image') ? 'nullable|image|max:5120' : 'nullable|string',
+            'image_base64' => 'nullable|string',
+            'image_data' => 'nullable|string',
             'remove_image' => 'nullable|boolean',
             'rates' => 'nullable|array',
             'rates.*.duration_unit' => 'required_with:rates|in:hour,day,week,month',
@@ -339,7 +343,10 @@ class ProductController extends Controller
         ]);
 
         return DB::transaction(function () use ($request, $product, $old, $validated, $businessId) {
-            $productFields = collect($validated)->except(['rates', 'image', 'remove_image', 'late_fee_per_hour'])->filter(fn($v) => $v !== null)->toArray();
+            $productFields = collect($validated)
+                ->except(['rates', 'image', 'image_base64', 'image_data', 'remove_image', 'late_fee_per_hour'])
+                ->filter(fn($v) => $v !== null)
+                ->toArray();
             if ($request->has('is_addon')) {
                 $productFields['is_addon'] = $request->boolean('is_addon');
             }
@@ -353,7 +360,7 @@ class ProductController extends Controller
                     : null;
             }
 
-            if ($request->hasFile('image')) {
+            if ($request->hasFile('image') || $this->extractBase64ImagePayload($request) !== null) {
                 $productFields['image_path'] = $this->handleModelImageUpload($request, $product->image_path);
             } elseif ($request->boolean('remove_image')) {
                 $this->deleteStoredModelImage($product->image_path);
@@ -497,17 +504,75 @@ class ProductController extends Controller
     }
 
     /**
-     * Store uploaded model image on public disk and delete previous image if replacing.
+     * Extract a base64 `data:image/...` payload from request fields when provided.
+     */
+    protected function extractBase64ImagePayload(Request $request): ?string
+    {
+        $candidates = [
+            $request->input('image_base64'),
+            $request->input('image_data'),
+            !$request->hasFile('image') ? $request->input('image') : null,
+            $request->input('image_path'),
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (is_string($candidate)) {
+                $trimmed = trim($candidate);
+                if (str_starts_with($trimmed, 'data:image/')) {
+                    return $trimmed;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Store uploaded model image (multipart file or base64 data URI) on public disk
+     * under `models/{filename}` and delete previous image if replacing.
      */
     protected function handleModelImageUpload(Request $request, ?string $previousPath = null): ?string
     {
-        if (!$request->hasFile('image')) {
-            return $previousPath;
+        if ($request->hasFile('image')) {
+            $storedPath = $request->file('image')->store('models', 'public');
+            $this->deleteStoredModelImage($previousPath);
+            return $storedPath;
         }
 
-        $this->deleteStoredModelImage($previousPath);
+        $base64Payload = $this->extractBase64ImagePayload($request);
+        if ($base64Payload !== null) {
+            if (!preg_match('/^data:image\/(jpeg|jpg|png|webp|gif);base64,(.+)$/is', $base64Payload, $matches)) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'image' => ['Format gambar base64 tidak valid. Gunakan JPG, PNG, WEBP, atau GIF.'],
+                ]);
+            }
 
-        return $request->file('image')->store('asset_models', 'public');
+            $ext = strtolower($matches[1]);
+            if ($ext === 'jpeg') {
+                $ext = 'jpg';
+            }
+
+            $decoded = base64_decode(preg_replace('/\s+/', '', $matches[2]), true);
+            if ($decoded === false || $decoded === '') {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'image' => ['Data gambar base64 tidak dapat didekode.'],
+                ]);
+            }
+
+            if (strlen($decoded) > 5 * 1024 * 1024) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'image' => ['Ukuran gambar melebihi batas maksimal 5MB.'],
+                ]);
+            }
+
+            $storedPath = 'models/' . Str::uuid()->toString() . '.' . $ext;
+            Storage::disk('public')->put($storedPath, $decoded);
+            $this->deleteStoredModelImage($previousPath);
+
+            return $storedPath;
+        }
+
+        return $previousPath;
     }
 
     /**
@@ -515,8 +580,15 @@ class ProductController extends Controller
      */
     protected function deleteStoredModelImage(?string $path): void
     {
-        if (!empty($path) && Storage::disk('public')->exists($path)) {
-            Storage::disk('public')->delete($path);
+        if (empty($path)) {
+            return;
+        }
+        $clean = ltrim($path, '/');
+        if (str_starts_with($clean, 'storage/')) {
+            $clean = substr($clean, strlen('storage/'));
+        }
+        if ($clean !== '' && Storage::disk('public')->exists($clean)) {
+            Storage::disk('public')->delete($clean);
         }
     }
 }

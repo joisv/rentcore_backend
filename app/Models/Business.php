@@ -124,6 +124,40 @@ class Business extends Model
         'is_dynamic_qris_enabled' => 'boolean',
     ];
 
+    protected $appends = [
+        'late_fee_grace_minutes',
+        'late_fee_rounding',
+        'late_fee_cap_daily',
+        'late_fee_default_rate',
+    ];
+
+    public function getLateFeeGraceMinutesAttribute(): int
+    {
+        return max(0, (int) ($this->return_grace_period_minutes ?? 15));
+    }
+
+    public function getLateFeeRoundingAttribute(): string
+    {
+        $mode = $this->late_fee_rounding_mode;
+        return in_array($mode, ['hourly_ceil', 'half_hourly_ceil', 'exact_minute'], true)
+            ? $mode
+            : 'hourly_ceil';
+    }
+
+    public function getLateFeeCapDailyAttribute(): bool
+    {
+        return $this->cap_late_fee_at_daily_rate !== null
+            ? (bool) $this->cap_late_fee_at_daily_rate
+            : true;
+    }
+
+    public function getLateFeeDefaultRateAttribute(): float
+    {
+        return $this->default_hourly_late_fee !== null
+            ? round((float) $this->default_hourly_late_fee, 2)
+            : 0.0;
+    }
+
     public function getLateFeePolicy(): array
     {
         $roundingMode = $this->late_fee_rounding_mode;

@@ -56,6 +56,7 @@ class BookingController extends Controller
         }
 
         $query = Booking::with([
+            'business',
             'customer',
             'returnInspection',
             'assetModel.category',
@@ -210,6 +211,16 @@ class BookingController extends Controller
 
         $perPage = max(1, min(50, (int) $request->get('per_page', 15)));
         $bookings = $query->orderBy('created_at', 'desc')->paginate($perPage);
+
+        $nowUtc = Carbon::now('UTC');
+        $bookings->getCollection()->transform(function (Booking $b) use ($nowUtc) {
+            if (in_array($b->status, ['rented', 'active'], true) && $b->end_at && Carbon::parse($b->end_at)->setTimezone('UTC')->lt($nowUtc)) {
+                $breakdown = $this->lateFeeCalculator->calculate($b);
+                $b->setAttribute('late_fee_breakdown', $breakdown);
+                $b->setAttribute('late_fee_preview', $breakdown);
+            }
+            return $b;
+        });
 
         return response()->json([
             'success' => true,
@@ -438,6 +449,7 @@ class BookingController extends Controller
     public function show(string $id): JsonResponse
     {
         $booking = Booking::with([
+            'business',
             'customer.identities',
             'assetModel.category',
             'assetModel.pricingTiers' => function ($pq) {
@@ -468,7 +480,9 @@ class BookingController extends Controller
         ->firstOrFail();
 
         $payload = $booking->toArray();
-        $payload['late_fee_preview'] = $this->lateFeeCalculator->calculate($booking);
+        $breakdown = $this->lateFeeCalculator->calculate($booking);
+        $payload['late_fee_breakdown'] = $breakdown;
+        $payload['late_fee_preview'] = $breakdown;
 
         return response()->json([
             'success' => true,
@@ -484,14 +498,23 @@ class BookingController extends Controller
         $booking = Booking::with(['business', 'items.asset.model', 'items.assetModel'])
             ->findOrFail($id);
 
+        $businessTz = $booking->business?->timezone ?: 'Asia/Jakarta';
         $returnedAt = null;
         if ($request->filled('returned_at')) {
-            $returnedAt = Carbon::parse((string) $request->query('returned_at'))->setTimezone('UTC');
+            $rawReturnedAt = (string) $request->query('returned_at');
+            if (preg_match('/(Z|[+-]\d{2}:?\d{2})$/i', $rawReturnedAt)) {
+                $returnedAt = Carbon::parse($rawReturnedAt)->setTimezone($businessTz);
+            } else {
+                $returnedAt = Carbon::parse($rawReturnedAt, $businessTz);
+            }
         }
+
+        $breakdown = $this->lateFeeCalculator->calculate($booking, $returnedAt);
 
         return response()->json([
             'success' => true,
-            'data' => $this->lateFeeCalculator->calculate($booking, $returnedAt),
+            'data' => $breakdown,
+            'late_fee_breakdown' => $breakdown,
         ]);
     }
 

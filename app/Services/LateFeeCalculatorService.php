@@ -53,17 +53,17 @@ class LateFeeCalculatorService
             $defaultRate = (float) ($policy['late_fee_default_rate'] ?? 0.0);
             $defaultType = (string) ($policy['late_fee_default_type'] ?? 'fixed');
 
-            if ($defaultType === 'percent_daily' && $defaultRate > 0) {
-                $dailyPrice = $this->resolveModelDailyPrice($resolvedModel, $tier);
-                if ($dailyPrice !== null && $dailyPrice > 0) {
-                    return [
-                        'rate' => round(($dailyPrice * $defaultRate) / 100.0, 2),
-                        'source' => 'business_percent_daily',
-                    ];
+            if ($defaultType === 'percent_daily') {
+                if ($defaultRate > 0) {
+                    $dailyPrice = $this->resolveModelDailyPrice($resolvedModel, $tier);
+                    if ($dailyPrice !== null && $dailyPrice > 0) {
+                        return [
+                            'rate' => round(($dailyPrice * $defaultRate) / 100.0, 2),
+                            'source' => 'business_percent_daily',
+                        ];
+                    }
                 }
-            }
-
-            if ($resolvedBusiness->default_hourly_late_fee !== null && $defaultRate > 0) {
+            } elseif ($defaultRate > 0) {
                 return [
                     'rate' => round(max(0.0, $defaultRate), 2),
                     'source' => 'business_default',
@@ -184,16 +184,20 @@ class LateFeeCalculatorService
     {
         $booking->loadMissing(['business', 'items.asset.model', 'items.assetModel']);
 
-        $dueAt = Carbon::parse($booking->end_at)->setTimezone('UTC');
-        $actualReturnedAt = ($returnedAt ?? Carbon::now('UTC'))->copy()->setTimezone('UTC');
-
-        // Step 1: raw_overdue_minutes
-        $rawOverdueMinutes = $actualReturnedAt->gt($dueAt)
-            ? (int) floor($dueAt->diffInMinutes($actualReturnedAt))
-            : 0;
-
         $business = $booking->business ?? ($booking->business_id ? Business::find($booking->business_id) : null);
+        $businessTz = $business?->timezone ?: 'Asia/Jakarta';
         $policy = $business ? $business->getLateFeePolicy() : $this->defaultPolicy();
+
+        $dueAt = $booking->end_at instanceof Carbon
+            ? $booking->end_at->copy()->setTimezone($businessTz)
+            : Carbon::parse($booking->end_at)->setTimezone($businessTz);
+        $actualReturnedAt = ($returnedAt ? $returnedAt->copy() : Carbon::now($businessTz))->setTimezone($businessTz);
+
+        // Step 1: raw_overdue_minutes (signed diff in business timezone so overdue is always positive)
+        $signedOverdueMinutes = $dueAt->diffInMinutes($actualReturnedAt, false);
+        $rawOverdueMinutes = $signedOverdueMinutes > 0
+            ? (int) floor($signedOverdueMinutes)
+            : 0;
 
         /** @var BookingItem|null $primaryItem */
         $primaryItem = $booking->items->first(function ($item) {
@@ -240,11 +244,15 @@ class LateFeeCalculatorService
             ?? ($booking->asset_model_id ? AssetModel::withoutGlobalScopes()->find($booking->asset_model_id) : null);
         $tier = !empty($rateSnapshot['tier_id']) ? PricingTier::find($rateSnapshot['tier_id']) : null;
 
-        if ($primaryItem && $primaryItem->applied_hourly_late_fee !== null) {
-            $hourlyRate = round(max(0.0, (float) $primaryItem->applied_hourly_late_fee), 2);
-            $rateSource = 'contract_snapshot';
-        } elseif (isset($rateSnapshot['applied_hourly_late_fee'])) {
-            $hourlyRate = round(max(0.0, (float) $rateSnapshot['applied_hourly_late_fee']), 2);
+        $snapshotAppliedRate = null;
+        if ($primaryItem && $primaryItem->applied_hourly_late_fee !== null && (float) $primaryItem->applied_hourly_late_fee > 0) {
+            $snapshotAppliedRate = round((float) $primaryItem->applied_hourly_late_fee, 2);
+        } elseif (isset($rateSnapshot['applied_hourly_late_fee']) && (float) $rateSnapshot['applied_hourly_late_fee'] > 0) {
+            $snapshotAppliedRate = round((float) $rateSnapshot['applied_hourly_late_fee'], 2);
+        }
+
+        if ($snapshotAppliedRate !== null) {
+            $hourlyRate = $snapshotAppliedRate;
             $rateSource = 'contract_snapshot';
         } else {
             $resolved = $this->resolveEffectiveHourlyLateFeeWithSource(

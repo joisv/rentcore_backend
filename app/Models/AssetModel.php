@@ -50,14 +50,46 @@ class AssetModel extends Model
         if (empty($this->image_path)) {
             return null;
         }
-        // Never leak raw base64 blobs into serialized list/detail payloads
-        if (str_starts_with($this->image_path, 'data:image')) {
+
+        $rawPath = str_replace('\\', '/', trim((string) $this->image_path));
+        if ($rawPath === '' || str_starts_with($rawPath, 'data:image')) {
             return null;
         }
-        if (str_starts_with($this->image_path, 'http://') || str_starts_with($this->image_path, 'https://')) {
-            return $this->image_path;
+
+        if (str_starts_with($rawPath, 'http://') || str_starts_with($rawPath, 'https://')) {
+            $parsed = parse_url($rawPath);
+            $host = strtolower((string) ($parsed['host'] ?? ''));
+            $path = (string) ($parsed['path'] ?? '');
+
+            $isStaleOrLocalHost = in_array($host, [
+                'localhost',
+                '127.0.0.1',
+                '10.0.2.2',
+                'rentcore_backend.test',
+                'sewakasir_backend.test',
+            ], true)
+                || str_contains($host, 'rentcore_backend')
+                || str_ends_with($host, '.test')
+                || str_ends_with($host, '.local');
+
+            if ($isStaleOrLocalHost && $path !== '' && str_contains($path, '/storage/')) {
+                $storagePos = strpos($path, '/storage/');
+                $relative = ltrim(substr($path, $storagePos + strlen('/storage/')), '/');
+                return $relative !== '' ? '/storage/' . $relative : null;
+            }
+
+            return $rawPath;
         }
-        return url('/storage/' . ltrim($this->image_path, '/'));
+
+        $cleanPath = ltrim($rawPath, '/');
+        if (str_starts_with($cleanPath, 'public/')) {
+            $cleanPath = substr($cleanPath, strlen('public/'));
+        }
+        if (str_starts_with($cleanPath, 'storage/')) {
+            $cleanPath = substr($cleanPath, strlen('storage/'));
+        }
+
+        return $cleanPath !== '' ? '/storage/' . ltrim($cleanPath, '/') : null;
     }
 
     protected $casts = [
